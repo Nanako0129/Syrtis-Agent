@@ -1,0 +1,1 @@
+{"defaultPreservesIdentity":true,"order":["disable","revokeAndRaiseDenyFloor","stopEndpoints","removeExactAutostart","removeExactBinary","clearSafeCaches"],"purgeRequiresAllObjectsSafe":true,"unsafeKeepsDeny":true}

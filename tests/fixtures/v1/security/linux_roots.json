@@ -1,0 +1,11 @@
+[
+  {"case":"unset","trustedHome":null,"environmentHome":null,"absolute":true,"localFilesystem":true,"ownerMatches":true,"noSymlink":true,"privatePermissions":true,"allowed":false},
+  {"case":"absolute","trustedHome":"/Users/owner","environmentHome":null,"absolute":true,"localFilesystem":true,"ownerMatches":true,"noSymlink":true,"privatePermissions":true,"allowed":true},
+  {"case":"relative","trustedHome":"relative/home","environmentHome":null,"absolute":false,"localFilesystem":true,"ownerMatches":true,"noSymlink":true,"privatePermissions":true,"allowed":false},
+  {"case":"foreign-owned","trustedHome":"/home/owner","environmentHome":null,"absolute":true,"localFilesystem":true,"ownerMatches":false,"noSymlink":true,"privatePermissions":true,"allowed":false},
+  {"case":"symlink","trustedHome":"/home/owner","environmentHome":null,"absolute":true,"localFilesystem":true,"ownerMatches":true,"noSymlink":false,"privatePermissions":true,"allowed":false},
+  {"case":"network-backed","trustedHome":"/net/owner","environmentHome":null,"absolute":true,"localFilesystem":false,"ownerMatches":true,"noSymlink":true,"privatePermissions":true,"allowed":false},
+  {"case":"attacker-HOME-ignored","trustedHome":"/home/owner","environmentHome":"/tmp/attacker","absolute":true,"localFilesystem":true,"ownerMatches":true,"noSymlink":true,"privatePermissions":true,"allowed":true},
+  {"case":"attacker-XDG-ignored","trustedHome":"/home/owner","environmentHome":"relative/xdg","absolute":true,"localFilesystem":true,"ownerMatches":true,"noSymlink":true,"privatePermissions":true,"allowed":true},
+  {"case":"getpwuid-unsafe","trustedHome":"/home/owner","environmentHome":"/tmp/attacker","absolute":true,"localFilesystem":true,"ownerMatches":true,"noSymlink":true,"privatePermissions":false,"allowed":false}
+]

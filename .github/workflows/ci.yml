@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Rust checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Before anything compiles: prove the checkout is byte-identical to the
+      # reviewed candidate. On Windows an end-of-line conversion would rewrite
+      # the LF-only fixtures that the contract tests compare via `include_str!`,
+      # and this names the file instead of leaving a hex-blob assertion failure.
+      - name: Verify candidate digests
+        run: python3 .github/verify-candidate-digests.py
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: clippy, rustfmt
+      - run: cargo fetch --locked
+      - run: cargo build --locked --offline
+      - run: cargo test --locked --offline --all-targets
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --offline --all-targets -- -D warnings

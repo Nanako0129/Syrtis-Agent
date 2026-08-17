@@ -1,0 +1,1 @@
+{"transitions":["sharing.enable","offer.create","claim","approve","reject","expiry","revoke","sharing.disable","source.change","reset","uninstall","compact"]}

@@ -1,0 +1,5 @@
+# The SA-0 contract fixtures are compared byte-for-byte by
+# `include_str!`, so no end-of-line conversion may happen on any
+# platform. `-text` disables it for every path rather than relying on
+# per-extension guesses.
+* -text
