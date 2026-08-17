@@ -15,7 +15,9 @@ MANIFEST = pathlib.Path(".github/candidate-digests.txt")
 
 expected = {}
 for line in MANIFEST.read_text(encoding="utf-8").splitlines():
-    if not line.strip():
+    # The manifest carries a header stating what it pins; without this the
+    # header would crash the parser rather than degrade.
+    if not line.strip() or line.lstrip().startswith("#"):
         continue
     digest, path = line.split("  ", 1)
     expected[path] = digest

@@ -1,3 +1,11 @@
+# SHA-256 of every contract file, re-derived on each CI platform before
+# anything compiles. See .github/verify-candidate-digests.py.
+#
+# MEANING CHANGED: this originally pinned "byte-identical to the reviewed
+# SA-0 candidate". Since the correction slice on feat/contract-clock-v1 it
+# pins "byte-identical to the CORRECTED contract" instead. It is not, and
+# must never become, "whatever was committed last": a change to any listed
+# file has to arrive with the reason it changed.
 9261ba46197050ccf1b80455a9b0193d5ab1069ae2dfceeae469e60b61fd6450  Cargo.lock
 5e7c8f4987ec411537c3a2fffb58e905cd9b6ceef48ed405d79395d404e9d093  Cargo.toml
 79d1c0363e4576d67827ebfa029fad7e3a5981474f4aafba3bd71e54f1a98172  spec/report-cache-v1.md
