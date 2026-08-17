@@ -38,9 +38,13 @@ pub const REMOTE_MEMORY_MAX: usize = 384 * 1024 * 1024;
 /// Raw paste bound, applied before any parsing work is done on it.
 pub const PAIR_URL_RAW_MAX: usize = 16_384;
 /// Bound on the Pair URL itself, applied once the grammar has identified one.
+///
+/// There is deliberately no third bound on the decoded offer JSON. One existed,
+/// at 4096 bytes, and could never bind: hex doubles, so a URL of at most 8192
+/// bytes carries at most (8192 - 20) / 2 = 4086 decoded bytes. A bound that
+/// cannot be reached is not defence in depth, it is the dead-bound shape this
+/// contract already removed once.
 pub const PAIR_URL_MAX: usize = 8_192;
-/// Bound on the CanonicalJsonV1 offer object carried by a Pair URL.
-pub const PAIR_OFFER_JSON_MAX: usize = 4_096;
 
 /// Largest tolerated backward step of the OS clock, in seconds.
 pub const MAX_CLOCK_ROLLBACK_SECONDS: i64 = 300;
@@ -286,9 +290,6 @@ pub struct PairOffer {
 pub fn pair_url(offer: &PairOffer) -> Result<String, SecurityError> {
     validate_pair_offer(offer, None)?;
     let json = CanonicalJsonV1::encode(offer).map_err(|_| SecurityError::Canonical)?;
-    if json.len() > PAIR_OFFER_JSON_MAX {
-        return Err(SecurityError::Bounds);
-    }
     let url = format!("{PAIR_URL_PREFIX}{}", hex_encode(&json));
     if url.len() > PAIR_URL_MAX {
         return Err(SecurityError::Bounds);
@@ -297,10 +298,11 @@ pub fn pair_url(offer: &PairOffer) -> Result<String, SecurityError> {
 }
 
 pub fn parse_pair_url(value: &str, effective_now_ms: i64) -> Result<PairOffer, SecurityError> {
-    // Three bounds, three distinct objects, each applied to its own: the raw
-    // paste before any parsing work, the URL once the grammar has identified
-    // one, and the offer JSON once it is decoded. Applying two of them to the
-    // same object is what made the tighter one dead code.
+    // Two bounds, two distinct objects, each applied to its own: the raw paste
+    // before any parsing work, and the URL once the grammar has identified one.
+    // Applying two bounds to the same object is what makes the tighter one dead
+    // code, which is why there is no third bound on the decoded offer JSON —
+    // see `PAIR_URL_MAX`.
     if value.len() > PAIR_URL_RAW_MAX {
         return Err(SecurityError::Bounds);
     }
@@ -311,9 +313,6 @@ pub fn parse_pair_url(value: &str, effective_now_ms: i64) -> Result<PairOffer, S
         return Err(SecurityError::Bounds);
     }
     let bytes = hex_decode(encoded)?;
-    if bytes.len() > PAIR_OFFER_JSON_MAX {
-        return Err(SecurityError::Bounds);
-    }
     let offer: PairOffer = CanonicalJsonV1::decode(&bytes).map_err(|_| SecurityError::Canonical)?;
     validate_pair_offer(&offer, Some(effective_now_ms))?;
     if pair_url(&offer)? != value {

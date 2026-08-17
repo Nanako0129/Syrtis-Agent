@@ -17,7 +17,7 @@ This document records deterministic SA-0 security reference behavior. All random
 | Unicode normalization | `0.1.25`; checksum `5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8`; MIT OR Apache-2.0; MSRV 1.36 |
 | Independent oracle | `x25519-dalek 2.0.1`, `chacha20poly1305 0.10.1`, and `blake2 0.10.6`; default features off; test-only |
 | Official vector | Snow crate `tests/vectors/snow.txt`, protocol `Noise_IK_25519_ChaChaPoly_BLAKE2s` |
-| Formatted test module SHA-256 | `22057ba75c1a051d34413842aa9f91332497a44e18d26100ddb4c728a0f1b362` |
+| Formatted test module SHA-256 | `b79c5bc8ade3f59367a1a0639c5dd7b8c17a94a92997ddf952cc60a462371f62` |
 | Oracle golden | `tests/fixtures/v1/security/noise_ik_oracle.hex` |
 
 The independent `tests/security_contract_v1.rs::independent_noise_ik_oracle` implements IK symmetric-state hashing, BLAKE2s HMAC/HKDF, X25519, and ChaCha20Poly1305 directly. It does not call `snow`. The test first reproduces the official Snow vector, then compares both implementations under the Syrtis prologue through exact message 1, message 2, and `hFinal` bytes.
@@ -55,7 +55,9 @@ sharingEnabled
 && scope == "usage.aggregate.read.v1"
 ```
 
-Every one of the nine conjuncts is independently falsifiable. The contract tests build the authorization request from literals chosen so that no two conjuncts read the same value, never from the grant under test; deleting or negating any single conjunct turns exactly one named test red. A request assembled from the object it is meant to constrain proves nothing, which is how eight of these nine once passed a frozen-contract acceptance.
+Every one of the nine conjuncts is independently falsifiable. The contract tests build the authorization request from literals chosen so that no two conjuncts read the same value, never from the grant under test; each conjunct has a named test of its own, and deleting or negating any single conjunct turns at least one named test red. It is not always exactly one: the expiry conjunct additionally carries `authorization_state_clock_and_crash_points`, which asserts that a rolled-back OS clock cannot revive an expired grant, so deleting it turns two red. A request assembled from the object it is meant to constrain proves nothing, which is how eight of these nine once passed a frozen-contract acceptance.
+
+The transitions that *produce* an authorized state are falsifiable on the same terms, and for the same reason: pinning the predicate while leaving the transition guards unwatched relocates the defect rather than removing it. Nine transition properties carry a named test each — the awaiting-approval precondition and the sharing check in approval, the deny-floor raise in revoke and in source change, the wall write on an idempotent claim retry, the allocate-then-increment epoch order, the compaction ordering key, and the offer state and expiry checks in claim. Deleting any one of them turns at least one named test red. The epoch order turns three red, because both deny-floor tests rest on `nextAuthEpoch - 1` reaching the newest issued epoch; that coupling is the property, not an artefact.
 
 The request carries no peer identity. Binding a grant to the paired static keys at authorization time is `SA-2B` work; the grant record does carry them (see below) so that `SA-2B` has something to bind to.
 
@@ -69,7 +71,7 @@ The request carries no peer identity. Binding a grant to the paired static keys 
 | Revoke | One immutable commit raises deny floor, re-epochs survivors, terminates target |
 | Disable/reset/uninstall | One commit raises deny floor, disables sharing, leaves no active grant |
 | Source change | Raises deny floor and source generation; existing grant cannot read the new scope before re-consent |
-| Cleanup complete | No clock anomaly; the runtime reports that physical cleanup finished for one existing terminal record that is not already complete; changes no counter. A terminal record is compactable only after this transition |
+| Cleanup complete | No clock anomaly; the runtime reports that physical cleanup finished for one existing terminal record that is not already complete; it advances the durable wall, which is itself a State counter, and changes no other counter. A terminal record is compactable only after this transition |
 | Compaction | No clock anomaly; only cleanup-complete terminal records aged at least 90 days; deterministic order; counters never decrease |
 
 The reference methods return a new state. The pre-commit state remains the only crash-before result; the returned state is the crash-after result. No partial mutation is observable.
@@ -117,6 +119,8 @@ Every clock-regulated entry point takes whole seconds (`osNowSeconds`), matching
 State is constructed with the install-time wall clock in seconds, whose domain is strictly positive; zero or negative is refused rather than silently accepted. A fresh state whose wall is zero would make every real Unix timestamp look like a forward jump of decades, so offer creation, claims and approvals would all fail — the frozen "counters never decrease" rule leaves no in-crate transition that could lower it again. Supplying a *future* wall clock is fail-closed in the same direction and is deliberate: the state refuses new offers, claims, approvals, cleanup reports and compaction until real time catches up. **Recovery is outside this crate** — the runtime discards the state and rebuilds it from a correct clock. This is a named `SA-2B` prerequisite.
 
 The authorization request's `osNow` and `lastAcceptedWall` are assembled by the caller from the *current* durable state. If a runtime authorizes against a stale snapshot, an already-revoked grant passes. That failure mode is structurally unobservable in a pure reference contract, and closing it is a named `SA-2B` prerequisite.
+
+**A wall accumulated one tolerated jump at a time is still a ratchet, and that is also deliberate.** Each accepted reading may carry the wall forward by up to 86,400 seconds and the wall never decreases, so a run of individually tolerated forward jumps — a clock a day fast across ten transitions, then corrected by NTP — leaves the wall days ahead of real time. Every honest reading after that is a rollback of more than 300 seconds, and the state then refuses every clock-bound transition: offers, claims, approvals, cleanup reports and compaction. This is the identical fail-closed direction as a future install wall above, reached by accumulation instead of in one step, and it has the identical resolution: **no in-crate transition may lower a counter, so recovery is outside this crate.** The runtime discards the state and rebuilds it from a correct clock, the same named `SA-2B` prerequisite. This contract deliberately does not add a second bound on accumulated forward motion — a cap on total drift, or a wall that decays toward a trusted reading, is a design decision, and taking it here would freeze a choice this slice did not make.
 
 **Structural ceiling, not a defect:** a pure state machine cannot advance its own clock between two transitions, so the widest undetected forward jump is bounded by the timestamp of the last accepted transition rather than by wall time. Narrowing that window needs periodic checkpointing, which is runtime work. This contract does not pretend to provide it.
 

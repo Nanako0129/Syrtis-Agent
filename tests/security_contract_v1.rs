@@ -1174,12 +1174,19 @@ fn clock_anomaly_thresholds_are_exact_at_both_edges() {
 /// A pure state machine cannot advance its own clock between transitions, so a
 /// test that needs a state ninety days older must take the steps. That is the
 /// structural ceiling recorded in `spec/security-v1.md`, not a defect.
+/// Every step must move the wall, or the loop is what fails rather than the
+/// assertion that wanted the aged state: a compaction that stopped writing the
+/// wall would spin here forever and time CI out instead of turning a test red.
 fn advance_wall(mut state: ReferenceState, seconds: i64) -> ReferenceState {
     let target = state.last_accepted_wall_unix_seconds() + seconds;
     while state.last_accepted_wall_unix_seconds() < target {
-        let step =
-            (state.last_accepted_wall_unix_seconds() + MAX_CLOCK_FORWARD_SECONDS).min(target);
+        let before = state.last_accepted_wall_unix_seconds();
+        let step = (before + MAX_CLOCK_FORWARD_SECONDS).min(target);
         state = state.compact_terminals(step).unwrap();
+        assert!(
+            state.last_accepted_wall_unix_seconds() > before,
+            "compaction did not advance the durable wall past {before}"
+        );
     }
     state
 }
@@ -1431,6 +1438,288 @@ fn the_terminal_reserve_keeps_a_full_state_revocable() {
     assert!(over.reject_pending(pending_id, generation, NOW_MS).is_ok());
 }
 
+// The nine transition guards below carry the same discipline as the nine
+// `authorize` conjunct tests: each one is falsified by deleting exactly the
+// property it names, from distinct literals, through the public API only. They
+// exist because pinning the authorization predicate left the transitions that
+// *produce* the authorized state equally unwatched — the same defect class, one
+// layer down.
+
+#[test]
+fn approval_requires_a_pending_that_is_still_awaiting_approval() {
+    // One consent, one grant. A rejected pending must not be approved into a
+    // grant, and an approved one must not be approved a second time; without
+    // this, one consent mints unlimited grants.
+    let state = enabled_state()
+        .create_offer(offer_record([0x31; 16], NOW_MS + 600_000), WALL_SECONDS)
+        .unwrap();
+    let (state, pending_id, generation) = state
+        .claim_offer(
+            claim_for([0x31; 16], [0x32; 16], INITIATOR_STATIC, 4),
+            WALL_SECONDS,
+        )
+        .unwrap();
+
+    let rejected = state
+        .reject_pending(pending_id, generation, NOW_MS)
+        .unwrap();
+    assert_eq!(rejected.pending[0].state, PendingState::Rejected);
+    assert_eq!(
+        rejected
+            .approve_pending(
+                approval_for(pending_id, generation, [0x33; 16], NOW_MS + 600_000),
+                WALL_SECONDS,
+            )
+            .unwrap_err(),
+        SecurityError::Unauthorized
+    );
+
+    // The same approval against the awaiting pending succeeds, so the state of
+    // the pending record is the only thing that differs.
+    let approved = state
+        .approve_pending(
+            approval_for(pending_id, generation, [0x34; 16], NOW_MS + 600_000),
+            WALL_SECONDS,
+        )
+        .unwrap();
+    assert_eq!(approved.grants.len(), 1);
+    assert_eq!(approved.pending[0].state, PendingState::Approved);
+    assert_eq!(
+        approved
+            .approve_pending(
+                approval_for(pending_id, generation, [0x35; 16], NOW_MS + 600_000),
+                WALL_SECONDS,
+            )
+            .unwrap_err(),
+        SecurityError::Unauthorized
+    );
+}
+
+#[test]
+fn revoke_raises_the_deny_floor_over_every_epoch_it_has_issued() {
+    // Two approvals, so epochs 1 and 2 are issued and the floor must land on 2.
+    let state = add_approved_grant(enabled_state(), [0x36; 16], [0x37; 16], [0x38; 16]);
+    let state = add_approved_grant(state, [0x39; 16], [0x3a; 16], [0x3b; 16]);
+    assert_eq!(state.deny_floor, 0);
+    assert_eq!(state.next_auth_epoch, 3);
+    let before = state
+        .grants
+        .iter()
+        .find(|grant| grant.grant_id == [0x3b; 16])
+        .unwrap()
+        .clone();
+    assert_eq!(before.auth_epoch, 2);
+
+    let after = state.revoke_commit([0x38; 16], NOW_MS).unwrap();
+    assert_eq!(after.deny_floor, 2);
+    // A peer still presenting the pre-revoke epoch is refused by the floor
+    // alone: the grant it names was not the revoked one, is still active, and
+    // still matches on scope, generation and expiry.
+    assert!(!authorize(
+        &before,
+        &runtime_request(&after, &before, WALL_SECONDS)
+    ));
+}
+
+#[test]
+fn a_source_change_raises_the_deny_floor_as_well_as_the_generation() {
+    let state = add_approved_grant(enabled_state(), [0x3c; 16], [0x3d; 16], [0x3e; 16]);
+    assert_eq!(state.source_scope_generation, 1);
+    assert_eq!(state.next_auth_epoch, 2);
+
+    let changed = state.source_change_commit().unwrap();
+    assert_eq!(changed.source_scope_generation, 2);
+    assert_eq!(changed.deny_floor, 1);
+    // The generation conjunct is not the whole rule. A grant carrying the new
+    // generation — what a runtime that copies the counter forward instead of
+    // asking for re-consent would produce — is still refused, by the floor.
+    let mut resynced = changed.grants[0].clone();
+    resynced.source_scope_generation = changed.source_scope_generation;
+    assert!(!authorize(
+        &resynced,
+        &runtime_request(&changed, &resynced, WALL_SECONDS)
+    ));
+}
+
+#[test]
+fn an_idempotent_claim_retry_still_advances_the_durable_wall() {
+    // The retry branch returns the pending that already exists, which makes it
+    // easy to return the state untouched. It is still a checked clock reading,
+    // and the partition in `spec/security-v1.md` puts every claim in the
+    // advancing set.
+    let state = enabled_state()
+        .create_offer(offer_record([0x40; 16], NOW_MS + 600_000), WALL_SECONDS)
+        .unwrap();
+    let (state, pending_id, generation) = state
+        .claim_offer(
+            claim_for([0x40; 16], [0x41; 16], INITIATOR_STATIC, 6),
+            WALL_SECONDS + 30,
+        )
+        .unwrap();
+    assert_eq!(state.last_accepted_wall_unix_seconds(), WALL_SECONDS + 30);
+
+    let (retried, retry_id, retry_generation) = state
+        .claim_offer(
+            claim_for([0x40; 16], [0x42; 16], INITIATOR_STATIC, 8),
+            WALL_SECONDS + 90,
+        )
+        .unwrap();
+    assert_eq!((retry_id, retry_generation), (pending_id, generation));
+    assert_eq!(retried.last_accepted_wall_unix_seconds(), WALL_SECONDS + 90);
+}
+
+#[test]
+fn approval_allocates_the_epoch_before_incrementing_the_counter() {
+    // Allocate, then increment. Swapped, the first grant is issued the epoch the
+    // counter still points at, so `nextAuthEpoch` aliases a live grant and the
+    // deny floor — which is `nextAuthEpoch - 1` — can never reach it.
+    let state = enabled_state();
+    assert_eq!(state.next_auth_epoch, 1);
+    let state = add_approved_grant(state, [0x43; 16], [0x44; 16], [0x45; 16]);
+    assert_eq!(state.grants[0].auth_epoch, 1);
+    assert_eq!(state.next_auth_epoch, 2);
+    let state = add_approved_grant(state, [0x46; 16], [0x47; 16], [0x48; 16]);
+    assert_eq!(state.grants[1].auth_epoch, 2);
+    assert_eq!(state.next_auth_epoch, 3);
+    assert!(
+        state
+            .grants
+            .iter()
+            .all(|grant| grant.auth_epoch < state.next_auth_epoch)
+    );
+}
+
+#[test]
+fn compaction_orders_terminal_records_deterministically() {
+    // Terminal records arrive in transition order carrying caller-supplied
+    // timestamps, so the stored order is not the frozen order. All three parts
+    // of the key are exercised: the record inserted first sorts last on
+    // `terminalAt`, a Grant sorts after an Offer at the same instant, and equal
+    // (instant, kind) falls back to the record ID.
+    let state = add_approved_grant(enabled_state(), [0x49; 16], [0x4a; 16], [0x0b; 16]);
+    let state = state
+        .create_offer(offer_record([0xa0; 16], NOW_MS + 600_000), WALL_SECONDS)
+        .unwrap();
+    let state = state
+        .create_offer(offer_record([0x0c; 16], NOW_MS + 600_000), WALL_SECONDS)
+        .unwrap();
+    let state = state
+        .create_offer(offer_record([0x0d; 16], NOW_MS + 600_000), WALL_SECONDS)
+        .unwrap();
+
+    let state = state.cancel_offer([0xa0; 16], 300).unwrap();
+    let state = state.revoke_commit([0x0b; 16], 100).unwrap();
+    let state = state.cancel_offer([0x0c; 16], 100).unwrap();
+    let state = state.cancel_offer([0x0d; 16], 100).unwrap();
+    let stored: Vec<u8> = state
+        .terminal
+        .iter()
+        .map(|terminal| terminal.record_id[0])
+        .collect();
+    assert_eq!(stored, vec![0xa0, 0x0b, 0x0c, 0x0d]);
+
+    let compacted = state.compact_terminals(WALL_SECONDS).unwrap();
+    let ordered: Vec<u8> = compacted
+        .terminal
+        .iter()
+        .map(|terminal| terminal.record_id[0])
+        .collect();
+    assert_eq!(ordered, vec![0x0c, 0x0d, 0x0b, 0xa0]);
+}
+
+#[test]
+fn a_cancelled_offer_is_not_claimable() {
+    let state = enabled_state()
+        .create_offer(offer_record([0x4b; 16], NOW_MS + 600_000), WALL_SECONDS)
+        .unwrap();
+    let cancelled = state.cancel_offer([0x4b; 16], NOW_MS).unwrap();
+    assert_eq!(cancelled.offers[0].state, OfferState::Cancelled);
+    // Well inside its lifetime, right secret, no pending yet: the offer state is
+    // the only thing that can refuse this claim.
+    assert_eq!(
+        cancelled
+            .claim_offer(
+                claim_for([0x4b; 16], [0x4c; 16], INITIATOR_STATIC, 2),
+                WALL_SECONDS,
+            )
+            .unwrap_err(),
+        SecurityError::Unauthorized
+    );
+    assert!(
+        state
+            .claim_offer(
+                claim_for([0x4b; 16], [0x4c; 16], INITIATOR_STATIC, 2),
+                WALL_SECONDS,
+            )
+            .is_ok()
+    );
+}
+
+#[test]
+fn an_expired_offer_is_not_claimable_and_the_edge_is_exact() {
+    // The offer is never marked expired, so only the clock comparison can refuse
+    // the claim. Expiry is 600 seconds out: second 599 still claims, and second
+    // 600 — the instant of expiry itself — does not.
+    let state = enabled_state()
+        .create_offer(offer_record([0x4d; 16], NOW_MS + 600_000), WALL_SECONDS)
+        .unwrap();
+    assert_eq!(state.offers[0].state, OfferState::Active);
+    assert!(
+        state
+            .claim_offer(
+                claim_for([0x4d; 16], [0x4e; 16], INITIATOR_STATIC, 5),
+                WALL_SECONDS + 599,
+            )
+            .is_ok()
+    );
+    assert_eq!(
+        state
+            .claim_offer(
+                claim_for([0x4d; 16], [0x4e; 16], INITIATOR_STATIC, 5),
+                WALL_SECONDS + 600,
+            )
+            .unwrap_err(),
+        SecurityError::Unauthorized
+    );
+}
+
+#[test]
+fn approval_after_sharing_is_disabled_mints_nothing() {
+    let state = enabled_state()
+        .create_offer(offer_record([0x4f; 16], NOW_MS + 600_000), WALL_SECONDS)
+        .unwrap();
+    let (state, pending_id, generation) = state
+        .claim_offer(
+            claim_for([0x4f; 16], [0x50; 16], INITIATOR_STATIC, 7),
+            WALL_SECONDS,
+        )
+        .unwrap();
+
+    let disabled = state.disable_commit([0x51; 16], NOW_MS).unwrap();
+    assert!(!disabled.sharing_enabled);
+    // The pending survives the disable, which is exactly why approval has to
+    // check sharing for itself rather than trust the claim that produced it.
+    assert_eq!(disabled.pending[0].state, PendingState::AwaitingApproval);
+    assert_eq!(
+        disabled
+            .approve_pending(
+                approval_for(pending_id, generation, [0x52; 16], NOW_MS + 600_000),
+                WALL_SECONDS,
+            )
+            .unwrap_err(),
+        SecurityError::Unauthorized
+    );
+    assert!(disabled.grants.is_empty());
+    assert!(
+        state
+            .approve_pending(
+                approval_for(pending_id, generation, [0x52; 16], NOW_MS + 600_000),
+                WALL_SECONDS,
+            )
+            .is_ok()
+    );
+}
+
 #[test]
 fn the_grant_state_record_has_exactly_the_frozen_field_set() {
     // Bound to the type, not to a second literal list: deleting a field from
@@ -1498,21 +1787,39 @@ fn pair_url_bounds_apply_to_their_own_object() {
     let url = pair_url(&offer).unwrap();
     assert!(url.len() <= PAIR_URL_MAX);
 
-    // Raw paste bound, checked before any parsing work.
-    let oversize_paste = format!("{url}{}", "0".repeat(PAIR_URL_RAW_MAX));
+    // Literals, not the constants: an edge read out of the value under test
+    // moves with it, and a widened bound would stay green. Each case below is
+    // one byte either side of a bound, and the two sides return *different*
+    // errors, so deleting the check is as visible as widening it.
+    assert_eq!(PAIR_URL_RAW_MAX, 16_384);
+    assert_eq!(PAIR_URL_MAX, 8_192);
+
+    // Raw paste bound, checked before any parsing work is done. The paste is not
+    // a Pair URL at all: over the bound it is refused on length, and at the
+    // bound it reaches the grammar and is refused for what it is.
     assert_eq!(
-        parse_pair_url(&oversize_paste, NOW_MS).unwrap_err(),
+        parse_pair_url(&"x".repeat(16_385), NOW_MS).unwrap_err(),
         SecurityError::Bounds
     );
-    // URL bound, checked once the grammar has identified a URL. This length is
-    // under the raw bound and its payload is under the offer-JSON bound, so
-    // only the URL bound can reject it.
-    let hex_len = PAIR_URL_MAX - "syrtis://pair?offer=".len() + 2;
-    let oversize_url = format!("syrtis://pair?offer={}", "0".repeat(hex_len));
-    assert!(oversize_url.len() > PAIR_URL_MAX && oversize_url.len() <= PAIR_URL_RAW_MAX);
-    assert!(hex_len / 2 <= PAIR_OFFER_JSON_MAX);
     assert_eq!(
-        parse_pair_url(&oversize_url, NOW_MS).unwrap_err(),
+        parse_pair_url(&"x".repeat(16_384), NOW_MS).unwrap_err(),
+        SecurityError::Invalid
+    );
+
+    // URL bound, checked once the grammar has identified a URL. At the bound the
+    // payload is decoded and refused as non-canonical JSON; one byte over, the
+    // odd-length payload is never decoded at all, because the length refuses it
+    // first.
+    let at_bound = format!("syrtis://pair?offer={}", "0".repeat(8_192 - 20));
+    assert_eq!(at_bound.len(), 8_192);
+    assert_eq!(
+        parse_pair_url(&at_bound, NOW_MS).unwrap_err(),
+        SecurityError::Canonical
+    );
+    let over_bound = format!("syrtis://pair?offer={}", "0".repeat(8_193 - 20));
+    assert_eq!(over_bound.len(), 8_193);
+    assert_eq!(
+        parse_pair_url(&over_bound, NOW_MS).unwrap_err(),
         SecurityError::Bounds
     );
 
