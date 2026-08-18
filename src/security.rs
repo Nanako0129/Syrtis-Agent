@@ -35,6 +35,45 @@ pub const LOGICAL_BODY_MAX: usize = 16_777_216;
 pub const RESPONSE_CHUNKS_MAX: u32 = 274;
 pub const REMOTE_MEMORY_MAX: usize = 384 * 1024 * 1024;
 
+/// Raw paste bound, applied before any parsing work is done on it.
+pub const PAIR_URL_RAW_MAX: usize = 16_384;
+/// Bound on the Pair URL itself, applied once the grammar has identified one.
+pub const PAIR_URL_MAX: usize = 8_192;
+
+/// Bound on the decoded offer JSON, frozen by `spec/v1.md`: "Decoded hex is a
+/// CanonicalJsonV1 Pair URL object no larger than 4,096 bytes."
+///
+/// It cannot bind while `PAIR_URL_MAX` is 8192, because hex doubles and a URL
+/// that long carries at most (8192 - 20) / 2 = 4086 decoded bytes — so no test
+/// can reach it through the public API, and it is verified by pointing at the
+/// specification line rather than by an assertion.
+///
+/// It is kept anyway. Deleting it would make conformance to a frozen bound
+/// depend on an *implication* from a different constant, so raising
+/// `PAIR_URL_MAX` later would silently stop enforcing a spec line with nothing
+/// to notice — which is the failure this whole slice exists to remove. That is
+/// a different thing from the dead condition `F-14` fixed, where one object was
+/// checked twice against two bounds and the looser check could never fire.
+pub const PAIR_OFFER_JSON_MAX: usize = 4_096;
+
+/// Largest tolerated backward step of the OS clock, in seconds.
+pub const MAX_CLOCK_ROLLBACK_SECONDS: i64 = 300;
+/// Largest tolerated forward jump of the OS clock, in seconds.
+pub const MAX_CLOCK_FORWARD_SECONDS: i64 = 86_400;
+
+/// Creation stops one record short of [`MAX_RECORDS`]. The reserved slot is
+/// what lets a full state still record a termination; see [`MAX_RECORDS`].
+pub const MAX_CREATION_RECORDS: usize = 255;
+/// Total record cap, reachable only by the paths that terminate a record.
+///
+/// Revoke, disable, reset, uninstall and reject are deliberately absent from
+/// every record-count check: a terminal record leaves only through compaction,
+/// which needs a cleanup report, ninety days and a sane clock, so failing them
+/// on record count would leave a full state unrevocable for months.
+pub const MAX_RECORDS: usize = 256;
+
+const PAIR_URL_PREFIX: &str = "syrtis://pair?offer=";
+
 const OFFER_SECRET_TAG: &[u8] = b"syrtis-offer-secret-v1\0";
 const CONTROL_KEY_TAG: &[u8] = b"syrtis-control-key-v1\0";
 const CONTROL_SERVER_TAG: &[u8] = b"syrtis-control-server-v1\0";
@@ -261,21 +300,32 @@ pub struct PairOffer {
 pub fn pair_url(offer: &PairOffer) -> Result<String, SecurityError> {
     validate_pair_offer(offer, None)?;
     let json = CanonicalJsonV1::encode(offer).map_err(|_| SecurityError::Canonical)?;
-    if json.len() > 4_096 {
+    if json.len() > PAIR_OFFER_JSON_MAX {
         return Err(SecurityError::Bounds);
     }
-    Ok(format!("syrtis://pair?offer={}", hex_encode(&json)))
+    let url = format!("{PAIR_URL_PREFIX}{}", hex_encode(&json));
+    if url.len() > PAIR_URL_MAX {
+        return Err(SecurityError::Bounds);
+    }
+    Ok(url)
 }
 
 pub fn parse_pair_url(value: &str, effective_now_ms: i64) -> Result<PairOffer, SecurityError> {
-    if value.len() > 16_384 || value.len() > 8_192 {
+    // Three bounds, three distinct objects, each applied to its own: the raw
+    // paste before any parsing work, the URL once the grammar has identified
+    // one, and the decoded offer JSON. Applying two bounds to the *same* object
+    // is what made the original condition dead; three objects is not that.
+    if value.len() > PAIR_URL_RAW_MAX {
         return Err(SecurityError::Bounds);
     }
     let encoded = value
-        .strip_prefix("syrtis://pair?offer=")
+        .strip_prefix(PAIR_URL_PREFIX)
         .ok_or(SecurityError::Invalid)?;
+    if value.len() > PAIR_URL_MAX {
+        return Err(SecurityError::Bounds);
+    }
     let bytes = hex_decode(encoded)?;
-    if bytes.len() > 4_096 {
+    if bytes.len() > PAIR_OFFER_JSON_MAX {
         return Err(SecurityError::Bounds);
     }
     let offer: PairOffer = CanonicalJsonV1::decode(&bytes).map_err(|_| SecurityError::Canonical)?;
@@ -619,7 +669,9 @@ fn validate_offer_data(data: &Value) -> Result<(), SecurityError> {
         .ok_or(SecurityError::Invalid)?;
     decode_fixed_hex::<16>(string(object, "offerId")?)?;
     let url = string(object, "pairUrl")?;
-    if url.len() <= 16_384 && url.starts_with("syrtis://pair?offer=") {
+    // Same bound `parse_pair_url` applies to a URL, so the control plane cannot
+    // hand back a Pair URL that its own parser would reject on length.
+    if url.len() <= PAIR_URL_MAX && url.starts_with(PAIR_URL_PREFIX) {
         Ok(())
     } else {
         Err(SecurityError::Invalid)
@@ -680,10 +732,15 @@ fn string<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a str, Secu
         .ok_or(SecurityError::Invalid)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Grant lifecycle.
+///
+/// There is deliberately no intermediate revocation state: revocation is one
+/// immutable commit, so a state sitting between "still authorized" and
+/// "revoked" would contradict the frozen rule rather than implement it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum GrantState {
     Active,
-    RevocationPending,
     Revoked,
     Expired,
 }
@@ -725,15 +782,43 @@ pub struct Pending {
     pub state: PendingState,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Grant state record.
+///
+/// The serializer is the guard: its key set must be exactly the ten fields
+/// frozen for the grant state record in `spec/v1.md`, so a missing or extra
+/// field is a test failure rather than a silent divergence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Grant {
+    #[serde(serialize_with = "serialize_hex_16")]
     pub grant_id: [u8; 16],
+    #[serde(serialize_with = "serialize_hex_32")]
+    pub initiator_static: [u8; 32],
+    #[serde(serialize_with = "serialize_hex_32")]
+    pub responder_static: [u8; 32],
+    pub scope: &'static str,
+    pub endpoints: [u16; 4],
     pub auth_epoch: u64,
     pub source_scope_generation: u64,
+    #[serde(rename = "createdAt")]
+    pub created_at_ms: i64,
+    #[serde(rename = "expiresAt")]
     pub expires_at_ms: i64,
-    pub endpoints: [u16; 4],
-    pub scope: &'static str,
     pub state: GrantState,
+}
+
+fn serialize_hex_16<S: serde::Serializer>(
+    value: &[u8; 16],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&hex_encode(value))
+}
+
+fn serialize_hex_32<S: serde::Serializer>(
+    value: &[u8; 32],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&hex_encode(value))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -748,6 +833,12 @@ pub struct AuthorizationRequest {
     pub endpoint: u16,
 }
 
+/// The complete positive authorization predicate.
+///
+/// Nine conjuncts, each independently falsifiable. `AuthorizationRequest` is
+/// assembled by the caller from the *current* durable state; a request derived
+/// from the grant it is meant to constrain cannot fail, which is exactly how
+/// eight of these nine went untested through a frozen-contract acceptance.
 pub fn authorize(grant: &Grant, request: &AuthorizationRequest) -> bool {
     let effective_seconds = request
         .os_now_unix_seconds
@@ -773,8 +864,8 @@ pub struct ClockStatus {
 pub fn clock_status(os_now: i64, last_accepted: i64) -> ClockStatus {
     ClockStatus {
         effective_now: os_now.max(last_accepted),
-        anomaly: os_now < last_accepted.saturating_sub(300)
-            || os_now > last_accepted.saturating_add(86_400),
+        anomaly: os_now < last_accepted.saturating_sub(MAX_CLOCK_ROLLBACK_SECONDS)
+            || os_now > last_accepted.saturating_add(MAX_CLOCK_FORWARD_SECONDS),
     }
 }
 
@@ -796,36 +887,88 @@ pub struct Terminal {
     pub cleanup_complete: bool,
 }
 
+/// Arguments of the claim transition.
+///
+/// Grouped rather than positional: `offer_id` and `pending_id` are both
+/// `[u8; 16]`, so a positional list lets a caller swap them and still compile.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfferClaim {
+    pub offer_id: [u8; 16],
+    pub secret: [u8; 32],
+    pub responder_static: [u8; 32],
+    pub pending_id: [u8; 16],
+    pub initiator_static: [u8; 32],
+    pub sas_code: String,
+    pub sas_generation: u64,
+}
+
+/// Arguments of the approval transition.
+///
+/// `responder_static` is explicit here: the reference state holds no identity
+/// of its own, and the state top level is frozen, so approval receives the
+/// responder key rather than reading one out of the state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingApproval {
+    pub pending_id: [u8; 16],
+    pub sas_generation: u64,
+    pub grant_id: [u8; 16],
+    pub responder_static: [u8; 32],
+    pub grant_expires_at_ms: i64,
+    pub disclosure_exact: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReferenceState {
     pub sharing_enabled: bool,
     pub next_auth_epoch: u64,
     pub deny_floor: u64,
     pub source_scope_generation: u64,
-    pub last_accepted_wall_unix_seconds: i64,
+    /// Durable wall clock, in seconds.
+    ///
+    /// Private on purpose. It is a State counter that never decreases, and it
+    /// advances only through [`ReferenceState::accept_clock`]. A test that can
+    /// assign it can also hide the fact that no transition ever writes it,
+    /// which is what happened here: the field was declared, read and
+    /// initialized, never assigned, and twelve green tests said nothing.
+    last_accepted_wall_unix_seconds: i64,
     pub offers: Vec<Offer>,
     pub pending: Vec<Pending>,
     pub grants: Vec<Grant>,
     pub terminal: Vec<Terminal>,
 }
 
-impl Default for ReferenceState {
-    fn default() -> Self {
-        Self {
+impl ReferenceState {
+    /// Builds a state from the install-time wall clock, in seconds.
+    ///
+    /// The domain is strictly positive. A zero wall would make every real Unix
+    /// timestamp read as a forward jump of decades and refuse every clock-bound
+    /// transition, and no in-crate transition can lower a counter again. A
+    /// *future* wall is fail-closed the same way and is deliberate: recovery is
+    /// the runtime's job (`SA-2B`), which discards the state and rebuilds it
+    /// from a correct clock.
+    pub fn new(install_wall_unix_seconds: i64) -> Result<Self, SecurityError> {
+        if install_wall_unix_seconds <= 0 {
+            return Err(SecurityError::Invalid);
+        }
+        Ok(Self {
             sharing_enabled: false,
             next_auth_epoch: 1,
             deny_floor: 0,
             source_scope_generation: 1,
-            last_accepted_wall_unix_seconds: 0,
+            last_accepted_wall_unix_seconds: install_wall_unix_seconds,
             offers: Vec::new(),
             pending: Vec::new(),
             grants: Vec::new(),
             terminal: Vec::new(),
-        }
+        })
     }
-}
 
-impl ReferenceState {
+    /// The durable wall clock the caller must put into an [`AuthorizationRequest`].
+    pub fn last_accepted_wall_unix_seconds(&self) -> i64 {
+        self.last_accepted_wall_unix_seconds
+    }
+
+    /// Does not advance the wall: it takes no clock reading at all.
     pub fn enable_sharing(&self) -> Result<Self, SecurityError> {
         if self.sharing_enabled {
             return Err(SecurityError::Conflict);
@@ -835,8 +978,9 @@ impl ReferenceState {
         Ok(next)
     }
 
+    /// Advances the wall: `os_now_seconds` is a checked clock reading.
     pub fn create_offer(&self, offer: Offer, os_now_seconds: i64) -> Result<Self, SecurityError> {
-        let effective_now_ms = self.effective_now_ms(os_now_seconds)?;
+        let (accepted_wall, effective_now_ms) = self.accept_clock(os_now_seconds)?;
         let lifetime_ms = offer
             .expires_at_ms
             .checked_sub(offer.created_at_ms)
@@ -852,87 +996,99 @@ impl ReferenceState {
                 .filter(|offer| offer.state == OfferState::Active)
                 .count()
                 >= 5
-            || self.record_count() >= 255
+            || self.record_count() >= MAX_CREATION_RECORDS
             || self.id_seen(offer.offer_id)
         {
             return Err(SecurityError::Unauthorized);
         }
         let mut next = self.clone();
+        next.last_accepted_wall_unix_seconds = accepted_wall;
         next.offers.push(offer);
         Ok(next)
     }
 
+    /// Advances the wall: `os_now_seconds` is a checked clock reading.
     pub fn claim_offer(
         &self,
-        offer_id: [u8; 16],
-        pending_id: [u8; 16],
-        initiator_static: [u8; 32],
-        sas_code: String,
-        sas_generation: u64,
-        now_ms: i64,
+        claim: OfferClaim,
+        os_now_seconds: i64,
     ) -> Result<(Self, [u8; 16], u64), SecurityError> {
-        if let Some(existing) = self
-            .pending
-            .iter()
-            .find(|pending| pending.offer_id == offer_id)
-        {
-            return if existing.initiator_static == initiator_static {
-                Ok((self.clone(), existing.pending_id, existing.sas_generation))
-            } else {
-                Err(SecurityError::Unauthorized)
-            };
-        }
+        let (accepted_wall, effective_now_ms) = self.accept_clock(os_now_seconds)?;
+        // The bearer proves possession before anything else is disclosed or
+        // consumed, and a wrong secret leaves the offer active: consuming it
+        // would turn one guess into a denial of service on the real initiator.
         let offer_index = self
             .offers
             .iter()
-            .position(|offer| offer.offer_id == offer_id && offer.state == OfferState::Active)
+            .position(|offer| offer.offer_id == claim.offer_id)
             .ok_or(SecurityError::Unauthorized)?;
         let offer = &self.offers[offer_index];
-        if now_ms >= offer.expires_at_ms
-            || !valid_sas(&sas_code)
+        let presented = offer_secret_hash(&claim.offer_id, &claim.secret, &claim.responder_static);
+        if !constant_time_eq(&presented, &offer.secret_hash) {
+            return Err(SecurityError::Unauthorized);
+        }
+        if let Some(existing) = self
+            .pending
+            .iter()
+            .find(|pending| pending.offer_id == claim.offer_id)
+        {
+            // A terminal pending is never authority, so it yields neither a
+            // success nor its generation, however the retry is addressed.
+            if existing.state != PendingState::AwaitingApproval
+                || existing.initiator_static != claim.initiator_static
+            {
+                return Err(SecurityError::Unauthorized);
+            }
+            let (pending_id, sas_generation) = (existing.pending_id, existing.sas_generation);
+            let mut next = self.clone();
+            next.last_accepted_wall_unix_seconds = accepted_wall;
+            return Ok((next, pending_id, sas_generation));
+        }
+        if offer.state != OfferState::Active
+            || effective_now_ms >= offer.expires_at_ms
+            || !valid_sas(&claim.sas_code)
             || self
                 .pending
                 .iter()
                 .filter(|pending| pending.state == PendingState::AwaitingApproval)
                 .count()
                 >= 5
-            || self.record_count() >= 255
-            || self.id_seen(pending_id)
+            || self.record_count() >= MAX_CREATION_RECORDS
+            || self.id_seen(claim.pending_id)
         {
             return Err(SecurityError::Unauthorized);
         }
+        let expires_at_ms = offer.expires_at_ms;
         let mut next = self.clone();
+        next.last_accepted_wall_unix_seconds = accepted_wall;
         next.offers[offer_index].state = OfferState::Consumed;
         next.pending.push(Pending {
-            pending_id,
-            offer_id,
-            initiator_static,
-            sas_code,
-            sas_generation,
-            created_at_ms: now_ms,
-            expires_at_ms: offer.expires_at_ms,
+            pending_id: claim.pending_id,
+            offer_id: claim.offer_id,
+            initiator_static: claim.initiator_static,
+            sas_code: claim.sas_code,
+            sas_generation: claim.sas_generation,
+            created_at_ms: effective_now_ms,
+            expires_at_ms,
             state: PendingState::AwaitingApproval,
         });
-        Ok((next, pending_id, sas_generation))
+        Ok((next, claim.pending_id, claim.sas_generation))
     }
 
+    /// Advances the wall: `os_now_seconds` is a checked clock reading.
     pub fn approve_pending(
         &self,
-        pending_id: [u8; 16],
-        sas_generation: u64,
-        grant_id: [u8; 16],
-        grant_expires_at_ms: i64,
+        approval: PendingApproval,
         os_now_seconds: i64,
-        disclosure_exact: bool,
     ) -> Result<Self, SecurityError> {
-        let effective_now_ms = self.effective_now_ms(os_now_seconds)?;
+        let (accepted_wall, effective_now_ms) = self.accept_clock(os_now_seconds)?;
         let pending_index = self
             .pending
             .iter()
             .position(|pending| {
-                pending.pending_id == pending_id
+                pending.pending_id == approval.pending_id
                     && pending.state == PendingState::AwaitingApproval
-                    && pending.sas_generation == sas_generation
+                    && pending.sas_generation == approval.sas_generation
                     && effective_now_ms < pending.expires_at_ms
             })
             .ok_or(SecurityError::Unauthorized)?;
@@ -942,36 +1098,47 @@ impl ReferenceState {
             .iter()
             .any(|offer| offer.offer_id == pending.offer_id && offer.state == OfferState::Consumed);
         if !self.sharing_enabled
-            || !disclosure_exact
+            || !approval.disclosure_exact
             || !consumed_offer_exists
-            || grant_expires_at_ms <= effective_now_ms
+            || approval.grant_expires_at_ms <= effective_now_ms
             || self
                 .grants
                 .iter()
                 .filter(|grant| grant.state == GrantState::Active)
                 .count()
                 >= 16
-            || self.record_count() >= 255
-            || self.id_seen(grant_id)
+            || self.record_count() >= MAX_CREATION_RECORDS
+            || self.id_seen(approval.grant_id)
         {
             return Err(SecurityError::Unauthorized);
         }
+        let initiator_static = pending.initiator_static;
         let mut next = self.clone();
+        next.last_accepted_wall_unix_seconds = accepted_wall;
         let epoch = next.next_auth_epoch;
         next.next_auth_epoch = epoch.checked_add(1).ok_or(SecurityError::Bounds)?;
         next.pending[pending_index].state = PendingState::Approved;
         next.grants.push(Grant {
-            grant_id,
+            grant_id: approval.grant_id,
+            initiator_static,
+            responder_static: approval.responder_static,
+            scope: CONSENT_SCOPE,
+            endpoints: [1, 2, 3, 4],
             auth_epoch: epoch,
             source_scope_generation: next.source_scope_generation,
-            expires_at_ms: grant_expires_at_ms,
-            endpoints: [1, 2, 3, 4],
-            scope: CONSENT_SCOPE,
+            created_at_ms: effective_now_ms,
+            expires_at_ms: approval.grant_expires_at_ms,
             state: GrantState::Active,
         });
         Ok(next)
     }
 
+    /// Does not advance the wall: `terminal_at_ms` is a record timestamp, not a
+    /// clock reading. Letting record data drive the durable clock would let one
+    /// absurd timestamp lock it into the future.
+    ///
+    /// Never fails on record count: refusing to record a rejection because the
+    /// state is full would leave the claim awaiting approval instead.
     pub fn reject_pending(
         &self,
         pending_id: [u8; 16],
@@ -999,6 +1166,7 @@ impl ReferenceState {
         Ok(next)
     }
 
+    /// Does not advance the wall: `terminal_at_ms` is a record timestamp.
     pub fn cancel_offer(
         &self,
         offer_id: [u8; 16],
@@ -1009,7 +1177,7 @@ impl ReferenceState {
             .iter()
             .position(|offer| offer.offer_id == offer_id && offer.state == OfferState::Active)
             .ok_or(SecurityError::Invalid)?;
-        if self.record_count() >= 256 {
+        if self.record_count() >= MAX_RECORDS {
             return Err(SecurityError::Bounds);
         }
         let mut next = self.clone();
@@ -1024,8 +1192,10 @@ impl ReferenceState {
         Ok(next)
     }
 
+    /// Does not advance the wall: `now_ms` is the record timestamp written into
+    /// the terminal record, not a checked clock reading.
     pub fn expire_one(&self, record_id: [u8; 16], now_ms: i64) -> Result<Self, SecurityError> {
-        if self.record_count() >= 256 {
+        if self.record_count() >= MAX_RECORDS {
             return Err(SecurityError::Bounds);
         }
         let mut next = self.clone();
@@ -1077,6 +1247,12 @@ impl ReferenceState {
         Err(SecurityError::Invalid)
     }
 
+    /// Does not advance the wall: `terminal_at_ms` is a record timestamp.
+    ///
+    /// Never fails on record count. A terminal record leaves only through
+    /// compaction, which needs a cleanup report, ninety days and a sane clock;
+    /// a revoke that could fail on a full state would be unrevocable for
+    /// months, which is what the terminal reserve exists to prevent.
     pub fn revoke_commit(
         &self,
         grant_id: [u8; 16],
@@ -1117,6 +1293,8 @@ impl ReferenceState {
         Ok(next)
     }
 
+    /// Does not advance the wall: `terminal_at_ms` is a record timestamp.
+    /// Never fails on record count, for the reason given on `revoke_commit`.
     pub fn disable_commit(
         &self,
         record_id: [u8; 16],
@@ -1140,6 +1318,8 @@ impl ReferenceState {
         Ok(next)
     }
 
+    /// Does not advance the wall: `terminal_at_ms` is a record timestamp.
+    /// Never fails on record count, for the reason given on `revoke_commit`.
     pub fn uninstall_commit(
         &self,
         record_id: [u8; 16],
@@ -1150,6 +1330,7 @@ impl ReferenceState {
         Ok(next)
     }
 
+    /// Does not advance the wall: it takes no clock reading at all.
     pub fn source_change_commit(&self) -> Result<Self, SecurityError> {
         let mut next = self.clone();
         next.raise_deny_floor()?;
@@ -1160,19 +1341,50 @@ impl ReferenceState {
         Ok(next)
     }
 
-    pub fn compact_terminals(&mut self, now_ms: i64) {
+    /// Advances the wall: `os_now_seconds` is a checked clock reading.
+    ///
+    /// The runtime reports that physical cleanup finished for one terminal
+    /// record. Nothing else can set `cleanup_complete`, and without it
+    /// compaction is inert — which is precisely why compaction's own missing
+    /// clock check went unnoticed. Changes no counter but the wall.
+    pub fn mark_cleanup_complete(
+        &self,
+        record_id: [u8; 16],
+        os_now_seconds: i64,
+    ) -> Result<Self, SecurityError> {
+        let (accepted_wall, _) = self.accept_clock(os_now_seconds)?;
+        let index = self
+            .terminal
+            .iter()
+            .position(|terminal| terminal.record_id == record_id && !terminal.cleanup_complete)
+            .ok_or(SecurityError::Invalid)?;
+        let mut next = self.clone();
+        next.last_accepted_wall_unix_seconds = accepted_wall;
+        next.terminal[index].cleanup_complete = true;
+        Ok(next)
+    }
+
+    /// Advances the wall: `os_now_seconds` is a checked clock reading.
+    ///
+    /// Refused outright while the clock is anomalous, so a rolled-back or
+    /// jumped clock cannot age records out of the audit trail early.
+    pub fn compact_terminals(&self, os_now_seconds: i64) -> Result<Self, SecurityError> {
         const NINETY_DAYS_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
-        self.terminal.sort_by_key(|terminal| {
+        let (accepted_wall, effective_now_ms) = self.accept_clock(os_now_seconds)?;
+        let mut next = self.clone();
+        next.last_accepted_wall_unix_seconds = accepted_wall;
+        next.terminal.sort_by_key(|terminal| {
             (
                 terminal.terminal_at_ms,
                 terminal_kind_rank(terminal.kind),
                 terminal.record_id,
             )
         });
-        self.terminal.retain(|terminal| {
+        next.terminal.retain(|terminal| {
             !(terminal.cleanup_complete
-                && now_ms.saturating_sub(terminal.terminal_at_ms) >= NINETY_DAYS_MS)
+                && effective_now_ms.saturating_sub(terminal.terminal_at_ms) >= NINETY_DAYS_MS)
         });
+        Ok(next)
     }
 
     fn raise_deny_floor(&mut self) -> Result<(), SecurityError> {
@@ -1184,15 +1396,23 @@ impl ReferenceState {
         Ok(())
     }
 
-    fn effective_now_ms(&self, os_now_seconds: i64) -> Result<i64, SecurityError> {
+    /// Checks a clock reading and returns `(accepted wall seconds, effective now
+    /// in milliseconds)`.
+    ///
+    /// The accepted wall is `max(osNow,lastAcceptedWall)`, so it never
+    /// decreases even when the reading steps back within tolerance. This is the
+    /// only place the durable clock may be sourced from, and callers in the
+    /// advancing set must write the first element back into the returned state.
+    fn accept_clock(&self, os_now_seconds: i64) -> Result<(i64, i64), SecurityError> {
         let clock = clock_status(os_now_seconds, self.last_accepted_wall_unix_seconds);
         if clock.anomaly {
             return Err(SecurityError::Unauthorized);
         }
-        clock
+        let effective_now_ms = clock
             .effective_now
             .checked_mul(1_000)
-            .ok_or(SecurityError::Bounds)
+            .ok_or(SecurityError::Bounds)?;
+        Ok((clock.effective_now, effective_now_ms))
     }
 
     fn record_count(&self) -> usize {

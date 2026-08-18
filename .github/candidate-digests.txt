@@ -1,13 +1,21 @@
+# SHA-256 of every contract file, re-derived on each CI platform before
+# anything compiles. See .github/verify-candidate-digests.py.
+#
+# MEANING CHANGED: this originally pinned "byte-identical to the reviewed
+# SA-0 candidate". Since the correction slice on feat/contract-clock-v1 it
+# pins "byte-identical to the CORRECTED contract" instead. It is not, and
+# must never become, "whatever was committed last": a change to any listed
+# file has to arrive with the reason it changed.
 9261ba46197050ccf1b80455a9b0193d5ab1069ae2dfceeae469e60b61fd6450  Cargo.lock
 5e7c8f4987ec411537c3a2fffb58e905cd9b6ceef48ed405d79395d404e9d093  Cargo.toml
 79d1c0363e4576d67827ebfa029fad7e3a5981474f4aafba3bd71e54f1a98172  spec/report-cache-v1.md
-970443f03c1479b2efe8f8a52d7fe30cebeb6d07eccc44f8f0d96ca2e9a60604  spec/security-v1.md
+ad9c1fc39056f0f6033dbb7426224ab987d7b4de0ef71371c348ddd8f20f762d  spec/security-v1.md
 0fc483cc0ac6e3b744b92af1194ac2c9bfb3ae4bf02c1bd220befda98bcd4d0f  spec/v1.md
 ff21cbcfdd6aedfb68ac1b3cfda056663203f2c7f08fd05a856dc5dbe5e4c25a  src/cache.rs
 8b0add8d4fde2253edebdddd448d381559d63ff630f0e9d2f9faad8d9625567f  src/canonical.rs
 42c33ea34862e0fe5a668922fb1c37aca7407fc123903a794b866fddf8d49772  src/lib.rs
 e3f35e33b4b26bab06e243d14eb087b5b2405a3b093a6a744cc84a5a36573ab0  src/report.rs
-b3938093584be2d4a2c2e5b62936280ae98e88cb986fdea4d44c6425de1930a0  src/security.rs
+ce18b810f1ceddb919202d2ff6df078d8c98210981ad992690834a9dd6269aac  src/security.rs
 e01e9d55a26fb4f807ff0baea4a9681b0cbbb86b61f6b00fe5c49d919a2ebb10  tests/fixtures/v1/cache/body.sha256
 edb92226baac009e4c7779cb2c7a7369049e0ea97615945f8e64378322785b19  tests/fixtures/v1/cache/filename.txt
 417b8bac17da40d1de4fee3e71f3a13770427d98ac764313f3d1074e4cb64002  tests/fixtures/v1/cache/key.json
@@ -28,4 +36,4 @@ cd289e2421e745c59b5798ffc29fcecb02836444f77e816794d62e6f4a2a688e  tests/fixtures
 94653acee749d3612203b35dc400df8d7c4a93272af47f2cdeb10d2f6e14cb00  tests/fixtures/v1/security/state_transitions.json
 cbd942c4fd168b5d78fbfc469acd06cb62f77c026fcbc256285c6c7d9680fdd1  tests/fixtures/v1/security/uninstall.json
 39c2823d68bf6de7854574899b606167897c21292037b8ed359b19fe2e08062c  tests/report_cache_v1.rs
-85da1c5c330fba8e180a61ea6946f93916400142786be268636c197f39c8b788  tests/security_contract_v1.rs
+b79c5bc8ade3f59367a1a0639c5dd7b8c17a94a92997ddf952cc60a462371f62  tests/security_contract_v1.rs
