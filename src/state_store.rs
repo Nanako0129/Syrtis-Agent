@@ -794,12 +794,12 @@ mod seams {
             cell.set(
                 checks
                     .iter()
-                    .fold(0, |bits, check| bits | 1 << *check as u32),
+                    .fold(0, |bits, check| bits | (1 << *check as u32)),
             )
         });
     }
     pub(super) fn skipped(check: Check) -> bool {
-        SKIP.with(|cell| cell.get() & 1 << check as u32 != 0)
+        SKIP.with(|cell| cell.get() & (1 << check as u32) != 0)
     }
 
     pub(super) struct Reset;
