@@ -1137,16 +1137,20 @@ mod tests {
 
     /// Whether this process is refused a `mkdir` inside a `0500` directory it
     /// owns. False for root and for a process with `CAP_DAC_OVERRIDE`, which
-    /// bypass directory permissions. Probed by behaviour, not by UID.
+    /// bypass directory permissions. Probed by behaviour, not by UID. Only
+    /// `PermissionDenied` counts as enforced; any other `mkdir` error fails
+    /// the test. `TempHome` drop removes the probe (an empty `0500`
+    /// directory, or one holding `inner` when permissions are bypassed).
     fn directory_permissions_enforced() -> bool {
         let scratch = TempHome::new();
         let probe = scratch.path.join("probe");
         std::fs::create_dir(&probe).unwrap();
         chmod(&probe, 0o500);
-        let enforced = std::fs::create_dir(probe.join("inner")).is_err();
-        chmod(&probe, 0o700);
-        std::fs::remove_dir_all(&probe).unwrap();
-        enforced
+        match std::fs::create_dir(probe.join("inner")) {
+            Ok(()) => false,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => true,
+            Err(error) => panic!("directory permission probe: {error}"),
+        }
     }
 
     /// umask is process-wide, so it is set in a child process. Under umask
@@ -1194,11 +1198,14 @@ mod tests {
                 // enforced, creating `AppSupport` in it fails with `EACCES`
                 // and the root is never created; the `NotFound` assertions
                 // check that. Root or `CAP_DAC_OVERRIDE` bypasses the
-                // `EACCES` (found by the probe, not by UID), so there they
-                // are skipped and the failure point is inferred: the root is
-                // created `0500` and refused by the exact-`0700` check. The
-                // `Err(UnsafeState)` assertion above and the `0500`
-                // assertion run either way.
+                // `EACCES` (found by the probe, not by UID); there the
+                // inferred failure point is asserted instead: the root is
+                // created `0500` and refused by the exact-`0700` check. That
+                // branch has never run (hosted CI and the maintainer's Mac
+                // are not root), and under `GITHUB_ACTIONS` it then fails the
+                // test, because CI must run the `NotFound` branch; elsewhere
+                // it prints `SKIPPED`. The `Err(UnsafeState)` assertion above
+                // and the `Library` `0500` assertion run either way.
                 let library = home.path.join(SUFFIX[0]);
                 let mode = std::fs::symlink_metadata(&library).unwrap().mode() & 0o7777;
                 assert_eq!(mode, 0o500);
@@ -1207,6 +1214,15 @@ mod tests {
                         let error = std::fs::symlink_metadata(&path).unwrap_err();
                         assert_eq!(error.kind(), io::ErrorKind::NotFound, "{path:?}");
                     }
+                } else {
+                    let root = std::fs::symlink_metadata(home.root()).unwrap();
+                    assert_eq!(root.mode() & 0o7777, 0o500);
+                    if std::env::var_os("GITHUB_ACTIONS").is_some() {
+                        panic!(
+                            "directory permissions bypassed (root/CAP_DAC_OVERRIDE) under GITHUB_ACTIONS"
+                        );
+                    }
+                    eprintln!("SKIPPED: a_restrictive_umask_still_yields_exact_modes");
                 }
             }
         }

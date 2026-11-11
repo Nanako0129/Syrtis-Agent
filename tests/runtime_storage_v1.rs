@@ -412,6 +412,21 @@ mod disk {
                 let result = SecureRoot::open_under(&home, SUFFIX).map(|_| ());
                 println!("LOCK:{result:?}");
             }
+            // "lock", but `Busy` is retried the way `try_open` retries it, for
+            // at most 2 s: a fork-to-exec child of the parent binary can
+            // still hold the lock the parent just released.
+            "lock-ok" => {
+                let attempt = || SecureRoot::open_under(&home, SUFFIX).map(|_| ());
+                let mut result = attempt();
+                for _ in 0..200 {
+                    if !matches!(result, Err(StorageError::Busy)) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    result = attempt();
+                }
+                println!("LOCK:{result:?}");
+            }
             "home" => println!("HOME:{}", default_root_path().unwrap().display()),
             other => panic!("unknown child mode {other}"),
         }
@@ -605,7 +620,7 @@ mod disk {
         assert_eq!(child("lock", &home.path, &[], "LOCK"), "Err(Busy)");
         drop(store);
         // The child takes the lock and exits; exit releases it.
-        assert_eq!(child("lock", &home.path, &[], "LOCK"), "Ok(())");
+        assert_eq!(child("lock-ok", &home.path, &[], "LOCK"), "Ok(())");
         open(&home);
     }
 

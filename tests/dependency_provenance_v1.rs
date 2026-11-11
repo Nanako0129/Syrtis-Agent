@@ -720,7 +720,11 @@ fn the_checkout_has_no_cargo_config() {
 
     // A directory whose `.cargo` lookup fails with an error other than
     // `NotFound`: no search permission. Root or `CAP_DAC_OVERRIDE` bypasses
-    // that, so the control runs only when the lookup really is refused.
+    // that, so the control runs only when the lookup fails with any error
+    // other than `NotFound`. Otherwise it is skipped, which under
+    // `GITHUB_ACTIONS` fails the test: CI must run the control. The chmod
+    // back to `0o700` comes first, or `Scratch` drop would leak `locked`.
+    // No test reaches this branch on Windows.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -729,7 +733,7 @@ fn the_checkout_has_no_cargo_config() {
         std::fs::create_dir(&locked).unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let refused = std::fs::symlink_metadata(locked.join(".cargo"))
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied);
+            .is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound);
         let result = no_cargo_config_in(&locked);
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
         if refused {
@@ -737,6 +741,10 @@ fn the_checkout_has_no_cargo_config() {
                 cannot_tell(&result),
                 "a directory without search permission: {result:?}"
             );
+        } else if std::env::var_os("GITHUB_ACTIONS").is_some() {
+            panic!("directory permissions bypassed (root/CAP_DAC_OVERRIDE) under GITHUB_ACTIONS");
+        } else {
+            eprintln!("SKIPPED: the_checkout_has_no_cargo_config");
         }
     }
 }
