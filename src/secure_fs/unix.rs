@@ -1135,9 +1135,26 @@ mod tests {
         println!("UMASK:{result:?}");
     }
 
+    /// Whether this process is refused a `mkdir` inside a `0500` directory it
+    /// owns. False for root and for a process with `CAP_DAC_OVERRIDE`, which
+    /// bypass directory permissions. Probed by behaviour, not by UID.
+    fn directory_permissions_enforced() -> bool {
+        let scratch = TempHome::new();
+        let probe = scratch.path.join("probe");
+        std::fs::create_dir(&probe).unwrap();
+        chmod(&probe, 0o500);
+        let enforced = std::fs::create_dir(probe.join("inner")).is_err();
+        chmod(&probe, 0o700);
+        std::fs::remove_dir_all(&probe).unwrap();
+        enforced
+    }
+
     /// umask is process-wide, so it is set in a child process. Under umask
     /// 0277 every object the agent creates still ends with its exact mode.
-    /// Negative control: without the `fchmod`, the root cannot be created.
+    /// Negative control: without the `fchmod` the open fails closed. When
+    /// directory permissions are enforced (not root or `CAP_DAC_OVERRIDE`)
+    /// the root cannot be created; otherwise the root is inferred, not
+    /// measured, to be created `0500` and refused by the exact-`0700` check.
     #[test]
     fn a_restrictive_umask_still_yields_exact_modes() {
         for (skip, expected) in [(false, "Ok(())"), (true, "Err(UnsafeState)")] {
@@ -1173,15 +1190,19 @@ mod tests {
                 }
             } else {
                 // Where it failed: `Library` was created but left at the
-                // umask-filtered `0500`, so creating `AppSupport` in it failed
-                // and the root was never created. Root bypasses that
-                // `EACCES`, so when the tests run as root the `NotFound`
-                // assertions are skipped; the `Err(UnsafeState)` assertion
-                // above still runs.
+                // umask-filtered `0500`. When directory permissions are
+                // enforced, creating `AppSupport` in it fails with `EACCES`
+                // and the root is never created; the `NotFound` assertions
+                // check that. Root or `CAP_DAC_OVERRIDE` bypasses the
+                // `EACCES` (found by the probe, not by UID), so there they
+                // are skipped and the failure point is inferred: the root is
+                // created `0500` and refused by the exact-`0700` check. The
+                // `Err(UnsafeState)` assertion above and the `0500`
+                // assertion run either way.
                 let library = home.path.join(SUFFIX[0]);
                 let mode = std::fs::symlink_metadata(&library).unwrap().mode() & 0o7777;
                 assert_eq!(mode, 0o500);
-                if unsafe { libc::geteuid() } != 0 {
+                if directory_permissions_enforced() {
                     for path in [library.join(SUFFIX[1]), home.root()] {
                         let error = std::fs::symlink_metadata(&path).unwrap_err();
                         assert_eq!(error.kind(), io::ErrorKind::NotFound, "{path:?}");

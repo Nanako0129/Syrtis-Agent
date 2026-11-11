@@ -627,16 +627,23 @@ fn snow_features_are_parsed_item_by_item() {
     check_manifest(MANIFEST).unwrap();
 }
 
-/// `Ok` only when `dir` has no `.cargo` entry of any kind: directory, file
-/// or symlink, dangling or not. Any error other than `NotFound` is an
-/// error, never "absent". On Unix that includes `dir` not being a
-/// directory (`ENOTDIR`); on Windows such a path is inferred, not measured,
-/// to read as `NotFound`.
+/// `Ok` only when `dir` is a directory with no `.cargo` entry of any kind:
+/// directory, file or symlink, dangling or not. `dir` itself must be a
+/// directory first, so a non-directory is an error on every OS. After that,
+/// any error other than `NotFound` is an error, never "absent".
 fn no_cargo_config_in(dir: &std::path::Path) -> Result<(), String> {
+    let cannot =
+        |error: &dyn std::fmt::Display| format!("cannot tell whether .cargo is present: {error}");
+    if !std::fs::metadata(dir)
+        .map_err(|error| cannot(&error))?
+        .is_dir()
+    {
+        return Err(cannot(&"not a directory"));
+    }
     match std::fs::symlink_metadata(dir.join(".cargo")) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Ok(_) => Err(".cargo is present".into()),
-        Err(error) => Err(format!("cannot tell whether .cargo is present: {error}")),
+        Err(error) => Err(cannot(&error)),
     }
 }
 
@@ -663,12 +670,13 @@ impl Drop for Scratch {
 }
 
 /// P4-c: cargo source replacement (`.cargo/config.toml`) is outside every
-/// check above, and this repo has no `.cargo/` at its root. This is a
-/// tripwire against adding one there by accident. It checks the repository
-/// root only: a `.cargo/` in a subdirectory (for example `tests/.cargo/`),
-/// in a parent directory or in `$CARGO_HOME` is not seen, so it is no
-/// defence against a malicious source replacement. Negative controls run in
-/// temp directories, never in the checkout.
+/// check above, and this package has no `.cargo/` in its directory. This is
+/// a tripwire against adding one there by accident. It checks only the
+/// package (manifest) directory, `CARGO_MANIFEST_DIR`, which is the
+/// repository root today: a `.cargo/` in a subdirectory (for example
+/// `tests/.cargo/`), in a parent directory or in `$CARGO_HOME` is not seen,
+/// so it is no defence against a malicious source replacement. Negative
+/// controls run in temp directories, never in the checkout.
 #[test]
 fn the_checkout_has_no_cargo_config() {
     no_cargo_config_in(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
@@ -695,20 +703,40 @@ fn the_checkout_has_no_cargo_config() {
         );
     }
 
-    // `ENOTDIR` is a Unix errno. Windows is inferred (not measured) to
-    // report a path through a file as not found, so this control runs on
-    // macOS and Linux only.
+    let cannot_tell = |result: &Result<(), String>| {
+        result
+            .as_ref()
+            .is_err_and(|error| error.starts_with("cannot tell whether .cargo is present:"))
+    };
+
+    let scratch = Scratch::new("cargo-notdir");
+    let file = scratch.0.join("file");
+    std::fs::write(&file, b"").unwrap();
+    let result = no_cargo_config_in(&file);
+    assert!(
+        cannot_tell(&result),
+        "a file passed as the directory: {result:?}"
+    );
+
+    // A directory whose `.cargo` lookup fails with an error other than
+    // `NotFound`: no search permission. Root or `CAP_DAC_OVERRIDE` bypasses
+    // that, so the control runs only when the lookup really is refused.
     #[cfg(unix)]
     {
-        let scratch = Scratch::new("cargo-notdir");
-        let file = scratch.0.join("file");
-        std::fs::write(&file, b"").unwrap();
-        let result = no_cargo_config_in(&file);
-        assert!(
-            result
-                .as_ref()
-                .is_err_and(|error| error.starts_with("cannot tell whether .cargo is present:")),
-            "a file passed as the directory (ENOTDIR): {result:?}"
-        );
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("cargo-nosearch");
+        let locked = scratch.0.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let refused = std::fs::symlink_metadata(locked.join(".cargo"))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied);
+        let result = no_cargo_config_in(&locked);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if refused {
+            assert!(
+                cannot_tell(&result),
+                "a directory without search permission: {result:?}"
+            );
+        }
     }
 }
