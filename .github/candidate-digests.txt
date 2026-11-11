@@ -14,6 +14,11 @@
 # SA-0D amended the SA-0 contract on purpose: it registers the pairing,
 # grant-status and peer-error wire surfaces in spec/v1.md and adds `state`
 # to PROTOCOL_FIELDS, so those five files carry new digests.
+#
+# SA-2B2a1 adds spec/pairing-v1.md, the pairing wire contract (Noise
+# framing, pairing ID derivations, producer order, receiver client). No
+# existing line changed.
+97ec5c2337388c6661e749f5ac9751a4b115216a44b07d94362b870c20914e73  spec/pairing-v1.md
 79d1c0363e4576d67827ebfa029fad7e3a5981474f4aafba3bd71e54f1a98172  spec/report-cache-v1.md
 976e37c0082c128f4067282506c4606013fa95b7387d5c937c627b9b0117ea4d  spec/security-v1.md
 ea302173340ae0dfb6f2a421326e7e178d2454bcab45ac28d74b144c1f17890e  spec/state-store-v1.md
