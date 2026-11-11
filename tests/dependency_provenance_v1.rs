@@ -141,6 +141,65 @@ const TABLES: [&str; 4] = [
 /// `[package]` keys. `build`, `links`, `workspace` and the rest are refused.
 const PACKAGE_KEYS: [&str; 5] = ["name", "version", "edition", "rust-version", "license"];
 
+/// The only keys a dependency's inline table may hold. `git`, `path`,
+/// `registry`, `registry-index`, `package`, `artifact`, `lib`, `target`,
+/// `branch`, `rev`, `tag` and anything else are refused, quoted or not.
+const DEPENDENCY_KEYS: [&str; 4] = ["version", "default-features", "features", "optional"];
+
+/// Byte offsets of `separator` outside strings and brackets. `None` when a
+/// string or bracket is left open.
+fn top_level_positions(text: &str, separator: u8) -> Option<Vec<usize>> {
+    let (mut positions, mut depth, mut quote, mut escaped) = (Vec::new(), 0usize, None, false);
+    for (index, byte) in text.bytes().enumerate() {
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' && open == b'"' {
+                escaped = true;
+            } else if byte == open {
+                quote = None;
+            }
+            continue;
+        }
+        match byte {
+            b'"' | b'\'' => quote = Some(byte),
+            b'[' | b'{' => depth += 1,
+            b']' | b'}' => depth = depth.checked_sub(1)?,
+            _ if byte == separator && depth == 0 => positions.push(index),
+            _ => {}
+        }
+    }
+    (quote.is_none() && depth == 0).then_some(positions)
+}
+
+/// The keys of a one-line inline table `{ k = v, … }`, with surrounding
+/// whitespace and quotes stripped. `None` when it cannot be parsed: an open
+/// string or bracket, an empty item, or an item with no `=` outside a string.
+fn inline_table_keys(spec: &str) -> Option<Vec<String>> {
+    let inner = spec.strip_prefix('{')?.strip_suffix('}')?;
+    if inner.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let mut bounds = vec![0];
+    for position in top_level_positions(inner, b',')? {
+        bounds.extend([position, position + 1]);
+    }
+    bounds.push(inner.len());
+    bounds
+        .chunks(2)
+        .map(|pair| {
+            let item = &inner[pair[0]..pair[1]];
+            let equals = *top_level_positions(item, b'=')?.first()?;
+            let (key, value) = (item[..equals].trim(), item[equals + 1..].trim());
+            let key = ['"', '\'']
+                .iter()
+                .find_map(|q| key.strip_prefix(*q)?.strip_suffix(*q))
+                .unwrap_or(key);
+            (!key.is_empty() && !value.is_empty()).then(|| key.to_owned())
+        })
+        .collect()
+}
+
 fn quoted_after<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let start = line.find(key)? + key.len();
     let rest = line[start..].strip_prefix('"')?;
@@ -200,13 +259,17 @@ fn check_manifest(manifest: &str) -> Result<(), String> {
         if spec.starts_with('{') != spec.ends_with('}') {
             return Err(format!("multi-line dependency: {name}"));
         }
-        // Whitespace is stripped first, so `git="…"` is caught like
-        // `git = "…"`. A quoted key (`"git" = …`) is not matched here; the
-        // lock's source and checksum comparison catches what it would pull.
-        let compact: String = spec.chars().filter(|c| !c.is_whitespace()).collect();
-        for forbidden in ["git", "path", "registry", "package", "branch", "rev", "tag"] {
-            if compact.contains(&format!("{forbidden}=")) {
-                return Err(format!("{name}: forbidden key {forbidden}"));
+        if spec.starts_with('{') {
+            let keys =
+                inline_table_keys(spec).ok_or_else(|| format!("{name}: unparsed inline table"))?;
+            let mut seen = BTreeSet::new();
+            for key in keys {
+                if !DEPENDENCY_KEYS.contains(&key.as_str()) {
+                    return Err(format!("{name}: forbidden key {key}"));
+                }
+                if !seen.insert(key.clone()) {
+                    return Err(format!("{name}: duplicate key {key}"));
+                }
             }
         }
         let version = if spec.starts_with('"') {
@@ -374,28 +437,51 @@ fn the_manifest_checker_rejects_unpinned_patched_or_duplicated_dependencies() {
     }
 }
 
-/// A forbidden key written without spaces is still refused. Control: the
-/// same in-test copy with that key renamed to one the checker does not
-/// forbid passes, so the refusal came from the forbidden-key branch.
+/// Every dependency key outside the allowlist is refused, however it is
+/// spelled: quoted, without spaces, or a key no denylist would name; and an
+/// inline table that cannot be parsed is refused. Control: the same in-test
+/// copy with the key renamed to an allowed one passes, so the refusal came
+/// from the key check.
 #[test]
-fn the_manifest_checker_rejects_forbidden_keys_written_without_spaces() {
+fn the_manifest_checker_rejects_any_dependency_key_outside_the_allowlist() {
     let libc = "libc = { version = \"=0.2.189\", default-features = false }";
     assert!(MANIFEST.contains(libc));
-    for (key, renamed) in [("git", "gix"), ("path", "pith")] {
-        let with = |name: &str| {
-            MANIFEST.replace(
-                libc,
-                &format!(
-                    "libc = {{ version = \"=0.2.189\", default-features = false, {name}=\"https://example.invalid/libc\" }}"
-                ),
-            )
-        };
-        let tampered = with(key);
-        assert_ne!(tampered, MANIFEST);
-        assert_eq!(
-            check_manifest(&tampered).unwrap_err(),
-            format!("libc: forbidden key {key}")
+    let with = |extra: &str| {
+        let tampered = MANIFEST.replace(
+            libc,
+            &format!("libc = {{ version = \"=0.2.189\", default-features = false, {extra} }}"),
         );
-        check_manifest(&with(renamed)).unwrap();
+        assert_ne!(tampered, MANIFEST);
+        tampered
+    };
+    for (extra, key) in [
+        ("\"git\" = \"https://example.invalid/libc\"", "git"),
+        ("git=\"https://example.invalid/libc\"", "git"),
+        (
+            "registry-index = \"https://example.invalid/index\"",
+            "registry-index",
+        ),
+        ("artifact = \"bin\"", "artifact"),
+        ("path = \"../libc\"", "path"),
+        ("'lib' = true", "lib"),
+    ] {
+        assert_eq!(
+            check_manifest(&with(extra)).unwrap_err(),
+            format!("libc: forbidden key {key}"),
+            "{extra}"
+        );
+        let renamed = extra.replacen(key, "optional", 1);
+        check_manifest(&with(&renamed)).unwrap_or_else(|error| panic!("{renamed}: {error}"));
     }
+    for extra in ["git", "features = [\"std\"", "version = \"=1\" = 2 \"x", ""] {
+        assert_eq!(
+            check_manifest(&with(extra)).unwrap_err(),
+            "libc: unparsed inline table",
+            "{extra:?}"
+        );
+    }
+    assert_eq!(
+        check_manifest(&with("version = \"=0.2.189\"")).unwrap_err(),
+        "libc: duplicate key version"
+    );
 }

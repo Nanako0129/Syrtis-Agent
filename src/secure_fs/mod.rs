@@ -127,6 +127,11 @@ pub(crate) mod seams {
         static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
         #[cfg(target_os = "macos")]
         static ACL_GET_ENTRY_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
+        /// `acl_get_entry` calls left before one fails without setting errno.
+        #[cfg(target_os = "macos")]
+        static ACL_GET_ENTRY_SILENT_IN: Cell<Option<usize>> = const { Cell::new(None) };
+        #[cfg(target_os = "macos")]
+        static CLOBBER_ERRNO_AFTER_FREE: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Makes every `acl_get_entry` on this thread return −1 with `errno`
@@ -138,6 +143,39 @@ pub(crate) mod seams {
     #[cfg(target_os = "macos")]
     pub(crate) fn acl_get_entry_failure() -> Option<i32> {
         ACL_GET_ENTRY_ERRNO.with(Cell::get)
+    }
+
+    /// Makes call number `n` (0-based, counted from now) of `acl_get_entry`
+    /// on this thread return −1 without touching errno, as a failure that
+    /// leaves an earlier call's errno in place would (macOS).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn fail_acl_get_entry_silently_at(n: Option<usize>) {
+        ACL_GET_ENTRY_SILENT_IN.with(|cell| cell.set(n));
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn acl_get_entry_fails_silently() -> bool {
+        ACL_GET_ENTRY_SILENT_IN.with(|cell| match cell.get() {
+            Some(0) => {
+                cell.set(None);
+                true
+            }
+            Some(n) => {
+                cell.set(Some(n - 1));
+                false
+            }
+            None => false,
+        })
+    }
+
+    /// Makes `acl_free` overwrite errno with `EINVAL` on this thread
+    /// (macOS), so an errno read after the free is caught.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn clobber_errno_after_acl_free(value: bool) {
+        CLOBBER_ERRNO_AFTER_FREE.with(|cell| cell.set(value));
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn clobbers_errno_after_acl_free() -> bool {
+        CLOBBER_ERRNO_AFTER_FREE.with(Cell::get)
     }
 
     pub(crate) fn bypass(flags: u32) {
@@ -186,6 +224,10 @@ pub(crate) mod seams {
             set_hook(None);
             #[cfg(target_os = "macos")]
             fail_acl_get_entry(None);
+            #[cfg(target_os = "macos")]
+            fail_acl_get_entry_silently_at(None);
+            #[cfg(target_os = "macos")]
+            clobber_errno_after_acl_free(false);
         }
     }
 }

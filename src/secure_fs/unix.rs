@@ -144,12 +144,8 @@ impl SecureRoot {
                 #[cfg(target_os = "macos")]
                 clear_acl(&next).map_err(|_| StorageError::UnsafeState)?;
             }
-            // A created directory's entry is made durable in its parent. The
-            // root's parent is synced on every open, found or created, so a
-            // root an earlier run created but crashed before syncing is
-            // durable before any commit lands in it. Failure here is
-            // `UnsafeState`: nothing was committed, so nothing is unknown.
-            if created || (last && sync_found_root_parent()) {
+            // A created intermediate's entry is made durable in its parent.
+            if created && !last {
                 shim(Step::SyncParent(index), || full_sync(&dir))
                     .map_err(|_| StorageError::UnsafeState)?;
             }
@@ -165,6 +161,17 @@ impl SecureRoot {
                     StorageError::UnsafeState,
                 )?;
                 guard(local_filesystem(&next), LOCAL_FS, StorageError::UnsafeState)?;
+                // The root's parent is synced on every open, found or
+                // created, so a root an earlier run created but crashed
+                // before syncing is durable before any commit lands in it.
+                // Only after every root check: an open that is refused, or
+                // a root on a non-local filesystem, never pays for (or hangs
+                // on) the sync. Failure is `UnsafeState`: nothing was
+                // committed, so nothing is unknown.
+                if created || sync_found_root_parent() {
+                    shim(Step::SyncParent(index), || full_sync(&dir))
+                        .map_err(|_| StorageError::UnsafeState)?;
+                }
             } else {
                 check_owner(&meta, Object::Intermediate)?;
                 guard(
@@ -430,25 +437,34 @@ mod acl {
         pub(super) fn acl_set_tag_type(entry: AclEntry, tag: c_int) -> c_int;
     }
 
-    /// `acl_get_entry`; a test seam can make it fail with a chosen errno.
+    /// `acl_get_entry`, the only call site for both `none` and the
+    /// deny-only walk. errno is cleared first, so the `EINVAL` read after a
+    /// −1 can only come from this call, never from an earlier one. Test
+    /// seams can make it fail with a chosen errno, or fail without setting
+    /// errno.
     fn get_entry(acl: Acl, entry_id: c_int, entry: &mut AclEntry) -> c_int {
+        unsafe { *libc::__error() = 0 };
         #[cfg(test)]
         if let Some(errno) = super::seams::acl_get_entry_failure() {
             unsafe { *libc::__error() = errno };
             return -1;
         }
+        #[cfg(test)]
+        if super::seams::acl_get_entry_fails_silently() {
+            return -1;
+        }
         unsafe { acl_get_entry(acl, entry_id, entry) }
     }
 
-    /// `acl_free`. Test builds then overwrite errno with `EINVAL`, so code
-    /// that reads errno after the free, instead of before it, reads the
-    /// "no more entries" value and is caught by the tests.
+    /// `acl_free`. When a test sets the seam, errno is then overwritten with
+    /// `EINVAL`, so code that reads errno after the free, instead of before
+    /// it, reads the "no more entries" value and is caught.
     pub(super) fn free(acl: Acl) {
         unsafe { acl_free(acl) };
         #[cfg(test)]
-        unsafe {
-            *libc::__error() = libc::EINVAL
-        };
+        if super::seams::clobbers_errno_after_acl_free() {
+            unsafe { *libc::__error() = libc::EINVAL };
+        }
     }
 
     fn errno() -> Option<i32> {
@@ -486,16 +502,19 @@ mod acl {
         match read(file) {
             Ok(None) => true,
             Err(()) => false,
-            Ok(Some(acl)) => {
-                let mut entry: AclEntry = std::ptr::null_mut();
-                let rc = get_entry(acl, ACL_FIRST_ENTRY, &mut entry);
-                // errno is read before `acl_free`, which may change it. Only
-                // `EINVAL` means "no entry"; any other failure counts as one.
-                let empty = rc == -1 && errno() == Some(libc::EINVAL);
-                free(acl);
-                empty
-            }
+            Ok(Some(acl)) => empty_then_free(acl),
         }
+    }
+
+    /// Whether `acl` has no entry, then frees it.
+    pub(super) fn empty_then_free(acl: Acl) -> bool {
+        let mut entry: AclEntry = std::ptr::null_mut();
+        let rc = get_entry(acl, ACL_FIRST_ENTRY, &mut entry);
+        // errno is read before `acl_free`, which may change it. Only
+        // `EINVAL` means "no entry"; any other failure counts as one.
+        let empty = rc == -1 && errno() == Some(libc::EINVAL);
+        free(acl);
+        empty
     }
 
     /// True only when the descriptor has no extended ACL or every entry is
@@ -1115,12 +1134,7 @@ mod tests {
     /// `ls -le` lists extended ACL entries as ` 0: …` lines.
     #[cfg(target_os = "macos")]
     fn ls_shows_acl(path: &Path) -> bool {
-        let output = std::process::Command::new("/bin/ls")
-            .arg("-led")
-            .arg(path)
-            .output()
-            .unwrap();
-        String::from_utf8(output.stdout).unwrap().contains("\n 0: ")
+        acl_listing(path).contains("\n 0: ")
     }
 
     #[cfg(target_os = "macos")]
@@ -1249,26 +1263,30 @@ mod tests {
     /// c2 at the tag level, on in-memory ACLs: only `ACL_EXTENDED_DENY`
     /// passes. `ACL_UNDEFINED_TAG` cannot be written to a file, so this is
     /// where an "every tag except allow" rule is caught.
+    /// An in-memory ACL with one entry per tag; `None` leaves a fresh
+    /// entry's tag as created. A control asserts each tag reads back.
+    #[cfg(target_os = "macos")]
+    fn in_memory_acl(tags: &[Option<libc::c_int>]) -> acl::Acl {
+        let mut list = unsafe { acl::acl_init(4) };
+        assert!(!list.is_null());
+        for tag in tags {
+            let mut entry: acl::AclEntry = std::ptr::null_mut();
+            assert_eq!(unsafe { acl::acl_create_entry(&mut list, &mut entry) }, 0);
+            if let Some(tag) = tag {
+                assert_eq!(unsafe { acl::acl_set_tag_type(entry, *tag) }, 0);
+            }
+            let mut read = -1;
+            assert_eq!(unsafe { acl::acl_get_tag_type(entry, &mut read) }, 0);
+            assert_eq!(read, tag.unwrap_or(acl::ACL_UNDEFINED_TAG), "control: tag");
+        }
+        list
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn only_explicit_deny_tags_pass_the_intermediate_acl_check() {
-        use acl::{ACL_EXTENDED_ALLOW, ACL_EXTENDED_DENY, ACL_UNDEFINED_TAG};
-        // `None` leaves a fresh entry's tag as created.
-        let verdict = |tags: &[Option<libc::c_int>]| {
-            let mut list = unsafe { acl::acl_init(4) };
-            assert!(!list.is_null());
-            for tag in tags {
-                let mut entry: acl::AclEntry = std::ptr::null_mut();
-                assert_eq!(unsafe { acl::acl_create_entry(&mut list, &mut entry) }, 0);
-                if let Some(tag) = tag {
-                    assert_eq!(unsafe { acl::acl_set_tag_type(entry, *tag) }, 0);
-                }
-                let mut read = -1;
-                assert_eq!(unsafe { acl::acl_get_tag_type(entry, &mut read) }, 0);
-                assert_eq!(read, tag.unwrap_or(ACL_UNDEFINED_TAG), "control: tag");
-            }
-            acl::all_deny_then_free(list)
-        };
+        use acl::{ACL_EXTENDED_ALLOW, ACL_EXTENDED_DENY};
+        let verdict = |tags: &[Option<libc::c_int>]| acl::all_deny_then_free(in_memory_acl(tags));
         let (deny, allow) = (Some(ACL_EXTENDED_DENY), Some(ACL_EXTENDED_ALLOW));
         assert!(verdict(&[]));
         assert!(verdict(&[deny]));
@@ -1280,9 +1298,9 @@ mod tests {
     }
 
     /// c5: when `acl_get_entry` fails, only `EINVAL` ("no more entries")
-    /// counts as the end; any other errno counts as an ACL. The test build's
-    /// `acl_free` overwrites errno with `EINVAL`, so errno read after the
-    /// free instead of before it admits the failure and turns this red.
+    /// counts as the end; any other errno counts as an ACL. This test makes
+    /// `acl_free` overwrite errno with `EINVAL`, so errno read after the free
+    /// instead of before it admits the failure and turns this red.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_failed_acl_entry_read_counts_as_an_acl() {
@@ -1293,6 +1311,7 @@ mod tests {
         write_state(&root, b"{}");
         add_acl(&home.root().join("state.json"), "everyone deny delete");
         let _reset = Reset;
+        seams::clobber_errno_after_acl_free(true);
         seams::fail_acl_get_entry(Some(libc::EIO));
         assert_eq!(
             root.read_file("state.json", 64).err(),
@@ -1366,6 +1385,88 @@ mod tests {
         for file in ["owner.lock", "state.json"] {
             assert!(!ls_shows_acl(&home.root().join(file)), "{file}");
         }
+    }
+
+    /// B7: errno is cleared before every `acl_get_entry`, so an `EINVAL`
+    /// left by an earlier call can never read as "end of list".
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stale_einval_never_ends_the_acl_walk() {
+        use acl::{ACL_EXTENDED_ALLOW, ACL_EXTENDED_DENY};
+        let (deny, allow) = (Some(ACL_EXTENDED_DENY), Some(ACL_EXTENDED_ALLOW));
+        let stale_einval = || unsafe { *libc::__error() = libc::EINVAL };
+        let _reset = Reset;
+        // Control: with a stale `EINVAL` in errno the walk still evaluates
+        // every real entry.
+        stale_einval();
+        assert!(acl::all_deny_then_free(in_memory_acl(&[deny, deny])));
+        stale_einval();
+        assert!(!acl::all_deny_then_free(in_memory_acl(&[deny, allow])));
+        stale_einval();
+        assert!(!acl::empty_then_free(in_memory_acl(&[deny])));
+        // A failure that sets no errno, after a stale `EINVAL`, is not the
+        // end of the list: the walk (second call) and `none` (first call)
+        // both refuse.
+        seams::fail_acl_get_entry_silently_at(Some(1));
+        stale_einval();
+        assert!(!acl::all_deny_then_free(in_memory_acl(&[deny, deny])));
+        seams::fail_acl_get_entry_silently_at(Some(0));
+        stale_einval();
+        assert!(!acl::empty_then_free(in_memory_acl(&[deny])));
+    }
+
+    /// B4: the root's parent is synced only after the root passed every
+    /// check, so a refused open (here: injected non-local filesystem) syncs
+    /// no root parent, whether the root was just created or found.
+    #[test]
+    fn a_refused_root_syncs_no_parent() {
+        let home = TempHome::new();
+        let _reset = Reset;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = std::sync::Arc::clone(&seen);
+        seams::set_hook(Some(Box::new(move |step| {
+            if matches!(step, Step::Descend(_) | Step::SyncParent(_)) {
+                record.lock().unwrap().push(step);
+            }
+            Ok(())
+        })));
+        seams::force_nonlocal(true);
+        assert_eq!(open_once(&home).err(), Some(StorageError::UnsafeState));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                Step::Descend(0),
+                Step::SyncParent(0),
+                Step::Descend(1),
+                Step::SyncParent(1),
+                Step::Descend(2),
+            ]
+        );
+        seen.lock().unwrap().clear();
+        assert_eq!(open_once(&home).err(), Some(StorageError::UnsafeState));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [Step::Descend(0), Step::Descend(1), Step::Descend(2)]
+        );
+        // Control: the same root, classified local, opens and syncs its
+        // parent.
+        seams::force_nonlocal(false);
+        drop(
+            retry_busy(|| {
+                seen.lock().unwrap().clear();
+                open_once(&home)
+            })
+            .unwrap(),
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                Step::Descend(0),
+                Step::Descend(1),
+                Step::Descend(2),
+                Step::SyncParent(2),
+            ]
+        );
     }
 
     #[test]
