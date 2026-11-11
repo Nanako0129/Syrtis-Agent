@@ -15,7 +15,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use snow::resolvers::{CryptoResolver, DefaultResolver};
+use snow::{
+    params::DHChoice,
+    resolvers::{CryptoResolver, DefaultResolver},
+};
 
 use crate::{
     canonical::{CanonicalJsonV1, constant_time_eq},
@@ -79,6 +82,20 @@ pub struct StoredState {
     pub config: ListenConfig,
     pub identity_private: Secret32,
     pub control_token: Secret32,
+}
+
+impl StoredState {
+    /// The X25519 public key of `identity_private`. Reads nothing else and
+    /// changes nothing.
+    pub fn identity_public(&self) -> Result<[u8; 32], StorageError> {
+        let mut dh = DefaultResolver
+            .resolve_dh(&DHChoice::Curve25519)
+            .ok_or(StorageError::Unavailable)?;
+        dh.set(self.identity_private.expose());
+        dh.pubkey()
+            .try_into()
+            .map_err(|_| StorageError::Unavailable)
+    }
 }
 
 /// What a caller supplies to authorize one peer request. Everything else in
@@ -376,7 +393,7 @@ pub fn os_now_seconds() -> Result<i64, StorageError> {
         .ok_or(StorageError::Unavailable)
 }
 
-fn random<const N: usize>() -> Result<[u8; N], StorageError> {
+pub(crate) fn random<const N: usize>() -> Result<[u8; N], StorageError> {
     let mut bytes = [0; N];
     DefaultResolver
         .resolve_rng()
