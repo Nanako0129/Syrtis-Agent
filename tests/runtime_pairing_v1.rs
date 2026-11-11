@@ -31,7 +31,7 @@ use syrtis_agent::{
     secure_fs::StorageError,
     security::{
         FRAME_CIPHERTEXT_MAX, Frame, FrameKind, MemoryLedger, PairOffer, REMOTE_MEMORY_MAX,
-        hex_encode, offer_secret_hash,
+        hex_encode, offer_secret_hash, pair_sas,
     },
 };
 
@@ -622,6 +622,167 @@ fn system_clock_instances_share_one_origin() {
     assert!(late >= early, "{late:?} < {early:?}");
 }
 
+/// A claim response for the connection with this `hFinal`.
+fn claim_reply(request: &Frame, secret_hash: &[u8; 32], h_final: &[u8; 32]) -> Frame {
+    frame(
+        FrameKind::Response,
+        request.request_id,
+        json_bytes(json!({
+            "expiresAt": 1,
+            "pendingId": hex_encode(&derive_pending_id(secret_hash, h_final)),
+            "protocol": 1,
+        })),
+    )
+}
+
+/// Acceptance (14): five transport failures after the handshake use the
+/// five attempt records, and the sixth try ends as a lost attempt without
+/// connecting; an answer naming the first attempt's pending ID on the
+/// fifth try is still matched, so no record is ever evicted. Each failure
+/// is a lost reply (the receiver's ledger cannot hold it): the request
+/// reached the producer and may have been committed, so its record stays.
+/// (A `busy` answer drops its record, C1, so it cannot fill them.)
+#[test]
+fn claim_attempts_are_capped_at_five_and_never_evicted() {
+    let fake_key = StaticKey::generate().unwrap();
+    let receiver = StaticKey::generate().unwrap();
+    let time = Mutex::new(Duration::ZERO);
+    let clock = FakeClock::new(&time);
+    let ledger = MemoryLedger::default();
+    let client = PairingClient {
+        identity: &receiver,
+        ledger: &ledger,
+        clock: &clock,
+    };
+    let secret_hash = offer_secret_hash(&offer_id(1), &secret(1), fake_key.public());
+
+    // Every reply would match its own attempt, but none can be read.
+    let fill = ledger.reserve(REMOTE_MEMORY_MAX).unwrap();
+    let mut attempts = ClaimAttempts::default();
+    let (result, count) = fake(
+        &fake_key,
+        |_, request, h_final| Some(claim_reply(request, &secret_hash, h_final)),
+        |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
+    );
+    assert_eq!((result, count), (Err(ClientError::LostAttempt), 5));
+    assert_eq!(attempts.used(&offer_id(1)), 5);
+    let (result, count) = fake(
+        &fake_key,
+        |_, request, h_final| Some(claim_reply(request, &secret_hash, h_final)),
+        |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
+    );
+    assert_eq!((result, count), (Err(ClientError::LostAttempt), 0));
+    drop(fill);
+    assert_eq!(ledger.used(), 0);
+
+    // Four replies are lost; the fifth, readable again, names the pending
+    // ID the first try derived.
+    let fill = Mutex::new(Some(ledger.reserve(REMOTE_MEMORY_MAX).unwrap()));
+    let mut first: Option<[u8; 32]> = None;
+    let mut attempts = ClaimAttempts::default();
+    let (result, count) = fake(
+        &fake_key,
+        |n, request, h_final| {
+            let first = *first.get_or_insert(*h_final);
+            if n < 4 {
+                return Some(claim_reply(request, &secret_hash, h_final));
+            }
+            // Released before the reply is written, so the client can read it.
+            fill.lock().unwrap().take();
+            Some(claim_reply(request, &secret_hash, &first))
+        },
+        |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
+    );
+    assert_eq!(count, 5);
+    let claimed = result.unwrap();
+    assert_eq!(attempts.used(&offer_id(1)), 5);
+    let h_first = first.unwrap();
+    assert_eq!(
+        claimed.sas,
+        pair_sas(
+            1,
+            &offer_id(1),
+            fake_key.public(),
+            receiver.public(),
+            &h_first
+        )
+    );
+    assert_eq!(
+        claimed.pending_id,
+        derive_pending_id(&secret_hash, &h_first)
+    );
+    assert_eq!(ledger.used(), 0);
+}
+
+/// C1: on Pair claim `busy` comes only from the rate limiter, before any
+/// state is read, so an authenticated `busy` drops its attempt record.
+/// Five `busy` answers end the call with `Busy` and no record; a later
+/// claim of the same offer succeeds with its own connection's SAS. Claim
+/// calls stay a second apart: a claim right after a finished one first
+/// waits out the interval, and takes one more record only.
+#[test]
+fn busy_claims_keep_no_record_and_claim_calls_stay_a_second_apart() {
+    let fake_key = StaticKey::generate().unwrap();
+    let receiver = StaticKey::generate().unwrap();
+    let time = Mutex::new(Duration::ZERO);
+    let clock = FakeClock::new(&time);
+    let ledger = MemoryLedger::default();
+    let client = PairingClient {
+        identity: &receiver,
+        ledger: &ledger,
+        clock: &clock,
+    };
+    let secret_hash = offer_secret_hash(&offer_id(1), &secret(1), fake_key.public());
+    let h_finals = Mutex::new(Vec::new());
+    let mut attempts = ClaimAttempts::default();
+    let (outcomes, count) = fake(
+        &fake_key,
+        |n, request, h_final| {
+            h_finals.lock().unwrap().push(*h_final);
+            Some(if n < 5 {
+                frame(FrameKind::Error, request.request_id, error_payload(5))
+            } else {
+                claim_reply(request, &secret_hash, h_final)
+            })
+        },
+        |port| {
+            let offer = fake_offer(&fake_key, port);
+            (0..3)
+                .map(|_| {
+                    let result = client.claim(&offer, &mut attempts);
+                    (result, attempts.used(&offer_id(1)), *time.lock().unwrap())
+                })
+                .collect::<Vec<_>>()
+        },
+    );
+    assert_eq!(count, 7);
+    let h_finals = h_finals.into_inner().unwrap();
+    let sas = |n: usize| {
+        pair_sas(
+            1,
+            &offer_id(1),
+            fake_key.public(),
+            receiver.public(),
+            &h_finals[n],
+        )
+    };
+    // Five `busy` answers, four 1 s waits between them, no record.
+    assert_eq!(outcomes[0].0, Err(ClientError::Busy));
+    assert_eq!((outcomes[0].1, outcomes[0].2), (0, Duration::from_secs(4)));
+    // The next call waits a second after the last exchange, then succeeds.
+    let claimed = outcomes[1].0.clone().unwrap();
+    assert_eq!(claimed.sas, sas(5));
+    assert_eq!(
+        claimed.pending_id,
+        derive_pending_id(&secret_hash, &h_finals[5])
+    );
+    assert_eq!((outcomes[1].1, outcomes[1].2), (1, Duration::from_secs(5)));
+    // Called again at once: it waits a second first and adds one record.
+    let claimed = outcomes[2].0.clone().unwrap();
+    assert_eq!(claimed.sas, sas(6));
+    assert_eq!((outcomes[2].1, outcomes[2].2), (2, Duration::from_secs(6)));
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod disk {
     use std::{
@@ -631,7 +792,7 @@ mod disk {
     use syrtis_agent::{
         pairing::{ConfirmedGrant, GrantStatus, PairStatus, Producer, approve},
         secure_fs::SecureRoot,
-        security::{NOISE_PROLOGUE, NOISE_SUITE, Offer, OfferState, PendingState, pair_sas},
+        security::{NOISE_PROLOGUE, NOISE_SUITE, Offer, OfferState, PendingState},
         state_store::StateStore,
     };
 
@@ -1429,6 +1590,68 @@ mod disk {
         });
     }
 
+    /// C2: with the OS wall clock unreadable or anomalous, Pair status
+    /// still answers the stored states that need no clock (`rejected`,
+    /// `approved`). Only `awaitingApproval` needs it: `internal` when it
+    /// cannot be read, `busy` under an anomaly.
+    #[test]
+    fn pair_status_without_a_sane_clock_still_reports_terminal_states() {
+        let node = Node::new();
+        let time = Mutex::new(Duration::ZERO);
+        let clock = FakeClock::new(&time);
+        let alice = StaticKey::generate().unwrap();
+        let responder = *node.key.public();
+        serve(&node.producer(&clock), |port| {
+            let claim = |n: u8| {
+                node.offer(n, 600_000, clock.os_now_seconds().unwrap());
+                clock.tick();
+                pending_of(&body_of(&raw(
+                    port,
+                    &alice,
+                    &responder,
+                    claim_json(n, &secret(n)),
+                )))
+            };
+            let awaiting = claim(1);
+            let rejected = claim(2);
+            let approved = claim(3);
+            node.store
+                .transition(|state| state.reject_pending(rejected, 1, NOW * 1_000))
+                .unwrap();
+            approve(
+                &node.store,
+                approved,
+                1,
+                true,
+                clock.os_now_seconds().unwrap(),
+            )
+            .unwrap();
+            let status = |pending_id: &[u8; 16]| {
+                clock.tick();
+                raw(port, &alice, &responder, pair_status_json(pending_id))
+            };
+            let rejected_body = br#"{"protocol":1,"state":"rejected"}"#;
+
+            clock.wall_fails.store(true, Ordering::SeqCst);
+            assert_eq!(status(&rejected).payload, rejected_body);
+            assert_eq!(state_of(&status(&approved)), "approved");
+            assert_eq!(status(&awaiting).payload, error_payload(8));
+            clock.wall_fails.store(false, Ordering::SeqCst);
+
+            clock.skew(200_000);
+            assert_eq!(status(&rejected).payload, rejected_body);
+            assert_eq!(state_of(&status(&approved)), "approved");
+            assert_eq!(status(&awaiting).payload, error_payload(5));
+
+            // Control: with a sane clock the awaiting pending is answered.
+            clock.skew(0);
+            assert_eq!(
+                status(&awaiting).payload,
+                br#"{"protocol":1,"state":"awaiting"}"#
+            );
+        });
+    }
+
     /// Acceptance (8), producer half: a bad message 1 prefix closes with
     /// nothing written; a replay of a recorded connection (message 1 and the
     /// request ciphertext) reaches no state.
@@ -1874,81 +2097,6 @@ mod disk {
             |port| client.poll(&claimed_for(&fake_key, port, pending_id)),
         );
         assert_eq!((result, count), (Err(ClientError::Aborted), 1));
-    }
-
-    /// Acceptance (14): five retriable failures use the five attempt slots
-    /// and the sixth try ends as a lost attempt without connecting; an
-    /// answer naming the first attempt's pending ID on the fifth try is
-    /// still matched, so no slot is ever evicted.
-    #[test]
-    fn claim_attempts_are_capped_at_five_and_never_evicted() {
-        let fake_key = StaticKey::generate().unwrap();
-        let receiver = StaticKey::generate().unwrap();
-        let time = Mutex::new(Duration::ZERO);
-        let clock = FakeClock::new(&time);
-        let ledger = MemoryLedger::default();
-        let client = PairingClient {
-            identity: &receiver,
-            ledger: &ledger,
-            clock: &clock,
-        };
-        let busy = |request: &Frame| frame(FrameKind::Error, request.request_id, error_payload(5));
-        let mut attempts = ClaimAttempts::default();
-        let (result, count) = fake(
-            &fake_key,
-            |_, request, _| Some(busy(request)),
-            |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
-        );
-        assert_eq!((result, count), (Err(ClientError::LostAttempt), 5));
-        assert_eq!(attempts.used(&offer_id(1)), 5);
-        let (result, count) = fake(
-            &fake_key,
-            |_, request, _| Some(busy(request)),
-            |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
-        );
-        assert_eq!((result, count), (Err(ClientError::LostAttempt), 0));
-
-        // The fifth try answers with the pending ID the first try derived.
-        let secret_hash = offer_secret_hash(&offer_id(1), &secret(1), fake_key.public());
-        let mut first: Option<[u8; 32]> = None;
-        let mut attempts = ClaimAttempts::default();
-        let (result, count) = fake(
-            &fake_key,
-            |n, request, h_final| {
-                let first = *first.get_or_insert(*h_final);
-                Some(if n < 4 {
-                    busy(request)
-                } else {
-                    frame(
-                        FrameKind::Response,
-                        request.request_id,
-                        json_bytes(json!({
-                            "expiresAt": 1,
-                            "pendingId": hex_encode(&derive_pending_id(&secret_hash, &first)),
-                            "protocol": 1,
-                        })),
-                    )
-                })
-            },
-            |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
-        );
-        assert_eq!(count, 5);
-        let claimed = result.unwrap();
-        let h_first = first.unwrap();
-        assert_eq!(
-            claimed.sas,
-            pair_sas(
-                1,
-                &offer_id(1),
-                fake_key.public(),
-                receiver.public(),
-                &h_first
-            )
-        );
-        assert_eq!(
-            claimed.pending_id,
-            derive_pending_id(&secret_hash, &h_first)
-        );
     }
 
     /// Acceptance (15): a producer that keeps answering `awaiting` is

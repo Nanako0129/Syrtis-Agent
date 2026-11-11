@@ -18,7 +18,7 @@
 # SA-2B2a1 adds spec/pairing-v1.md, the pairing wire contract (Noise
 # framing, pairing ID derivations, producer order, receiver client). No
 # existing line changed.
-8f783bd76e39ce3b551fc72800e8e25765f01314e73521d056707a9b847a3a27  spec/pairing-v1.md
+13ad241420a2e76b9a1d5e1aaeb13a5b68fa85db2fd1e0257559928ef7c1a6c8  spec/pairing-v1.md
 79d1c0363e4576d67827ebfa029fad7e3a5981474f4aafba3bd71e54f1a98172  spec/report-cache-v1.md
 976e37c0082c128f4067282506c4606013fa95b7387d5c937c627b9b0117ea4d  spec/security-v1.md
 ea302173340ae0dfb6f2a421326e7e178d2454bcab45ac28d74b144c1f17890e  spec/state-store-v1.md

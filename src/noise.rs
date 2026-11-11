@@ -159,7 +159,9 @@ impl fmt::Debug for Received {
 
 /// Initiator: connects and runs IK with `remote_static` pinned, all within
 /// one [`HANDSHAKE_TIMEOUT`]. Name resolution (`getaddrinfo`) runs first and
-/// is not bounded by that deadline: std offers no way to bound it.
+/// is not bounded by that deadline: std offers no way to bound it. Once a
+/// TCP connection is up, a handshake failure ends the call: no other
+/// address is tried.
 pub fn connect(
     host: &str,
     port: u16,
@@ -171,9 +173,7 @@ pub fn connect(
         .map_err(|_| NoiseError::Io)?
         .collect();
     let deadline = Deadline::after(HANDSHAKE_TIMEOUT);
-    let mut stream = connect_addrs(&addresses, deadline)?;
-    // The deadline loops rely on blocking reads and writes.
-    stream.set_nonblocking(false).map_err(|_| NoiseError::Io)?;
+    let mut stream = connect_addrs(&addresses, deadline, TcpStream::connect_timeout)?;
     let mut state = Builder::new(params()?)
         .local_private_key(local.private.expose())
         .and_then(|builder| builder.remote_public_key(remote_static))
@@ -271,9 +271,16 @@ impl Session {
 }
 
 /// Tries each resolved address in order, all under one absolute deadline.
-fn connect_addrs(addresses: &[SocketAddr], deadline: Deadline) -> Result<TcpStream, NoiseError> {
-    for address in addresses {
-        if let Ok(stream) = TcpStream::connect_timeout(address, deadline.remaining()?) {
+/// Each address gets the time left divided by the addresses not yet tried,
+/// so an unresponsive first address cannot take the whole deadline.
+fn connect_addrs(
+    addresses: &[SocketAddr],
+    deadline: Deadline,
+    mut connect: impl FnMut(&SocketAddr, Duration) -> std::io::Result<TcpStream>,
+) -> Result<TcpStream, NoiseError> {
+    for (index, address) in addresses.iter().enumerate() {
+        let untried = u32::try_from(addresses.len() - index).unwrap_or(u32::MAX);
+        if let Ok(stream) = connect(address, deadline.remaining()? / untried) {
             return Ok(stream);
         }
     }
@@ -437,18 +444,45 @@ mod tests {
     /// resolved address is tried under the same deadline.
     #[test]
     fn connect_tries_every_resolved_address() {
-        let refused = {
-            let closed = TcpListener::bind("127.0.0.1:0").unwrap();
-            closed.local_addr().unwrap()
-        };
+        // Both bound at once, so the two ports differ (C7); then one closes.
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let refused = closed.local_addr().unwrap();
         let open = listener.local_addr().unwrap();
-        let stream = connect_addrs(&[refused, open], Deadline::after(HANDSHAKE_TIMEOUT)).unwrap();
+        drop(closed);
+        let deadline = || Deadline::after(HANDSHAKE_TIMEOUT);
+        let stream =
+            connect_addrs(&[refused, open], deadline(), TcpStream::connect_timeout).unwrap();
         assert_eq!(stream.peer_addr().unwrap(), open);
         // Control: the refused address alone fails.
         assert_eq!(
-            connect_addrs(&[refused], Deadline::after(HANDSHAKE_TIMEOUT)).err(),
+            connect_addrs(&[refused], deadline(), TcpStream::connect_timeout).err(),
             Some(NoiseError::Io)
+        );
+    }
+
+    /// C3: each address gets the time left divided by the addresses not yet
+    /// tried. Four addresses that each hang for their whole budget all get
+    /// tried within one deadline; handing the first one everything left
+    /// would end the call after one try.
+    #[test]
+    fn connect_splits_the_deadline_across_the_addresses() {
+        let addresses: Vec<SocketAddr> = (1..=4)
+            .map(|n| SocketAddr::from(([127, 0, 0, 1], n)))
+            .collect();
+        let total = Duration::from_secs(1);
+        let mut budgets = Vec::new();
+        let result = connect_addrs(&addresses, Deadline::after(total), |_, budget| {
+            budgets.push(budget);
+            std::thread::sleep(budget);
+            Err(std::io::ErrorKind::TimedOut.into())
+        });
+        assert_eq!(result.err(), Some(NoiseError::Io));
+        assert_eq!(budgets.len(), 4, "{budgets:?}");
+        assert!(budgets[0] <= total / 4, "{budgets:?}");
+        assert!(
+            budgets.iter().all(|budget| !budget.is_zero()),
+            "{budgets:?}"
         );
     }
 

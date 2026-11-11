@@ -43,7 +43,12 @@ pub const GRANT_LIFETIME_MS: i64 = 30 * 86_400_000;
 pub const PAIRING_PAYLOAD_MAX: usize = 4_096;
 pub const RATE_INTERVAL: Duration = Duration::from_secs(1);
 pub const RATE_TABLE_MAX: usize = 256;
+/// Attempt records per offer, never evicted.
 pub const CLAIM_ATTEMPTS_MAX: usize = 5;
+/// Connect or handshake failures in one `claim` call.
+pub const CLAIM_CONNECT_FAILURES_MAX: usize = 5;
+/// Authenticated `busy` answers in one `claim` call.
+pub const CLAIM_BUSY_MAX: usize = 5;
 pub const CLAIM_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 pub const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// Longest offer (900 s) plus 60 s of grace, on the receiver's monotonic clock.
@@ -508,11 +513,6 @@ impl Producer<'_> {
             .find(|pending| pending.pending_id == pending_id)
             .filter(|pending| constant_time_eq(&pending.initiator_static, initiator))
             .ok_or(PeerCode::Unauthorized)?;
-        // After the binding: only the bound static can see `busy`.
-        let clock = self.clock_of(reference)?;
-        if clock.anomaly {
-            return Err(PeerCode::Busy);
-        }
         let waiting = |state| {
             encode(&PairStatusPending {
                 protocol: PROTOCOL,
@@ -520,10 +520,16 @@ impl Producer<'_> {
             })
         };
         match pending.state {
-            PendingState::AwaitingApproval if effective_ms(clock)? >= pending.expires_at_ms => {
-                waiting(WaitingState::Expired)
-            }
-            PendingState::AwaitingApproval => waiting(WaitingState::Awaiting),
+            // Only `awaitingApproval` needs the clock, and it is read after
+            // the binding, so only the bound static can see `busy`.
+            PendingState::AwaitingApproval => match self.clock_of(reference) {
+                Ok(clock) if clock.anomaly => Err(PeerCode::Busy),
+                Ok(clock) if effective_ms(clock)? >= pending.expires_at_ms => {
+                    waiting(WaitingState::Expired)
+                }
+                Ok(_) => waiting(WaitingState::Awaiting),
+                Err(error) => Err(storage_error_code(error)),
+            },
             PendingState::Rejected => waiting(WaitingState::Rejected),
             PendingState::Expired => waiting(WaitingState::Expired),
             // Answered whether or not the pending has since expired (F-8),
@@ -563,10 +569,7 @@ impl Producer<'_> {
             .find(|grant| grant.grant_id == grant_id)
             .filter(|grant| constant_time_eq(&grant.initiator_static, initiator))
             .ok_or(PeerCode::Unauthorized)?;
-        let clock = self
-            .clock
-            .os_now_seconds()
-            .map(|os_now| clock_status(os_now, reference.last_accepted_wall_unix_seconds()));
+        let clock = self.clock_of(reference);
         // None of these needs a clock.
         let revoked = grant.state == GrantState::Revoked
             || !reference.sharing_enabled
@@ -599,12 +602,12 @@ impl Producer<'_> {
         })
     }
 
-    fn clock_of(&self, reference: &ReferenceState) -> Result<ClockStatus, PeerCode> {
-        let os_now = self.clock.os_now_seconds().map_err(storage_error_code)?;
-        Ok(clock_status(
-            os_now,
-            reference.last_accepted_wall_unix_seconds(),
-        ))
+    /// The frozen clock status, or the OS clock error for the caller to
+    /// weigh against answers that need no clock.
+    fn clock_of(&self, reference: &ReferenceState) -> Result<ClockStatus, StorageError> {
+        self.clock
+            .os_now_seconds()
+            .map(|os_now| clock_status(os_now, reference.last_accepted_wall_unix_seconds()))
     }
 }
 
@@ -680,6 +683,9 @@ pub enum ClientError {
     /// A claim succeeded with a pending ID none of this device's attempts
     /// derived, or every attempt slot for the offer is used.
     LostAttempt,
+    /// Pair claim answered `busy` [`CLAIM_BUSY_MAX`] times in one call.
+    /// Nothing was committed; a later call may succeed.
+    Busy,
     /// The producer answered with this error code.
     Code(PeerCode),
     Rejected,
@@ -703,6 +709,7 @@ impl ClientError {
             Self::LostAttempt => {
                 "This device lost track of an earlier attempt. Ask the owner to reject the request and create a new offer."
             }
+            Self::Busy => "The other device is busy. Try again in a moment.",
             Self::SelfPairing => "This offer was created on this device.",
             Self::InvalidOffer => "This offer is not valid.",
             Self::Rejected => "The owner rejected the request.",
@@ -729,12 +736,18 @@ struct Attempt {
 /// exists only from `hFinal` on. A new attempt or another offer clears only
 /// what is displayed, never this.
 #[derive(Clone, Debug, Default)]
-pub struct ClaimAttempts(BTreeMap<[u8; 16], Vec<Attempt>>);
+pub struct ClaimAttempts {
+    records: BTreeMap<[u8; 16], Vec<Attempt>>,
+    /// Receiver monotonic time the last claim exchange ended (at or after
+    /// the producer admitted it); the next claim waits until
+    /// [`CLAIM_RETRY_INTERVAL`] after it. Process-local.
+    last_exchange: Option<Duration>,
+}
 
 impl ClaimAttempts {
     /// Attempt slots used for `offer_id`.
     pub fn used(&self, offer_id: &[u8; 16]) -> usize {
-        self.0.get(offer_id).map_or(0, Vec::len)
+        self.records.get(offer_id).map_or(0, Vec::len)
     }
 }
 
@@ -750,7 +763,8 @@ pub struct Claimed {
     pub sas: String,
     /// Producer wall clock; display only.
     pub expires_at_ms: i64,
-    /// Receiver monotonic time of the successful claim.
+    /// Receiver monotonic time of the successful claim. Process-local: it
+    /// has an arbitrary origin and must never be persisted.
     pub claimed_at: Duration,
 }
 
@@ -813,11 +827,13 @@ impl PairingClient<'_> {
     /// this rechecks only `version` and `port`.
     ///
     /// Retries `busy`, `internal` and transport failures at least
-    /// [`CLAIM_RETRY_INTERVAL`] apart. A try whose handshake completed takes
-    /// one attempt slot, recorded before the request is written; a connect
-    /// or handshake failure takes none, and after [`CLAIM_ATTEMPTS_MAX`] of
-    /// them this call returns [`ClientError::Transport`] (a later call may
-    /// connect again).
+    /// [`CLAIM_RETRY_INTERVAL`] apart, across calls too. A try whose
+    /// handshake completed takes one attempt slot, recorded before the
+    /// request is written, and keeps it unless the answer is `busy`. A
+    /// connect or handshake failure takes none, and after
+    /// [`CLAIM_CONNECT_FAILURES_MAX`] of them this call returns
+    /// [`ClientError::Transport`]; after [`CLAIM_BUSY_MAX`] `busy` answers
+    /// it returns [`ClientError::Busy`]. A later call may try again.
     pub fn claim(
         &self,
         offer: &PairOffer,
@@ -843,15 +859,25 @@ impl PairingClient<'_> {
             secret: WireSecret(secret),
         })
         .map_err(|_| ClientError::InvalidOffer)?;
-        let tries = attempts.0.entry(offer_id).or_default();
+        let tries = attempts.records.entry(offer_id).or_default();
         let mut connect_failures = 0;
+        let mut busy = 0;
         let mut retry = false;
         loop {
             if tries.len() >= CLAIM_ATTEMPTS_MAX {
                 return Err(ClientError::LostAttempt);
             }
-            if retry {
-                self.clock.sleep(CLAIM_RETRY_INTERVAL);
+            // A retry waits the full interval; a call's first try waits out
+            // what is left of it since the previous call's last exchange.
+            let wait = if retry {
+                CLAIM_RETRY_INTERVAL
+            } else {
+                attempts.last_exchange.map_or(Duration::ZERO, |last| {
+                    (last + CLAIM_RETRY_INTERVAL).saturating_sub(self.clock.monotonic())
+                })
+            };
+            if !wait.is_zero() {
+                self.clock.sleep(wait);
             }
             retry = true;
             let mut session =
@@ -859,7 +885,7 @@ impl PairingClient<'_> {
                     Ok(session) => session,
                     Err(error) => {
                         connect_failures += 1;
-                        if connect_failures >= CLAIM_ATTEMPTS_MAX {
+                        if connect_failures >= CLAIM_CONNECT_FAILURES_MAX {
                             return Err(ClientError::Transport(error));
                         }
                         continue;
@@ -876,7 +902,9 @@ impl PairingClient<'_> {
                     h_final,
                 ),
             });
-            match self.exchange(&mut session, payload.clone()) {
+            let reply = self.exchange(&mut session, payload.clone());
+            attempts.last_exchange = Some(self.clock.monotonic());
+            match reply {
                 Ok(Reply::Body(received)) => {
                     let response: PairClaimResponse =
                         CanonicalJsonV1::decode(&received.frame().payload)
@@ -905,8 +933,18 @@ impl PairingClient<'_> {
                 Ok(Reply::Code(code @ (PeerCode::Invalid | PeerCode::Incompatible))) => {
                     return Err(ClientError::Code(code));
                 }
-                Ok(Reply::Code(PeerCode::Busy | PeerCode::Internal))
-                | Err(ClientError::Transport(_)) => {}
+                // On Pair claim `busy` comes only from the rate limiter,
+                // which runs before any state is read: nothing was
+                // committed, so this attempt's record can never be answered.
+                Ok(Reply::Code(PeerCode::Busy)) => {
+                    tries.pop();
+                    busy += 1;
+                    if busy >= CLAIM_BUSY_MAX {
+                        return Err(ClientError::Busy);
+                    }
+                }
+                // The request may have been committed: the record stays.
+                Ok(Reply::Code(PeerCode::Internal)) | Err(ClientError::Transport(_)) => {}
                 Err(error) => return Err(error),
             }
         }
