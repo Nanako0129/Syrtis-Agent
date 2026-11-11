@@ -17,6 +17,8 @@ One TCP connection carries one handshake, one request frame and one reply frame 
 | Suite | `Noise_IK_25519_ChaChaPoly_BLAKE2s`, prologue `syrtis-peer-v1\0` (`spec/security-v1.md`) |
 | Implementation | `snow` `0.10.0` only |
 | Initiator | The receiver; pins the Pair URL's `responderStatic` as the remote static |
+| Initiator connect | The host is resolved first (`getaddrinfo`); resolution is not bounded by the handshake deadline, because std offers no way to bound it. Each resolved address is then tried in order, all under the one 10 s connect-plus-handshake deadline |
+| Blocking mode | Both sides put the stream in blocking mode before the handshake, whatever it inherited (an accepted stream's mode differs by OS), so a deadline loop waits instead of spinning |
 | Responder identity | The agent identity in `state.json`, read once by the caller before serving; a handshake reads and writes no state |
 | Message 1 on the wire | `u32be(96) ‖ 96 bytes` (`e` 32, encrypted `s` 48, tag 16; empty payload) |
 | Message 2 on the wire | `u32be(48) ‖ 48 bytes` (`e` 32, tag 16; empty payload) |
@@ -63,6 +65,8 @@ Non-claims:
 - A change of a grant's `authEpoch` or `sourceScopeGeneration` in Grant status tells its receiver that another grant was revoked or the source scope changed (F-6).
 - The rate-limit table can be filled by a LAN attacker who generates a new static key per handshake, which refuses new pairing requests with `busy` while it lasts. This is availability only.
 - The frozen claim refuses a full record table as `unauthorized`, indistinguishable from the other causes; the receiver never infers why an offer was refused.
+- A low-order (small-subgroup) remote static key is not rejected. Binding a pairing to it still needs the Pair URL's bearer secret and the owner's SAS check.
+- The producer's identity is read once by its caller, not per handshake, so a handshake touches no state. After a reset rotates the identity, the caller must reread it. Until it does, by reading the frozen transitions (not exercised by a test here), the old key fails closed: a receiver that pinned the new static cannot complete the handshake, and a claim under the old static cannot match an offer's secret hash, which binds the new one.
 
 ## Producer processing order
 
@@ -112,14 +116,15 @@ Answered from one snapshot. Sharing being off does not refuse it: the bound stat
 
 | Clock | Condition | `state` |
 |---|---|---|
-| Anomaly | `grant.state` revoked, sharing off, `authEpoch ≤ denyFloor`, or `sourceScopeGeneration` ≠ the counter | `revoked` (none of these needs a clock) |
-| Anomaly | `grant.state` expired | `expired` |
+| Anomaly or unreadable | `grant.state` revoked, sharing off, `authEpoch ≤ denyFloor`, or `sourceScopeGeneration` ≠ the counter | `revoked` (none of these needs a clock) |
+| Anomaly or unreadable | `grant.state` expired | `expired` |
 | Anomaly | otherwise | `busy` (error) |
+| Unreadable | otherwise | the OS clock error, by the error map (`internal`) |
 | Sane | effective now ≥ `expiresAt`, or `grant.state` expired | `expired` |
 | Sane | any revocation condition above | `revoked` |
 | Sane | otherwise | `active` |
 
-Expiry is checked before revocation on purpose: the grant is unusable either way, and expiry needs no further explanation. The fields are the grant's current values.
+"Unreadable" is an OS wall clock that cannot be read at all. Expiry is checked before revocation on purpose: the grant is unusable either way, and expiry needs no further explanation. The fields are the grant's current values.
 
 ## Approval
 
@@ -140,7 +145,11 @@ Every one of these arises after the secret check or independently of any ID, so 
 
 ## Receiver client
 
-**Claim.** Refuses an offer whose `responderStatic` is its own, pins `responderStatic`, and sends `{offerId, protocol, secret}`. Before sending, it records the attempt's derived `pendingId` and SAS. An offer keeps at most 5 attempt records, never evicted, because a retry against the frozen claim returns the first ID. A success whose `pendingId` matches a record returns that record's SAS; a success that matches none ends with "This device lost track of an earlier attempt. Ask the owner to reject the request and create a new offer." `unauthorized` ends with "This offer cannot be used. If the owner's device shows a pending request for this offer, ask the owner to reject it." (the cause is not inferred). `busy`, `internal` and transport failures are retried at least 1 s apart, one record each; when all five are used, the next try ends as a lost attempt without connecting. `invalid` and `incompatible` stop. A new attempt or a different offer clears only what is displayed, never the records.
+**Claim.** Takes an offer from the frozen `parse_pair_url`, which owns the offer's validation (the canonical host check among it); the client itself rechecks only `version` 1 and `port` ≥ 1024 and refuses anything else before connecting. Refuses an offer whose `responderStatic` is its own, pins `responderStatic`, and sends `{offerId, protocol, secret}`.
+
+An attempt record maps a derived `pendingId` to its SAS, and a `pendingId` exists only once the handshake has completed (`hFinal`). So a record is created after a successful handshake and before the request is written; a connect or handshake failure creates none. An offer keeps at most 5 records, never evicted, because a retry against the frozen claim returns the first ID. A success whose `pendingId` matches a record returns that record's SAS; a success that matches none ends with "This device lost track of an earlier attempt. Ask the owner to reject the request and create a new offer." `unauthorized` ends with "This offer cannot be used. If the owner's device shows a pending request for this offer, ask the owner to reject it." (the cause is not inferred). `invalid` and `incompatible` stop.
+
+Retries are at least 1 s apart. `busy`, `internal` and a transport failure after the handshake are retried, one record each; when all five records are used, the next try ends as a lost attempt without connecting. A connect or handshake failure is retried without a record; after 5 of them in one claim call, the call ends with a transport error, and a later call may connect again. A new attempt or a different offer clears only what is displayed, never the records.
 
 **Reply checks.** The reply frame must have `chunkCount` 1, index 0, final set, and the `requestId` that was sent. Its type follows from the request that was sent and the frame kind, never from the key set; a Pair status response's shape is chosen by its `state` value. `state` is checked per surface (Pair status refuses `active`, Grant status refuses `approved`); `protocol` must be `1`; an approved `grantId` must equal `derive(pendingId)`; a Grant status `grantId` must equal the one requested; an error code outside {1, 2, 5, 6, 8} or an error frame with the wrong `requestId` or `protocol` stops the client.
 

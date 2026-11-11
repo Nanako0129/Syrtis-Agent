@@ -11,14 +11,28 @@
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
+    },
     thread,
     time::Duration,
 };
 
+use serde_json::{Value, json};
 use syrtis_agent::{
-    noise::{self, MESSAGE1_LEN, MESSAGE2_LEN, NoiseError, StaticKey},
-    pairing::{RATE_INTERVAL, RATE_TABLE_MAX, RateLimiter, derive_grant_id, derive_pending_id},
-    security::{Frame, FrameKind, MemoryLedger},
+    canonical::CanonicalJsonV1,
+    noise::{self, Deadline, MESSAGE1_LEN, MESSAGE2_LEN, NoiseError, Session, StaticKey},
+    pairing::{
+        ClaimAttempts, Claimed, ClientError, Clock, PairingClient, PeerCode, RATE_INTERVAL,
+        RATE_TABLE_MAX, RateLimiter, SystemClock, derive_grant_id, derive_pending_id,
+    },
+    secure_fs::StorageError,
+    security::{
+        FRAME_CIPHERTEXT_MAX, Frame, FrameKind, MemoryLedger, PairOffer, REMOTE_MEMORY_MAX,
+        hex_encode, offer_secret_hash,
+    },
 };
 
 fn loopback() -> (TcpListener, u16) {
@@ -56,7 +70,7 @@ fn a_frame_round_trip_reserves_three_times_the_declared_length() {
                 .unwrap();
             // 38-byte header + payload + 16-byte tag, three times.
             assert_eq!(ledger.used(), 3 * (38 + payload.len() + 16));
-            let mut reply = received.frame.clone();
+            let mut reply = received.frame().clone();
             drop(received);
             assert_eq!(ledger.used(), 0);
             reply.kind = FrameKind::Response;
@@ -84,8 +98,8 @@ fn a_frame_round_trip_reserves_three_times_the_declared_length() {
                 noise::Deadline::after(Duration::from_secs(10)),
             )
             .unwrap();
-        assert_eq!(reply.frame.payload, payload);
-        assert_eq!(reply.frame.request_id, [9; 16]);
+        assert_eq!(reply.frame().payload, payload);
+        assert_eq!(reply.frame().request_id, [9; 16]);
         let (h_final, remote) = server.join().unwrap();
         assert_eq!(&h_final, session.h_final());
         assert_eq!(&remote, initiator.public());
@@ -193,15 +207,20 @@ fn partial_bytes_do_not_extend_the_handshake_deadline() {
 }
 
 /// A transport length prefix above the frozen ciphertext maximum is refused
-/// before anything is reserved or read: the body is never awaited.
+/// before anything is reserved or read: the body is never awaited (B9). The
+/// ledger is filled so that reserving 3x that length would fail: refusing
+/// the length first gives `Framing`, reserving first would give `Memory`.
 #[test]
 fn a_transport_length_over_the_maximum_is_refused_before_reserving() {
-    use syrtis_agent::security::{FRAME_CIPHERTEXT_MAX, NOISE_PROLOGUE, NOISE_SUITE};
+    use syrtis_agent::security::{NOISE_PROLOGUE, NOISE_SUITE};
     let responder = StaticKey::generate().unwrap();
     let builder = || snow::Builder::new(NOISE_SUITE.parse().unwrap());
     let initiator = builder().generate_keypair().unwrap();
     let (listener, port) = loopback();
     let ledger = MemoryLedger::default();
+    let level = REMOTE_MEMORY_MAX - 3 * (FRAME_CIPHERTEXT_MAX + 1) + 1;
+    let _fill = ledger.reserve(level).unwrap();
+    assert!(ledger.reserve(3 * (FRAME_CIPHERTEXT_MAX + 1)).is_none());
     thread::scope(|scope| {
         let server = scope.spawn(|| {
             let (stream, _) = listener.accept().unwrap();
@@ -235,7 +254,7 @@ fn a_transport_length_over_the_maximum_is_refused_before_reserving() {
         let (result, used) = server.join().unwrap();
         // Waiting for the body would have ended in `Timeout`.
         assert_eq!(result, Err(NoiseError::Framing));
-        assert_eq!(used, 0);
+        assert_eq!(used, level);
     });
 }
 
@@ -284,42 +303,360 @@ fn the_pending_and_grant_ids_follow_the_specified_formulas() {
     assert_eq!(derive_grant_id(&pending)[..], digest[..16]);
 }
 
+// ------------------------------------------------------- shared harness
+
+const NOW: i64 = 1_700_000_000;
+const LONG: Duration = Duration::from_secs(15);
+
+type Hook<'a> = Box<dyn FnMut(Duration) + Send + 'a>;
+
+/// Shared fake time. `sleep` advances it (unless frozen) and then runs
+/// the hook, so a test can act "while the client waits".
+struct FakeClock<'a> {
+    elapsed: &'a Mutex<Duration>,
+    /// Added to the monotonic reading and to the wall clock.
+    offset: Duration,
+    /// Added to the wall clock only.
+    skew: AtomicI64,
+    frozen: bool,
+    /// When set, the OS wall clock cannot be read.
+    wall_fails: AtomicBool,
+    hook: Mutex<Hook<'a>>,
+}
+
+impl<'a> FakeClock<'a> {
+    fn new(elapsed: &'a Mutex<Duration>) -> Self {
+        Self {
+            elapsed,
+            offset: Duration::ZERO,
+            skew: AtomicI64::new(0),
+            frozen: false,
+            wall_fails: AtomicBool::new(false),
+            hook: Mutex::new(Box::new(|_| {})),
+        }
+    }
+}
+
+impl Clock for FakeClock<'_> {
+    fn monotonic(&self) -> Duration {
+        *self.elapsed.lock().unwrap() + self.offset
+    }
+
+    fn os_now_seconds(&self) -> Result<i64, StorageError> {
+        if self.wall_fails.load(Ordering::SeqCst) {
+            return Err(StorageError::Unavailable);
+        }
+        Ok(NOW + self.skew.load(Ordering::SeqCst) + self.monotonic().as_secs() as i64)
+    }
+
+    fn sleep(&self, duration: Duration) {
+        let now = {
+            let mut elapsed = self.elapsed.lock().unwrap();
+            if !self.frozen {
+                *elapsed += duration;
+            }
+            *elapsed
+        };
+        (self.hook.lock().unwrap())(now);
+    }
+}
+
+fn secret(n: u8) -> [u8; 32] {
+    std::array::from_fn(|i| (n.wrapping_mul(37)).wrapping_add(i as u8) ^ 0xa5)
+}
+
+fn offer_id(n: u8) -> [u8; 16] {
+    [n; 16]
+}
+
+/// A scripted responder: for connection `n` (0-based), `reply` gets the
+/// request and the session's `hFinal` and returns the frame to send,
+/// or `None` to hold the connection open without answering.
+fn fake<R>(
+    key: &StaticKey,
+    reply: impl FnMut(usize, &Frame, &[u8; 32]) -> Option<Frame> + Send,
+    body: impl FnOnce(u16) -> R,
+) -> (R, usize) {
+    let (listener, port) = loopback();
+    let stop = AtomicBool::new(false);
+    let count = AtomicUsize::new(0);
+    let mut reply = reply;
+    let result = thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut held: Vec<Session> = Vec::new();
+            for stream in listener.incoming() {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(stream) = stream else { continue };
+                let n = count.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut session) = noise::accept(stream, key) else {
+                    continue;
+                };
+                let Ok(received) = session.receive(&MemoryLedger::default(), Deadline::after(LONG))
+                else {
+                    continue;
+                };
+                match reply(n, received.frame(), session.h_final()) {
+                    Some(frame) => {
+                        let _ = session.send(&frame, Deadline::after(LONG));
+                    }
+                    None => held.push(session),
+                }
+            }
+        });
+        let result = catch_unwind(AssertUnwindSafe(|| body(port)));
+        stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(("127.0.0.1", port));
+        result
+    });
+    let result = result.unwrap_or_else(|panic| resume_unwind(panic));
+    (result, count.into_inner())
+}
+
+fn json_bytes(value: Value) -> Vec<u8> {
+    CanonicalJsonV1::encode(&value).unwrap()
+}
+
+fn error_payload(code: u16) -> Vec<u8> {
+    format!("{{\"code\":{code},\"protocol\":1}}").into_bytes()
+}
+
+fn frame(kind: FrameKind, request_id: [u8; 16], payload: Vec<u8>) -> Frame {
+    Frame {
+        kind,
+        final_chunk: true,
+        request_id,
+        chunk_index: 0,
+        chunk_count: 1,
+        payload,
+    }
+}
+
+fn claimed_for(key: &StaticKey, port: u16, pending_id: [u8; 16]) -> Claimed {
+    Claimed {
+        offer_id: offer_id(1),
+        responder_static: *key.public(),
+        host: "127.0.0.1".into(),
+        port,
+        pending_id,
+        sas: "0000-0000".into(),
+        expires_at_ms: 0,
+        claimed_at: Duration::ZERO,
+    }
+}
+
+fn fake_offer(key: &StaticKey, port: u16) -> PairOffer {
+    PairOffer {
+        expires_at: 0,
+        host: "127.0.0.1".into(),
+        offer_id: hex_encode(&offer_id(1)),
+        port,
+        responder_static: hex_encode(key.public()),
+        secret: hex_encode(&secret(1)),
+        version: 1,
+    }
+}
+
+// ------------------------------------------------- tests on every OS
+
+/// A loopback port with nothing listening: connecting to it is refused.
+fn refused_port() -> u16 {
+    loopback().1
+}
+
+/// B2: a connect failure takes no attempt record. Five refused connects
+/// end this claim with a transport error and no record; a later claim of
+/// the same offer (same offer ID, same records) still connects and
+/// succeeds.
+#[test]
+fn refused_connects_take_no_attempt_record() {
+    let fake_key = StaticKey::generate().unwrap();
+    let receiver = StaticKey::generate().unwrap();
+    let time = Mutex::new(Duration::ZERO);
+    let clock = FakeClock::new(&time);
+    let ledger = MemoryLedger::default();
+    let client = PairingClient {
+        identity: &receiver,
+        ledger: &ledger,
+        clock: &clock,
+    };
+    let mut attempts = ClaimAttempts::default();
+    let result = client.claim(&fake_offer(&fake_key, refused_port()), &mut attempts);
+    assert_eq!(result, Err(ClientError::Transport(NoiseError::Io)));
+    assert_eq!(attempts.used(&offer_id(1)), 0);
+    // Four waits between five connects, all on the injected clock.
+    assert_eq!(*time.lock().unwrap(), 4 * Duration::from_secs(1));
+
+    let secret_hash = offer_secret_hash(&offer_id(1), &secret(1), fake_key.public());
+    let (result, count) = fake(
+        &fake_key,
+        |_, request, h_final| {
+            Some(frame(
+                FrameKind::Response,
+                request.request_id,
+                json_bytes(json!({
+                    "expiresAt": 1,
+                    "pendingId": hex_encode(&derive_pending_id(&secret_hash, h_final)),
+                    "protocol": 1,
+                })),
+            ))
+        },
+        |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
+    );
+    assert_eq!(count, 1);
+    assert_eq!(result.map(|claimed| claimed.offer_id), Ok(offer_id(1)));
+    assert_eq!(attempts.used(&offer_id(1)), 1);
+}
+
+/// B7: an offer with another `version` or a port below 1024 is refused
+/// before any connection.
+#[test]
+fn an_offer_with_a_bad_version_or_port_is_refused_without_connecting() {
+    let fake_key = StaticKey::generate().unwrap();
+    let receiver = StaticKey::generate().unwrap();
+    let time = Mutex::new(Duration::ZERO);
+    let clock = FakeClock::new(&time);
+    let ledger = MemoryLedger::default();
+    let client = PairingClient {
+        identity: &receiver,
+        ledger: &ledger,
+        clock: &clock,
+    };
+    let unauthorized =
+        |request: &Frame| frame(FrameKind::Error, request.request_id, error_payload(2));
+    let (results, count) = fake(
+        &fake_key,
+        |_, request, _| Some(unauthorized(request)),
+        |port| {
+            let mut attempts = ClaimAttempts::default();
+            let version = PairOffer {
+                version: 2,
+                ..fake_offer(&fake_key, port)
+            };
+            let low_port = PairOffer {
+                port: 1023,
+                ..fake_offer(&fake_key, port)
+            };
+            [
+                client.claim(&version, &mut attempts),
+                client.claim(&low_port, &mut attempts),
+            ]
+        },
+    );
+    assert_eq!(
+        results,
+        [
+            Err(ClientError::InvalidOffer),
+            Err(ClientError::InvalidOffer)
+        ]
+    );
+    assert_eq!(count, 0, "no connection was made");
+    // Control: the same offer with version 1 and its real port connects.
+    let (result, count) = fake(
+        &fake_key,
+        |_, request, _| Some(unauthorized(request)),
+        |port| client.claim(&fake_offer(&fake_key, port), &mut ClaimAttempts::default()),
+    );
+    assert_eq!((result, count), (Err(ClientError::OfferUnusable), 1));
+}
+
+/// B10: `unauthorized`, `invalid` and `incompatible` stop both the claim
+/// and the poll on the first answer.
+#[test]
+fn a_refusing_answer_stops_claim_and_poll_at_once() {
+    let fake_key = StaticKey::generate().unwrap();
+    let receiver = StaticKey::generate().unwrap();
+    let time = Mutex::new(Duration::ZERO);
+    let clock = FakeClock::new(&time);
+    let ledger = MemoryLedger::default();
+    let client = PairingClient {
+        identity: &receiver,
+        ledger: &ledger,
+        clock: &clock,
+    };
+    for (code, claim_error, poll_error) in [
+        (
+            2,
+            ClientError::OfferUnusable,
+            ClientError::Code(PeerCode::Unauthorized),
+        ),
+        (
+            1,
+            ClientError::Code(PeerCode::Invalid),
+            ClientError::Code(PeerCode::Invalid),
+        ),
+        (
+            6,
+            ClientError::Code(PeerCode::Incompatible),
+            ClientError::Code(PeerCode::Incompatible),
+        ),
+    ] {
+        let answer =
+            |request: &Frame| frame(FrameKind::Error, request.request_id, error_payload(code));
+        let mut attempts = ClaimAttempts::default();
+        let (result, count) = fake(
+            &fake_key,
+            |_, request, _| Some(answer(request)),
+            |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
+        );
+        assert_eq!((result, count), (Err(claim_error), 1), "claim {code}");
+        let (result, count) = fake(
+            &fake_key,
+            |_, request, _| Some(answer(request)),
+            |port| client.poll(&claimed_for(&fake_key, port, [0x21; 16])),
+        );
+        assert_eq!((result, count), (Err(poll_error), 1), "poll {code}");
+    }
+}
+
+/// B4: every `SystemClock` reads one process-wide monotonic origin, so a
+/// reading from an instance made later is never behind an earlier one.
+#[test]
+fn system_clock_instances_share_one_origin() {
+    let first = SystemClock;
+    thread::sleep(Duration::from_millis(50));
+    let second = SystemClock;
+    let early = first.monotonic();
+    let late = second.monotonic();
+    assert!(late >= early, "{late:?} < {early:?}");
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod disk {
     use std::{
-        net::Shutdown,
-        os::unix::fs::PermissionsExt,
-        panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
-        path::PathBuf,
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
-        },
-        time::Instant,
+        net::Shutdown, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Instant,
     };
 
-    use serde_json::{Value, json};
     use syrtis_agent::{
-        canonical::CanonicalJsonV1,
-        noise::{Deadline, Session},
-        pairing::{
-            ClaimAttempts, Claimed, ClientError, Clock, ConfirmedGrant, GrantStatus, PairStatus,
-            PairingClient, PeerCode, Producer, SystemClock, approve,
-        },
-        secure_fs::{SecureRoot, StorageError},
-        security::{
-            NOISE_PROLOGUE, NOISE_SUITE, Offer, OfferState, PairOffer, PendingState,
-            REMOTE_MEMORY_MAX, hex_encode, offer_secret_hash, pair_sas,
-        },
+        pairing::{ConfirmedGrant, GrantStatus, PairStatus, Producer, approve},
+        secure_fs::SecureRoot,
+        security::{NOISE_PROLOGUE, NOISE_SUITE, Offer, OfferState, PendingState, pair_sas},
         state_store::StateStore,
     };
 
     use super::*;
 
-    const NOW: i64 = 1_700_000_000;
     const SUFFIX: &[&str] = &["Library", "AppSupport", "agent"];
+
+    // Used only by the store-backed tests.
+    impl<'a> FakeClock<'a> {
+        fn hook(self, hook: impl FnMut(Duration) + Send + 'a) -> Self {
+            *self.hook.lock().unwrap() = Box::new(hook);
+            self
+        }
+
+        fn skew(&self, seconds: i64) {
+            self.skew.store(seconds, Ordering::SeqCst);
+        }
+
+        /// Moves time on by a second, so the next request from the same
+        /// static is admitted by the producer's rate limiter.
+        fn tick(&self) {
+            *self.elapsed.lock().unwrap() += RATE_INTERVAL;
+        }
+    }
     const REQUEST_ID: [u8; 16] = [0x5a; 16];
-    const LONG: Duration = Duration::from_secs(15);
 
     // ------------------------------------------------------------ harness
 
@@ -346,76 +683,6 @@ mod disk {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
-    }
-
-    type Hook<'a> = Box<dyn FnMut(Duration) + Send + 'a>;
-
-    /// Shared fake time. `sleep` advances it (unless frozen) and then runs
-    /// the hook, so a test can act "while the client waits".
-    struct FakeClock<'a> {
-        elapsed: &'a Mutex<Duration>,
-        /// Added to the monotonic reading and to the wall clock.
-        offset: Duration,
-        /// Added to the wall clock only.
-        skew: AtomicI64,
-        frozen: bool,
-        hook: Mutex<Hook<'a>>,
-    }
-
-    impl<'a> FakeClock<'a> {
-        fn new(elapsed: &'a Mutex<Duration>) -> Self {
-            Self {
-                elapsed,
-                offset: Duration::ZERO,
-                skew: AtomicI64::new(0),
-                frozen: false,
-                hook: Mutex::new(Box::new(|_| {})),
-            }
-        }
-
-        fn hook(self, hook: impl FnMut(Duration) + Send + 'a) -> Self {
-            *self.hook.lock().unwrap() = Box::new(hook);
-            self
-        }
-
-        fn skew(&self, seconds: i64) {
-            self.skew.store(seconds, Ordering::SeqCst);
-        }
-
-        /// Moves time on by a second, so the next request from the same
-        /// static is admitted by the producer's rate limiter.
-        fn tick(&self) {
-            *self.elapsed.lock().unwrap() += RATE_INTERVAL;
-        }
-    }
-
-    impl Clock for FakeClock<'_> {
-        fn monotonic(&self) -> Duration {
-            *self.elapsed.lock().unwrap() + self.offset
-        }
-
-        fn os_now_seconds(&self) -> Result<i64, StorageError> {
-            Ok(NOW + self.skew.load(Ordering::SeqCst) + self.monotonic().as_secs() as i64)
-        }
-
-        fn sleep(&self, duration: Duration) {
-            let now = {
-                let mut elapsed = self.elapsed.lock().unwrap();
-                if !self.frozen {
-                    *elapsed += duration;
-                }
-                *elapsed
-            };
-            (self.hook.lock().unwrap())(now);
-        }
-    }
-
-    fn secret(n: u8) -> [u8; 32] {
-        std::array::from_fn(|i| (n.wrapping_mul(37)).wrapping_add(i as u8) ^ 0xa5)
-    }
-
-    fn offer_id(n: u8) -> [u8; 16] {
-        [n; 16]
     }
 
     /// A producer agent on its own secure root, sharing on.
@@ -538,56 +805,6 @@ mod disk {
         (result, accepted.into_inner().unwrap())
     }
 
-    /// A scripted responder: for connection `n` (0-based), `reply` gets the
-    /// request and the session's `hFinal` and returns the frame to send,
-    /// or `None` to hold the connection open without answering.
-    fn fake<R>(
-        key: &StaticKey,
-        reply: impl FnMut(usize, &Frame, &[u8; 32]) -> Option<Frame> + Send,
-        body: impl FnOnce(u16) -> R,
-    ) -> (R, usize) {
-        let (listener, port) = loopback();
-        let stop = AtomicBool::new(false);
-        let count = AtomicUsize::new(0);
-        let mut reply = reply;
-        let result = thread::scope(|scope| {
-            scope.spawn(|| {
-                let mut held: Vec<Session> = Vec::new();
-                for stream in listener.incoming() {
-                    if stop.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let Ok(stream) = stream else { continue };
-                    let n = count.fetch_add(1, Ordering::SeqCst);
-                    let Ok(mut session) = noise::accept(stream, key) else {
-                        continue;
-                    };
-                    let Ok(received) =
-                        session.receive(&MemoryLedger::default(), Deadline::after(LONG))
-                    else {
-                        continue;
-                    };
-                    match reply(n, &received.frame, session.h_final()) {
-                        Some(frame) => {
-                            let _ = session.send(&frame, Deadline::after(LONG));
-                        }
-                        None => held.push(session),
-                    }
-                }
-            });
-            let result = catch_unwind(AssertUnwindSafe(|| body(port)));
-            stop.store(true, Ordering::SeqCst);
-            let _ = TcpStream::connect(("127.0.0.1", port));
-            result
-        });
-        let result = result.unwrap_or_else(|panic| resume_unwind(panic));
-        (result, count.into_inner())
-    }
-
-    fn json_bytes(value: Value) -> Vec<u8> {
-        CanonicalJsonV1::encode(&value).unwrap()
-    }
-
     fn claim_json(n: u8, secret: &[u8; 32]) -> Vec<u8> {
         json_bytes(json!({
             "offerId": hex_encode(&offer_id(n)),
@@ -602,21 +819,6 @@ mod disk {
 
     fn grant_status_json(grant_id: &[u8; 16]) -> Vec<u8> {
         json_bytes(json!({"grantId": hex_encode(grant_id), "protocol": 1}))
-    }
-
-    fn error_payload(code: u16) -> Vec<u8> {
-        format!("{{\"code\":{code},\"protocol\":1}}").into_bytes()
-    }
-
-    fn frame(kind: FrameKind, request_id: [u8; 16], payload: Vec<u8>) -> Frame {
-        Frame {
-            kind,
-            final_chunk: true,
-            request_id,
-            chunk_index: 0,
-            chunk_count: 1,
-            payload,
-        }
     }
 
     /// One raw request over a real handshake: the reply frame and `hFinal`.
@@ -634,8 +836,8 @@ mod disk {
         let received = session
             .receive(&MemoryLedger::default(), Deadline::after(LONG))
             .unwrap();
-        assert_eq!(received.frame.request_id, REQUEST_ID);
-        (received.frame.clone(), *session.h_final())
+        assert_eq!(received.frame().request_id, REQUEST_ID);
+        (received.frame().clone(), *session.h_final())
     }
 
     fn raw(port: u16, key: &StaticKey, responder: &[u8; 32], payload: Vec<u8>) -> Frame {
@@ -1192,6 +1394,41 @@ mod disk {
         });
     }
 
+    /// B5: with the OS wall clock unreadable, Grant status still answers
+    /// what needs no clock: a revoked grant `revoked`, an expired one
+    /// `expired`; an active one gets the error map's `internal`.
+    #[test]
+    fn grant_status_without_a_wall_clock_still_reports_revoked_and_expired() {
+        let node = Node::new();
+        let time = Mutex::new(Duration::ZERO);
+        let clock = FakeClock::new(&time);
+        let alice = StaticKey::generate().unwrap();
+        let responder = *node.key.public();
+        serve(&node.producer(&clock), |port| {
+            let grants: Vec<[u8; 16]> = (1..=3)
+                .map(|n| derive_grant_id(&paired(&node, port, &alice, n, &clock)))
+                .collect();
+            node.store
+                .transition(|state| state.revoke_commit(grants[0], NOW * 1_000))
+                .unwrap();
+            let expires = node.store.state().unwrap().reference.grants[1].expires_at_ms;
+            node.store
+                .transition(|state| state.expire_one(grants[1], expires))
+                .unwrap();
+            clock.wall_fails.store(true, Ordering::SeqCst);
+            let status = |grant_id: &[u8; 16]| {
+                clock.tick();
+                raw(port, &alice, &responder, grant_status_json(grant_id))
+            };
+            assert_eq!(state_of(&status(&grants[0])), "revoked");
+            assert_eq!(state_of(&status(&grants[1])), "expired");
+            assert_eq!(status(&grants[2]).payload, error_payload(8));
+            // Control: with the clock back, the active grant is `active`.
+            clock.wall_fails.store(false, Ordering::SeqCst);
+            assert_eq!(state_of(&status(&grants[2])), "active");
+        });
+    }
+
     /// Acceptance (8), producer half: a bad message 1 prefix closes with
     /// nothing written; a replay of a recorded connection (message 1 and the
     /// request ciphertext) reaches no state.
@@ -1234,7 +1471,9 @@ mod disk {
 
     /// Acceptance (9): unknown key set, the Peer request key set, a frame
     /// that is not a request and a 4,097-byte payload are `invalid`;
-    /// `protocol: 2` is `incompatible`.
+    /// `protocol: 2` is `incompatible`. The 4,097-byte payload is canonical
+    /// with the Pair status key set and `protocol: 2` (B8), so only the size
+    /// cap makes it `invalid`; without the cap it would be `incompatible`.
     #[test]
     fn malformed_requests_are_invalid_and_another_protocol_is_incompatible() {
         let node = Node::new();
@@ -1243,6 +1482,12 @@ mod disk {
         let alice = StaticKey::generate().unwrap();
         let responder = *node.key.public();
         let id = hex_encode(&[0x11; 16]);
+        let padded = |size: usize| {
+            let base = json_bytes(json!({"pendingId": "", "protocol": 2})).len();
+            let bytes = json_bytes(json!({"pendingId": "a".repeat(size - base), "protocol": 2}));
+            assert_eq!(bytes.len(), size);
+            bytes
+        };
         let peer_request = json!({
             "aggregationRevision": 1, "authEpoch": 1, "clients": [],
             "endDateExclusive": "2026-01-02", "endpoint": 1, "grantId": id,
@@ -1268,7 +1513,7 @@ mod disk {
                     FrameKind::Response,
                     pair_status_json(&[0x11; 16]),
                 ),
-                ("4097 bytes", request, vec![b' '; 4_097]),
+                ("4097 bytes", request, padded(4_097)),
                 ("not canonical", request, b"{ \"pendingId\":1}".to_vec()),
             ];
             for (label, kind, payload) in cases {
@@ -1278,6 +1523,9 @@ mod disk {
                 ask(request, json_bytes(json!({"pendingId": id, "protocol": 2}))),
                 error_payload(6)
             );
+            // Control for the cap: at 4,096 bytes the same payload passes
+            // every other check and reaches `incompatible`.
+            assert_eq!(ask(request, padded(4_096)), error_payload(6));
             // Control: protocol 1 reaches the surface.
             assert_eq!(
                 ask(request, json_bytes(json!({"pendingId": id, "protocol": 1}))),
@@ -1347,7 +1595,7 @@ mod disk {
                 format!("{:?}", node.limiter),
                 format!("{:?}", node.key),
                 format!("{receiver:?}"),
-                format!("{:?}", SystemClock::default()),
+                format!("{:?}", SystemClock),
                 format!("{:?}", Deadline::after(LONG)),
                 format!("{:?}", NoiseError::Io),
             ]);
@@ -1362,7 +1610,7 @@ mod disk {
                         .receive(&MemoryLedger::default(), Deadline::after(LONG))
                         .unwrap();
                     assert!(contains(
-                        &received.frame.payload,
+                        &received.frame().payload,
                         hex_encode(&the_secret).as_bytes()
                     ));
                     (format!("{session:?}"), format!("{received:?}"))
@@ -1486,19 +1734,6 @@ mod disk {
         assert_eq!(accepted.len(), 1, "the client never connected");
         assert_eq!(producer.payload, error_payload(2));
         assert!(node.store.state().unwrap().reference.pending.is_empty());
-    }
-
-    fn claimed_for(key: &StaticKey, port: u16, pending_id: [u8; 16]) -> Claimed {
-        Claimed {
-            offer_id: offer_id(1),
-            responder_static: *key.public(),
-            host: "127.0.0.1".into(),
-            port,
-            pending_id,
-            sas: "0000-0000".into(),
-            expires_at_ms: 0,
-            claimed_at: Duration::ZERO,
-        }
     }
 
     /// Acceptance (14): every mismatch in a reply frame stops the client.
@@ -1639,18 +1874,6 @@ mod disk {
             |port| client.poll(&claimed_for(&fake_key, port, pending_id)),
         );
         assert_eq!((result, count), (Err(ClientError::Aborted), 1));
-    }
-
-    fn fake_offer(key: &StaticKey, port: u16) -> PairOffer {
-        PairOffer {
-            expires_at: 0,
-            host: "127.0.0.1".into(),
-            offer_id: hex_encode(&offer_id(1)),
-            port,
-            responder_static: hex_encode(key.public()),
-            secret: hex_encode(&secret(1)),
-            version: 1,
-        }
     }
 
     /// Acceptance (14): five retriable failures use the five attempt slots

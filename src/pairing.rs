@@ -13,7 +13,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt,
     net::TcpStream,
-    sync::{Mutex, PoisonError},
+    sync::{Mutex, OnceLock, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -331,18 +331,15 @@ pub trait Clock: Send + Sync {
     fn sleep(&self, duration: Duration);
 }
 
-#[derive(Debug)]
-pub struct SystemClock(Instant);
-
-impl Default for SystemClock {
-    fn default() -> Self {
-        Self(Instant::now())
-    }
-}
+/// The OS clocks. Every instance reads monotonic time from one
+/// process-wide origin, so readings from different instances compare.
+#[derive(Debug, Default)]
+pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn monotonic(&self) -> Duration {
-        self.0.elapsed()
+        static ORIGIN: OnceLock<Instant> = OnceLock::new();
+        ORIGIN.get_or_init(Instant::now).elapsed()
     }
 
     fn os_now_seconds(&self) -> Result<i64, StorageError> {
@@ -404,8 +401,8 @@ impl Producer<'_> {
         else {
             return;
         };
-        let request_id = received.frame.request_id;
-        let answer = self.answer(&received.frame, session.remote_static(), session.h_final());
+        let request_id = received.frame().request_id;
+        let answer = self.answer(received.frame(), session.remote_static(), session.h_final());
         drop(received);
         let frame = match answer {
             Ok(payload) => Frame {
@@ -554,7 +551,9 @@ impl Producer<'_> {
     }
 
     /// Advisory only: admits nothing. Answers the bound static even while
-    /// sharing is off, so a receiver learns `revoked` explicitly (F-5).
+    /// sharing is off, so a receiver learns `revoked` explicitly (F-5). An
+    /// unreadable OS clock is handled like an anomaly: what needs no clock
+    /// is still answered.
     fn grant_status(&self, grant_id: [u8; 16], initiator: &[u8; 32]) -> Result<Vec<u8>, PeerCode> {
         let state = self.store.state().map_err(storage_error_code)?;
         let reference = &state.reference;
@@ -564,28 +563,31 @@ impl Producer<'_> {
             .find(|grant| grant.grant_id == grant_id)
             .filter(|grant| constant_time_eq(&grant.initiator_static, initiator))
             .ok_or(PeerCode::Unauthorized)?;
-        let clock = self.clock_of(reference)?;
+        let clock = self
+            .clock
+            .os_now_seconds()
+            .map(|os_now| clock_status(os_now, reference.last_accepted_wall_unix_seconds()));
         // None of these needs a clock.
         let revoked = grant.state == GrantState::Revoked
             || !reference.sharing_enabled
             || grant.auth_epoch <= reference.deny_floor
             || grant.source_scope_generation != reference.source_scope_generation;
         let expired = grant.state == GrantState::Expired;
-        let status = if clock.anomaly {
-            if revoked {
-                GrantStatus::Revoked
-            } else if expired {
-                GrantStatus::Expired
-            } else {
-                return Err(PeerCode::Busy);
+        let status = match clock {
+            // Expiry first, deliberately (`spec/pairing-v1.md`).
+            Ok(clock) if !clock.anomaly => {
+                if expired || effective_ms(clock)? >= grant.expires_at_ms {
+                    GrantStatus::Expired
+                } else if revoked {
+                    GrantStatus::Revoked
+                } else {
+                    GrantStatus::Active
+                }
             }
-        // Expiry first, deliberately (`spec/pairing-v1.md`).
-        } else if expired || effective_ms(clock)? >= grant.expires_at_ms {
-            GrantStatus::Expired
-        } else if revoked {
-            GrantStatus::Revoked
-        } else {
-            GrantStatus::Active
+            _ if revoked => GrantStatus::Revoked,
+            _ if expired => GrantStatus::Expired,
+            Ok(_) => return Err(PeerCode::Busy),
+            Err(error) => return Err(storage_error_code(error)),
         };
         encode(&GrantStatusResponse {
             auth_epoch: grant.auth_epoch,
@@ -713,6 +715,8 @@ impl ClientError {
     }
 }
 
+/// One attempt that completed its handshake: the pending ID and SAS it
+/// derived, recorded before the request was written.
 #[derive(Clone, Debug)]
 struct Attempt {
     pending_id: [u8; 16],
@@ -721,9 +725,11 @@ struct Attempt {
 
 /// Claim attempts, per offer: at most [`CLAIM_ATTEMPTS_MAX`], never evicted,
 /// because a retry against the frozen claim returns the *first* pending ID.
-/// A new attempt or another offer clears only what is displayed, never this.
+/// Only an attempt whose handshake completed is recorded: a pending ID
+/// exists only from `hFinal` on. A new attempt or another offer clears only
+/// what is displayed, never this.
 #[derive(Clone, Debug, Default)]
-pub struct ClaimAttempts(BTreeMap<[u8; 16], Vec<Option<Attempt>>>);
+pub struct ClaimAttempts(BTreeMap<[u8; 16], Vec<Attempt>>);
 
 impl ClaimAttempts {
     /// Attempt slots used for `offer_id`.
@@ -802,13 +808,24 @@ enum Reply {
 }
 
 impl PairingClient<'_> {
-    /// Pair claim. Retries `busy`, `internal` and transport failures at
-    /// least [`CLAIM_RETRY_INTERVAL`] apart, one attempt slot each.
+    /// Pair claim. `offer` must come from the frozen `parse_pair_url`, which
+    /// owns the full offer validation (the canonical host check among it);
+    /// this rechecks only `version` and `port`.
+    ///
+    /// Retries `busy`, `internal` and transport failures at least
+    /// [`CLAIM_RETRY_INTERVAL`] apart. A try whose handshake completed takes
+    /// one attempt slot, recorded before the request is written; a connect
+    /// or handshake failure takes none, and after [`CLAIM_ATTEMPTS_MAX`] of
+    /// them this call returns [`ClientError::Transport`] (a later call may
+    /// connect again).
     pub fn claim(
         &self,
         offer: &PairOffer,
         attempts: &mut ClaimAttempts,
     ) -> Result<Claimed, ClientError> {
+        if offer.version != PROTOCOL || offer.port < 1024 {
+            return Err(ClientError::InvalidOffer);
+        }
         let offer_id =
             decode_fixed_hex::<16>(&offer.offer_id).map_err(|_| ClientError::InvalidOffer)?;
         let responder_static = decode_fixed_hex::<32>(&offer.responder_static)
@@ -827,21 +844,29 @@ impl PairingClient<'_> {
         })
         .map_err(|_| ClientError::InvalidOffer)?;
         let tries = attempts.0.entry(offer_id).or_default();
+        let mut connect_failures = 0;
+        let mut retry = false;
         loop {
             if tries.len() >= CLAIM_ATTEMPTS_MAX {
                 return Err(ClientError::LostAttempt);
             }
-            if !tries.is_empty() {
+            if retry {
                 self.clock.sleep(CLAIM_RETRY_INTERVAL);
             }
-            tries.push(None);
-            let Ok(mut session) =
-                noise::connect(&offer.host, offer.port, self.identity, &responder_static)
-            else {
-                continue;
-            };
+            retry = true;
+            let mut session =
+                match noise::connect(&offer.host, offer.port, self.identity, &responder_static) {
+                    Ok(session) => session,
+                    Err(error) => {
+                        connect_failures += 1;
+                        if connect_failures >= CLAIM_ATTEMPTS_MAX {
+                            return Err(ClientError::Transport(error));
+                        }
+                        continue;
+                    }
+                };
             let h_final = session.h_final();
-            *tries.last_mut().expect("pushed above") = Some(Attempt {
+            tries.push(Attempt {
                 pending_id: derive_pending_id(&secret_hash, h_final),
                 sas: pair_sas(
                     PROTOCOL,
@@ -854,7 +879,7 @@ impl PairingClient<'_> {
             match self.exchange(&mut session, payload.clone()) {
                 Ok(Reply::Body(received)) => {
                     let response: PairClaimResponse =
-                        CanonicalJsonV1::decode(&received.frame.payload)
+                        CanonicalJsonV1::decode(&received.frame().payload)
                             .map_err(|_| ClientError::Aborted)?;
                     if response.protocol != PROTOCOL {
                         return Err(ClientError::Aborted);
@@ -863,7 +888,6 @@ impl PairingClient<'_> {
                         .map_err(|_| ClientError::Aborted)?;
                     let attempt = tries
                         .iter()
-                        .flatten()
                         .find(|attempt| attempt.pending_id == pending_id)
                         .ok_or(ClientError::LostAttempt)?;
                     return Ok(Claimed {
@@ -896,7 +920,7 @@ impl PairingClient<'_> {
         })
         .map_err(|_| ClientError::Aborted)?;
         let received = self.request(claimed, payload)?;
-        let body = &received.frame.payload;
+        let body = &received.frame().payload;
         let value = CanonicalJsonV1::decode_value(body).map_err(|_| ClientError::Aborted)?;
         // Shape chosen by the `state` value, never by the key set.
         if value.get("state").and_then(Value::as_str) == Some("approved") {
@@ -939,7 +963,7 @@ impl PairingClient<'_> {
         .map_err(|_| ClientError::Aborted)?;
         let received = self.request(claimed, payload)?;
         let response: GrantStatusResponse =
-            CanonicalJsonV1::decode(&received.frame.payload).map_err(|_| ClientError::Aborted)?;
+            CanonicalJsonV1::decode(&received.frame().payload).map_err(|_| ClientError::Aborted)?;
         if response.protocol != PROTOCOL
             || decode_fixed_hex::<16>(&response.grant_id) != Ok(grant_id)
         {
@@ -1048,7 +1072,7 @@ impl PairingClient<'_> {
         let received = session
             .receive(self.ledger, Deadline::after(INITIATOR_READ_TIMEOUT))
             .map_err(ClientError::Transport)?;
-        let frame = &received.frame;
+        let frame = received.frame();
         if frame.request_id != request_id
             || frame.chunk_count != 1
             || frame.chunk_index != 0

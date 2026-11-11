@@ -11,7 +11,7 @@
 use std::{
     fmt,
     io::{ErrorKind, Read, Write},
-    net::{TcpStream, ToSocketAddrs},
+    net::{SocketAddr, TcpStream, ToSocketAddrs},
     time::{Duration, Instant},
 };
 
@@ -139,8 +139,15 @@ impl fmt::Debug for Session {
 /// One received frame and the ledger reservation that paid for it. The
 /// reservation is returned when this is dropped.
 pub struct Received {
-    pub frame: Frame,
+    frame: Frame,
     _reservation: MemoryReservation,
+}
+
+impl Received {
+    /// Borrowed only: moving the frame out would outlive its reservation.
+    pub fn frame(&self) -> &Frame {
+        &self.frame
+    }
 }
 
 /// Redacted: a request frame's payload can carry the Pair bearer secret.
@@ -151,21 +158,22 @@ impl fmt::Debug for Received {
 }
 
 /// Initiator: connects and runs IK with `remote_static` pinned, all within
-/// one [`HANDSHAKE_TIMEOUT`].
+/// one [`HANDSHAKE_TIMEOUT`]. Name resolution (`getaddrinfo`) runs first and
+/// is not bounded by that deadline: std offers no way to bound it.
 pub fn connect(
     host: &str,
     port: u16,
     local: &StaticKey,
     remote_static: &[u8; 32],
 ) -> Result<Session, NoiseError> {
-    let deadline = Deadline::after(HANDSHAKE_TIMEOUT);
-    let address = (host, port)
+    let addresses: Vec<SocketAddr> = (host, port)
         .to_socket_addrs()
         .map_err(|_| NoiseError::Io)?
-        .next()
-        .ok_or(NoiseError::Io)?;
-    let mut stream =
-        TcpStream::connect_timeout(&address, deadline.remaining()?).map_err(|_| NoiseError::Io)?;
+        .collect();
+    let deadline = Deadline::after(HANDSHAKE_TIMEOUT);
+    let mut stream = connect_addrs(&addresses, deadline)?;
+    // The deadline loops rely on blocking reads and writes.
+    stream.set_nonblocking(false).map_err(|_| NoiseError::Io)?;
     let mut state = Builder::new(params()?)
         .local_private_key(local.private.expose())
         .and_then(|builder| builder.remote_public_key(remote_static))
@@ -186,6 +194,9 @@ pub fn connect(
 /// Touches no agent state: the identity is passed in.
 pub fn accept(mut stream: TcpStream, local: &StaticKey) -> Result<Session, NoiseError> {
     let deadline = Deadline::after(HANDSHAKE_TIMEOUT);
+    // An accepted stream may inherit non-blocking mode from its listener
+    // (OS-dependent); the deadline loops would then spin on `WouldBlock`.
+    stream.set_nonblocking(false).map_err(|_| NoiseError::Io)?;
     let mut state = Builder::new(params()?)
         .local_private_key(local.private.expose())
         .and_then(|builder| builder.prologue(NOISE_PROLOGUE))
@@ -257,6 +268,16 @@ impl Session {
             _reservation: reservation,
         })
     }
+}
+
+/// Tries each resolved address in order, all under one absolute deadline.
+fn connect_addrs(addresses: &[SocketAddr], deadline: Deadline) -> Result<TcpStream, NoiseError> {
+    for address in addresses {
+        if let Ok(stream) = TcpStream::connect_timeout(address, deadline.remaining()?) {
+            return Ok(stream);
+        }
+    }
+    Err(NoiseError::Io)
 }
 
 fn params() -> Result<NoiseParams, NoiseError> {
@@ -340,6 +361,8 @@ fn read_exact(
         stream
             .set_read_timeout(Some(deadline.remaining()?))
             .map_err(|_| NoiseError::Io)?;
+        #[cfg(test)]
+        tests::READ_CALLS.with(|calls| calls.set(calls.get() + 1));
         match stream.read(&mut buffer[filled..]) {
             Ok(0) => return Err(NoiseError::Io),
             Ok(read) => filled += read,
@@ -376,7 +399,58 @@ fn retry(kind: ErrorKind) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, net::TcpListener};
+
     use super::*;
+
+    thread_local! {
+        /// `read` system calls made by `read_exact` on this thread.
+        pub(super) static READ_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// B1: `accept` on a stream left in non-blocking mode puts it back in
+    /// blocking mode, so the handshake read waits for the peer instead of
+    /// spinning on `WouldBlock` until the deadline. The peer sends a bad
+    /// prefix after 300 ms; a blocking read gets it in one call.
+    #[test]
+    fn accept_reads_a_non_blocking_stream_in_blocking_mode() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            stream.write_all(&97_u32.to_be_bytes()).unwrap();
+            let _ = stream.read_to_end(&mut Vec::new());
+        });
+        let (stream, _) = listener.accept().unwrap();
+        // Set explicitly: inheritance from the listener differs by OS.
+        stream.set_nonblocking(true).unwrap();
+        READ_CALLS.with(|calls| calls.set(0));
+        let key = StaticKey::generate().unwrap();
+        assert_eq!(accept(stream, &key).err(), Some(NoiseError::Framing));
+        let reads = READ_CALLS.with(Cell::get);
+        peer.join().unwrap();
+        assert!(reads <= 4, "{reads} reads: the handshake read spun");
+    }
+
+    /// B3: a refused first address does not end the connect; the next
+    /// resolved address is tried under the same deadline.
+    #[test]
+    fn connect_tries_every_resolved_address() {
+        let refused = {
+            let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+            closed.local_addr().unwrap()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = listener.local_addr().unwrap();
+        let stream = connect_addrs(&[refused, open], Deadline::after(HANDSHAKE_TIMEOUT)).unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), open);
+        // Control: the refused address alone fails.
+        assert_eq!(
+            connect_addrs(&[refused], Deadline::after(HANDSHAKE_TIMEOUT)).err(),
+            Some(NoiseError::Io)
+        );
+    }
 
     fn pair() -> (HandshakeState, HandshakeState, StaticKey) {
         let initiator = StaticKey::generate().unwrap();
