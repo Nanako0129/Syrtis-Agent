@@ -5,12 +5,14 @@
 # longer pins Cargo.toml, Cargo.lock or src/lib.rs, which runtime slices must
 # edit; tests/dependency_provenance_v1.rs, pinned here together with its
 # lock baseline, now guards every dependency instead. The SA-0 contract
-# (source, specs, tests, fixtures) keeps its corrected-contract bytes. It
-# is not, and must never become, "whatever was
+# (source, specs, tests, fixtures) keeps its corrected-contract bytes, and
+# the storage contract (spec/state-store-v1.md, its golden fixture) is
+# frozen alongside it. It is not, and must never become, "whatever was
 # committed last": a change to any listed file has to arrive with the reason
 # it changed.
 79d1c0363e4576d67827ebfa029fad7e3a5981474f4aafba3bd71e54f1a98172  spec/report-cache-v1.md
 ad9c1fc39056f0f6033dbb7426224ab987d7b4de0ef71371c348ddd8f20f762d  spec/security-v1.md
+07a1ba85037e7768fe717678c1a961621966384133b1454767cd875d86b3a05b  spec/state-store-v1.md
 0fc483cc0ac6e3b744b92af1194ac2c9bfb3ae4bf02c1bd220befda98bcd4d0f  spec/v1.md
 ff21cbcfdd6aedfb68ac1b3cfda056663203f2c7f08fd05a856dc5dbe5e4c25a  src/cache.rs
 8b0add8d4fde2253edebdddd448d381559d63ff630f0e9d2f9faad8d9625567f  src/canonical.rs
@@ -26,6 +28,7 @@ e222989ac752a128717fc37b48e8f5c625d5883c0be98d761c3ac19d298a2b72  tests/fixtures
 c02dccddf2ffbb5c86f0a0230db59e59276efece0970aad85252d78af6d31d05  tests/fixtures/v1/report/hourly.json
 60c2996518decd1ec26e810df8b92a32298530947e3df5eb59db1aaa4294d07c  tests/fixtures/v1/report/models.json
 070b5d28018b353eae1d53658f43a8c45d0f50205c86050e45cb6ad4d212f09c  tests/fixtures/v1/runtime/storage/cargo-lock-baseline.json
+f8326f22b3df9d37df1ec1eea8dd6b4a160de6022b3a226a35bb618c4345f4e0  tests/fixtures/v1/runtime/storage/state-golden.json
 7d63f4dd2eda8933046b960fcfa8eb817324e4f29ac1dbb6b106e661d3b6940c  tests/fixtures/v1/security/consent.json
 a58bdd593173195fa9042f6c0e4065a11d553fcc88d4ae79bfc1a5e31f16692e  tests/fixtures/v1/security/control_mac.hex
 ad73bef2423761d5f2d473cab2561133560498054009e01e52c2a845a643dfd1  tests/fixtures/v1/security/linux_roots.json
