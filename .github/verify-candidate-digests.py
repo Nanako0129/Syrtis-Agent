@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the imported SA-0 candidate is byte-identical to what was reviewed.
+"""Verify the frozen contract files are byte-identical to what was reviewed.
 
 Runs on every CI platform. Windows is the one that matters: a stray
 end-of-line conversion would rewrite the LF-only fixtures that

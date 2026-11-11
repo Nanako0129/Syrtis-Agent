@@ -1,21 +1,22 @@
-# SHA-256 of every contract file, re-derived on each CI platform before
-# anything compiles. See .github/verify-candidate-digests.py.
+# SHA-256 of every frozen contract file, re-derived on each CI platform
+# before anything compiles. See .github/verify-candidate-digests.py.
 #
-# MEANING CHANGED: this originally pinned "byte-identical to the reviewed
-# SA-0 candidate". Since the correction slice on feat/contract-clock-v1 it
-# pins "byte-identical to the CORRECTED contract" instead. It is not, and
-# must never become, "whatever was committed last": a change to any listed
-# file has to arrive with the reason it changed.
-9261ba46197050ccf1b80455a9b0193d5ab1069ae2dfceeae469e60b61fd6450  Cargo.lock
-5e7c8f4987ec411537c3a2fffb58e905cd9b6ceef48ed405d79395d404e9d093  Cargo.toml
+# MEANING: "the frozen contract files are unchanged". Since SA-2B1a this no
+# longer pins Cargo.toml, Cargo.lock or src/lib.rs, which runtime slices must
+# edit; tests/dependency_provenance_v1.rs, pinned here together with its
+# lock baseline, now guards every dependency instead. The SA-0 contract
+# (source, specs, tests, fixtures) keeps its corrected-contract bytes. It
+# is not, and must never become, "whatever was
+# committed last": a change to any listed file has to arrive with the reason
+# it changed.
 79d1c0363e4576d67827ebfa029fad7e3a5981474f4aafba3bd71e54f1a98172  spec/report-cache-v1.md
 ad9c1fc39056f0f6033dbb7426224ab987d7b4de0ef71371c348ddd8f20f762d  spec/security-v1.md
 0fc483cc0ac6e3b744b92af1194ac2c9bfb3ae4bf02c1bd220befda98bcd4d0f  spec/v1.md
 ff21cbcfdd6aedfb68ac1b3cfda056663203f2c7f08fd05a856dc5dbe5e4c25a  src/cache.rs
 8b0add8d4fde2253edebdddd448d381559d63ff630f0e9d2f9faad8d9625567f  src/canonical.rs
-42c33ea34862e0fe5a668922fb1c37aca7407fc123903a794b866fddf8d49772  src/lib.rs
 e3f35e33b4b26bab06e243d14eb087b5b2405a3b093a6a744cc84a5a36573ab0  src/report.rs
 ce18b810f1ceddb919202d2ff6df078d8c98210981ad992690834a9dd6269aac  src/security.rs
+d5f996584b60503b242f91bf58ccde55e3005ad6f3fb367836dd46c9edb15cbb  tests/dependency_provenance_v1.rs
 e01e9d55a26fb4f807ff0baea4a9681b0cbbb86b61f6b00fe5c49d919a2ebb10  tests/fixtures/v1/cache/body.sha256
 edb92226baac009e4c7779cb2c7a7369049e0ea97615945f8e64378322785b19  tests/fixtures/v1/cache/filename.txt
 417b8bac17da40d1de4fee3e71f3a13770427d98ac764313f3d1074e4cb64002  tests/fixtures/v1/cache/key.json
@@ -24,6 +25,7 @@ e3437af54f3292180d1510ca274cc445d243d777188f1e441dec50a9d1450ffc  tests/fixtures
 e222989ac752a128717fc37b48e8f5c625d5883c0be98d761c3ac19d298a2b72  tests/fixtures/v1/report/graph.json
 c02dccddf2ffbb5c86f0a0230db59e59276efece0970aad85252d78af6d31d05  tests/fixtures/v1/report/hourly.json
 60c2996518decd1ec26e810df8b92a32298530947e3df5eb59db1aaa4294d07c  tests/fixtures/v1/report/models.json
+070b5d28018b353eae1d53658f43a8c45d0f50205c86050e45cb6ad4d212f09c  tests/fixtures/v1/runtime/storage/cargo-lock-baseline.json
 7d63f4dd2eda8933046b960fcfa8eb817324e4f29ac1dbb6b106e661d3b6940c  tests/fixtures/v1/security/consent.json
 a58bdd593173195fa9042f6c0e4065a11d553fcc88d4ae79bfc1a5e31f16692e  tests/fixtures/v1/security/control_mac.hex
 ad73bef2423761d5f2d473cab2561133560498054009e01e52c2a845a643dfd1  tests/fixtures/v1/security/linux_roots.json
