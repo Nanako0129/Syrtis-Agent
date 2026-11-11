@@ -167,10 +167,10 @@ impl SecureRoot {
                 // before any commit lands in it. After the root's own checks
                 // (a root that fails them, for example on a non-local
                 // filesystem, never pays for or hangs on the sync) and
-                // before the backup exclusion, the `owner.lock` checks and
-                // the lock, so an open that then fails there or gets `Busy`
-                // has already synced. Failure is `UnsafeState`: nothing was
-                // committed, so nothing is unknown.
+                // before the backup exclusion (macOS only), the `owner.lock`
+                // checks and the lock, so an open that then fails there or
+                // gets `Busy` has already synced. Failure is `UnsafeState`:
+                // nothing was committed, so nothing is unknown.
                 if created || sync_found_root_parent() {
                     shim(Step::SyncParent(index), || full_sync(&dir))
                         .map_err(|_| StorageError::UnsafeState)?;
@@ -445,7 +445,12 @@ mod acl {
     /// −1 can only come from this call, never from an earlier one. Test
     /// seams can make it fail with a chosen errno, or fail without setting
     /// errno.
-    fn get_entry(acl: Acl, entry_id: c_int, entry: &mut AclEntry) -> c_int {
+    ///
+    /// # Safety
+    ///
+    /// `acl` must be a valid ACL handle that has not been freed, and it must
+    /// stay valid for the call: `acl_get_entry` reads through it.
+    unsafe fn get_entry(acl: Acl, entry_id: c_int, entry: &mut AclEntry) -> c_int {
         unsafe { *libc::__error() = 0 };
         #[cfg(test)]
         if let Some(errno) = super::seams::acl_get_entry_failure() {
@@ -462,7 +467,13 @@ mod acl {
     /// `acl_free`. When a test sets the seam, errno is then overwritten with
     /// `EINVAL`, so code that reads errno after the free, instead of before
     /// it, reads the "no more entries" value and is caught.
-    pub(super) fn free(acl: Acl) {
+    ///
+    /// # Safety
+    ///
+    /// `acl` must be a valid ACL handle that the caller owns (from
+    /// `acl_get_fd_np` or `acl_init`) and does not use or free afterwards:
+    /// `acl_free` releases it.
+    pub(super) unsafe fn free(acl: Acl) {
         unsafe { acl_free(acl) };
         #[cfg(test)]
         if super::seams::clobbers_errno_after_acl_free() {
@@ -482,7 +493,9 @@ mod acl {
         }
         let rc = unsafe { acl_set_fd_np(file.as_raw_fd(), acl, ACL_TYPE_EXTENDED) };
         let error = io::Error::last_os_error();
-        free(acl);
+        // SAFETY: `acl` is the non-null handle `acl_init` returned above,
+        // owned here and not used after this call.
+        unsafe { free(acl) };
         if rc == 0 { Ok(()) } else { Err(error) }
     }
 
@@ -532,11 +545,15 @@ mod acl {
     /// this function frees it exactly once.
     pub(super) unsafe fn empty_then_free(acl: Acl) -> bool {
         let mut entry: AclEntry = std::ptr::null_mut();
-        let rc = get_entry(acl, ACL_FIRST_ENTRY, &mut entry);
+        // SAFETY: the caller guarantees `acl` is a valid handle; it is not
+        // freed until below.
+        let rc = unsafe { get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
         // errno is read before `acl_free`, which may change it. Only
         // `EINVAL` means "no entry"; any other failure counts as one.
         let empty = rc == -1 && errno() == Some(libc::EINVAL);
-        free(acl);
+        // SAFETY: the caller hands over ownership of `acl`; this is its only
+        // free and nothing uses it afterwards.
+        unsafe { free(acl) };
         empty
     }
 
@@ -568,7 +585,9 @@ mod acl {
         // One more iteration than the cap, to see the end of a full ACL.
         for _ in 0..=ACL_MAX_ENTRIES {
             let mut entry: AclEntry = std::ptr::null_mut();
-            if get_entry(acl, entry_id, &mut entry) != 0 {
+            // SAFETY: the caller guarantees `acl` is a valid handle; it is
+            // not freed until after the loop.
+            if unsafe { get_entry(acl, entry_id, &mut entry) } != 0 {
                 // Before `acl_free`. Only `EINVAL` is "no more entries".
                 verdict = errno() == Some(libc::EINVAL);
                 break;
@@ -579,7 +598,9 @@ mod acl {
             }
             entry_id = ACL_NEXT_ENTRY;
         }
-        free(acl);
+        // SAFETY: the caller hands over ownership of `acl`; this is its only
+        // free and nothing uses it afterwards.
+        unsafe { free(acl) };
         verdict
     }
 }
@@ -1008,8 +1029,9 @@ mod tests {
 
     /// Creating a directory syncs its parent so the new entry is durable,
     /// and every open whose root passes its own checks syncs the root's
-    /// parent, also when the root already exists. Creating the root records that sync once, not twice;
-    /// reopening creates nothing, so it syncs only the root's parent.
+    /// parent, also when the root already exists. Creating the root records
+    /// that sync once, not twice; reopening creates nothing, so it syncs
+    /// only the root's parent.
     #[test]
     fn each_created_directory_is_followed_by_a_sync_of_its_parent() {
         let home = TempHome::new();
@@ -1146,6 +1168,18 @@ mod tests {
                 for file in ["state.json", "owner.lock"] {
                     let meta = std::fs::symlink_metadata(home.root().join(file)).unwrap();
                     assert_eq!(meta.mode() & 0o7777, 0o600, "{file}");
+                }
+            } else {
+                // Where it failed: `Library` was created but left at the
+                // umask-filtered `0500`, so creating `AppSupport` in it failed
+                // and the root was never created. The `NotFound` assertions
+                // assume a non-root test user: root bypasses the `EACCES`.
+                let library = home.path.join(SUFFIX[0]);
+                let mode = std::fs::symlink_metadata(&library).unwrap().mode() & 0o7777;
+                assert_eq!(mode, 0o500);
+                for path in [library.join(SUFFIX[1]), home.root()] {
+                    let error = std::fs::symlink_metadata(&path).unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::NotFound, "{path:?}");
                 }
             }
         }
