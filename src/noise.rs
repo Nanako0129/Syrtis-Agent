@@ -461,25 +461,59 @@ mod tests {
         );
     }
 
-    /// C3: each address gets the time left divided by the addresses not yet
-    /// tried. Four addresses that each hang for their whole budget all get
-    /// tried within one deadline; handing the first one everything left
-    /// would end the call after one try.
+    /// D7: the initiator's stream (from `TcpStream::connect_timeout`) is in
+    /// blocking mode, so its handshake read waits for the peer instead of
+    /// spinning on `WouldBlock`. The peer answers message 1 with a bad
+    /// message 2 prefix after 300 ms; a blocking read gets it in one call.
+    #[test]
+    fn connect_reads_its_stream_in_blocking_mode() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut message1 = [0; 4 + MESSAGE1_LEN];
+            stream.read_exact(&mut message1).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            stream.write_all(&49_u32.to_be_bytes()).unwrap();
+            let _ = stream.read_to_end(&mut Vec::new());
+        });
+        let local = StaticKey::generate().unwrap();
+        let remote = StaticKey::generate().unwrap();
+        READ_CALLS.with(|calls| calls.set(0));
+        assert_eq!(
+            connect("127.0.0.1", port, &local, remote.public()).err(),
+            Some(NoiseError::Framing)
+        );
+        let reads = READ_CALLS.with(Cell::get);
+        peer.join().unwrap();
+        assert!(reads <= 4, "{reads} reads: the handshake read spun");
+    }
+
+    /// C3, D8: each address gets the time left divided by the addresses not
+    /// yet tried. Each fake connect hangs for half its budget, so time is
+    /// left over for later addresses: the last one gets everything left,
+    /// well over a quarter of the total. Dividing by the total number of
+    /// addresses instead would give it less than a quarter; handing the
+    /// first one everything would break the first bound.
     #[test]
     fn connect_splits_the_deadline_across_the_addresses() {
         let addresses: Vec<SocketAddr> = (1..=4)
             .map(|n| SocketAddr::from(([127, 0, 0, 1], n)))
             .collect();
         let total = Duration::from_secs(1);
+        // Scheduling slack. Expected last budget ~547 ms; the divide-by-
+        // total mutant gives ~167 ms.
+        let slack = Duration::from_millis(50);
         let mut budgets = Vec::new();
         let result = connect_addrs(&addresses, Deadline::after(total), |_, budget| {
             budgets.push(budget);
-            std::thread::sleep(budget);
+            std::thread::sleep(budget / 2);
             Err(std::io::ErrorKind::TimedOut.into())
         });
         assert_eq!(result.err(), Some(NoiseError::Io));
         assert_eq!(budgets.len(), 4, "{budgets:?}");
         assert!(budgets[0] <= total / 4, "{budgets:?}");
+        assert!(budgets[3] > total / 4 - slack, "{budgets:?}");
         assert!(
             budgets.iter().all(|budget| !budget.is_zero()),
             "{budgets:?}"

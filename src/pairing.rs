@@ -43,7 +43,8 @@ pub const GRANT_LIFETIME_MS: i64 = 30 * 86_400_000;
 pub const PAIRING_PAYLOAD_MAX: usize = 4_096;
 pub const RATE_INTERVAL: Duration = Duration::from_secs(1);
 pub const RATE_TABLE_MAX: usize = 256;
-/// Attempt records per offer, never evicted.
+/// Attempt records per offer. A record is removed only by the record rule
+/// ([`ClaimAttempts`]); there is no eviction to make room.
 pub const CLAIM_ATTEMPTS_MAX: usize = 5;
 /// Connect or handshake failures in one `claim` call.
 pub const CLAIM_CONNECT_FAILURES_MAX: usize = 5;
@@ -133,6 +134,17 @@ pub fn storage_error_code(error: StorageError) -> PeerCode {
         | StorageError::Incompatible
         | StorageError::Corrupt
         | StorageError::Unavailable => PeerCode::Internal,
+    }
+}
+
+/// The map for Pair claim: [`storage_error_code`], except that a store
+/// `Busy` is `internal`. So a `busy` on Pair claim can only come from the
+/// rate limiter, before any state is read, and a receiver may take it as
+/// proof that nothing was committed.
+fn claim_error_code(error: StorageError) -> PeerCode {
+    match error {
+        StorageError::Busy => PeerCode::Internal,
+        other => storage_error_code(other),
     }
 }
 
@@ -456,49 +468,62 @@ impl Producer<'_> {
         initiator: &[u8; 32],
         h_final: &[u8; 32],
     ) -> Result<Vec<u8>, PeerCode> {
-        let responder = *self.identity.public();
-        // The presented secret, not anything looked up in state.
-        let secret_hash = offer_secret_hash(&offer_id, secret, &responder);
-        let pending_id = derive_pending_id(&secret_hash, h_final);
-        let sas_code = pair_sas(PROTOCOL, &offer_id, &responder, initiator, h_final);
-        let os_now = self.clock.os_now_seconds().map_err(storage_error_code)?;
-        let mut claimed = None;
-        #[cfg(test)]
-        seams::before_claim_transition();
-        self.store
-            .transition(|state| {
-                // Inside the closure, so a disable committed after any
-                // earlier read still refuses the claim.
-                if !state.sharing_enabled {
-                    return Err(SecurityError::Unauthorized);
-                }
-                let claim = OfferClaim {
-                    offer_id,
-                    secret: *secret,
-                    responder_static: responder,
-                    pending_id,
-                    initiator_static: *initiator,
-                    sas_code,
-                    sas_generation: SAS_GENERATION,
-                };
-                let (next, pending_id, _) = state.claim_offer(claim, os_now)?;
-                let expires_at = next
-                    .pending
-                    .iter()
-                    .find(|pending| pending.pending_id == pending_id)
-                    .map(|pending| pending.expires_at_ms)
-                    .ok_or(SecurityError::Invalid)?;
-                claimed = Some((pending_id, expires_at));
-                Ok(next)
-            })
-            .map_err(storage_error_code)?;
-        // Reached only when the commit is durable.
-        let (pending_id, expires_at) = claimed.ok_or(PeerCode::Internal)?;
+        // Every store error on this surface goes through this one map.
+        let (pending_id, expires_at) = self
+            .commit_claim(offer_id, secret, initiator, h_final)
+            .map_err(claim_error_code)?;
         encode(&PairClaimResponse {
             expires_at,
             pending_id: hex_encode(&pending_id),
             protocol: PROTOCOL,
         })
+    }
+
+    /// The claim transition. Returns the pending ID and expiry only once the
+    /// commit is durable.
+    fn commit_claim(
+        &self,
+        offer_id: [u8; 16],
+        secret: &[u8; 32],
+        initiator: &[u8; 32],
+        h_final: &[u8; 32],
+    ) -> Result<([u8; 16], i64), StorageError> {
+        let responder = *self.identity.public();
+        // The presented secret, not anything looked up in state.
+        let secret_hash = offer_secret_hash(&offer_id, secret, &responder);
+        let pending_id = derive_pending_id(&secret_hash, h_final);
+        let sas_code = pair_sas(PROTOCOL, &offer_id, &responder, initiator, h_final);
+        let os_now = self.clock.os_now_seconds()?;
+        let mut claimed = None;
+        #[cfg(test)]
+        seams::before_claim_transition();
+        self.store.transition(|state| {
+            // Inside the closure, so a disable committed after any
+            // earlier read still refuses the claim.
+            if !state.sharing_enabled {
+                return Err(SecurityError::Unauthorized);
+            }
+            let claim = OfferClaim {
+                offer_id,
+                secret: *secret,
+                responder_static: responder,
+                pending_id,
+                initiator_static: *initiator,
+                sas_code,
+                sas_generation: SAS_GENERATION,
+            };
+            let (next, pending_id, _) = state.claim_offer(claim, os_now)?;
+            let expires_at = next
+                .pending
+                .iter()
+                .find(|pending| pending.pending_id == pending_id)
+                .map(|pending| pending.expires_at_ms)
+                .ok_or(SecurityError::Invalid)?;
+            claimed = Some((pending_id, expires_at));
+            Ok(next)
+        })?;
+        // Reached only when the commit is durable.
+        claimed.ok_or(StorageError::Refused(SecurityError::Invalid))
     }
 
     fn pair_status(&self, pending_id: [u8; 16], initiator: &[u8; 32]) -> Result<Vec<u8>, PeerCode> {
@@ -683,10 +708,10 @@ pub enum ClientError {
     /// A claim succeeded with a pending ID none of this device's attempts
     /// derived, or every attempt slot for the offer is used.
     LostAttempt,
-    /// Pair claim answered `busy` [`CLAIM_BUSY_MAX`] times in one call.
-    /// Nothing was committed; a later call may succeed.
-    Busy,
-    /// The producer answered with this error code.
+    /// The producer answered with this error code. From `claim`,
+    /// `Code(Busy)` means [`CLAIM_BUSY_MAX`] `busy` answers in one call
+    /// (nothing was committed), and `Code(Internal)` ends the call at once;
+    /// a later call may succeed.
     Code(PeerCode),
     Rejected,
     Expired,
@@ -709,7 +734,7 @@ impl ClientError {
             Self::LostAttempt => {
                 "This device lost track of an earlier attempt. Ask the owner to reject the request and create a new offer."
             }
-            Self::Busy => "The other device is busy. Try again in a moment.",
+            Self::Code(PeerCode::Busy) => "The other device is busy. Try again in a moment.",
             Self::SelfPairing => "This offer was created on this device.",
             Self::InvalidOffer => "This offer is not valid.",
             Self::Rejected => "The owner rejected the request.",
@@ -730,18 +755,22 @@ struct Attempt {
     sas: String,
 }
 
-/// Claim attempts, per offer: at most [`CLAIM_ATTEMPTS_MAX`], never evicted,
-/// because a retry against the frozen claim returns the *first* pending ID.
-/// Only an attempt whose handshake completed is recorded: a pending ID
-/// exists only from `hFinal` on. A new attempt or another offer clears only
-/// what is displayed, never this.
+/// Claim attempts, per offer, at most [`CLAIM_ATTEMPTS_MAX`]. A retry
+/// against the frozen claim returns the *first* pending ID, so a record is
+/// kept while it may still be answered.
+///
+/// Record rule: a record is created after the handshake (a pending ID
+/// exists only from `hFinal` on) and before the request is written. It is
+/// removed in exactly two cases: (a) an authenticated `busy` on Pair claim,
+/// which proves nothing was committed; (b) a success whose pending ID
+/// matches an *earlier* record, which then removes only the record just
+/// created for this connection, since the offer was consumed by that
+/// earlier attempt. It is kept for `internal`, for a transport failure
+/// after the handshake, and for a success that matches itself. A new
+/// attempt or another offer clears only what is displayed, never this.
 #[derive(Clone, Debug, Default)]
 pub struct ClaimAttempts {
     records: BTreeMap<[u8; 16], Vec<Attempt>>,
-    /// Receiver monotonic time the last claim exchange ended (at or after
-    /// the producer admitted it); the next claim waits until
-    /// [`CLAIM_RETRY_INTERVAL`] after it. Process-local.
-    last_exchange: Option<Duration>,
 }
 
 impl ClaimAttempts {
@@ -826,14 +855,13 @@ impl PairingClient<'_> {
     /// owns the full offer validation (the canonical host check among it);
     /// this rechecks only `version` and `port`.
     ///
-    /// Retries `busy`, `internal` and transport failures at least
-    /// [`CLAIM_RETRY_INTERVAL`] apart, across calls too. A try whose
-    /// handshake completed takes one attempt slot, recorded before the
-    /// request is written, and keeps it unless the answer is `busy`. A
-    /// connect or handshake failure takes none, and after
+    /// Within one call, retries `busy` and transport failures at least
+    /// [`CLAIM_RETRY_INTERVAL`] apart; `internal` ends the call. Attempt
+    /// records follow the record rule of [`ClaimAttempts`]. A connect or
+    /// handshake failure takes no record, and after
     /// [`CLAIM_CONNECT_FAILURES_MAX`] of them this call returns
     /// [`ClientError::Transport`]; after [`CLAIM_BUSY_MAX`] `busy` answers
-    /// it returns [`ClientError::Busy`]. A later call may try again.
+    /// it returns `Code(Busy)`. A later call may try again.
     pub fn claim(
         &self,
         offer: &PairOffer,
@@ -867,17 +895,8 @@ impl PairingClient<'_> {
             if tries.len() >= CLAIM_ATTEMPTS_MAX {
                 return Err(ClientError::LostAttempt);
             }
-            // A retry waits the full interval; a call's first try waits out
-            // what is left of it since the previous call's last exchange.
-            let wait = if retry {
-                CLAIM_RETRY_INTERVAL
-            } else {
-                attempts.last_exchange.map_or(Duration::ZERO, |last| {
-                    (last + CLAIM_RETRY_INTERVAL).saturating_sub(self.clock.monotonic())
-                })
-            };
-            if !wait.is_zero() {
-                self.clock.sleep(wait);
+            if retry {
+                self.clock.sleep(CLAIM_RETRY_INTERVAL);
             }
             retry = true;
             let mut session =
@@ -902,9 +921,7 @@ impl PairingClient<'_> {
                     h_final,
                 ),
             });
-            let reply = self.exchange(&mut session, payload.clone());
-            attempts.last_exchange = Some(self.clock.monotonic());
-            match reply {
+            match self.exchange(&mut session, payload.clone()) {
                 Ok(Reply::Body(received)) => {
                     let response: PairClaimResponse =
                         CanonicalJsonV1::decode(&received.frame().payload)
@@ -914,17 +931,24 @@ impl PairingClient<'_> {
                     }
                     let pending_id = decode_fixed_hex::<16>(&response.pending_id)
                         .map_err(|_| ClientError::Aborted)?;
-                    let attempt = tries
+                    let index = tries
                         .iter()
-                        .find(|attempt| attempt.pending_id == pending_id)
+                        .position(|attempt| attempt.pending_id == pending_id)
                         .ok_or(ClientError::LostAttempt)?;
+                    let sas = tries[index].sas.clone();
+                    // Rule (b): an earlier attempt consumed the offer, so the
+                    // ID this connection derived is never answered. Only the
+                    // record just created (the last) goes.
+                    if index + 1 != tries.len() {
+                        tries.pop();
+                    }
                     return Ok(Claimed {
                         offer_id,
                         responder_static,
                         host: offer.host.clone(),
                         port: offer.port,
                         pending_id,
-                        sas: attempt.sas.clone(),
+                        sas,
                         expires_at_ms: response.expires_at,
                         claimed_at: self.clock.monotonic(),
                     });
@@ -933,18 +957,25 @@ impl PairingClient<'_> {
                 Ok(Reply::Code(code @ (PeerCode::Invalid | PeerCode::Incompatible))) => {
                     return Err(ClientError::Code(code));
                 }
-                // On Pair claim `busy` comes only from the rate limiter,
-                // which runs before any state is read: nothing was
-                // committed, so this attempt's record can never be answered.
+                // Rule (a): on Pair claim `busy` comes only from the rate
+                // limiter, before any state is read (a store `Busy` is sent
+                // as `internal`): nothing was committed, so this
+                // connection's record can never be answered.
                 Ok(Reply::Code(PeerCode::Busy)) => {
                     tries.pop();
                     busy += 1;
                     if busy >= CLAIM_BUSY_MAX {
-                        return Err(ClientError::Busy);
+                        return Err(ClientError::Code(PeerCode::Busy));
                     }
                 }
-                // The request may have been committed: the record stays.
-                Ok(Reply::Code(PeerCode::Internal)) | Err(ClientError::Transport(_)) => {}
+                // The request may have been committed: the record stays,
+                // and the call ends so each retry is the caller's choice.
+                Ok(Reply::Code(PeerCode::Internal)) => {
+                    return Err(ClientError::Code(PeerCode::Internal));
+                }
+                // The request may have reached the producer: the record
+                // stays and the call retries.
+                Err(ClientError::Transport(_)) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -1199,6 +1230,35 @@ mod tests {
         }
     }
 
+    /// D3: Pair claim sends a store `Busy` as `internal`, so its `busy` can
+    /// only be the rate limiter's; every other store error maps as the
+    /// total map does.
+    #[test]
+    fn the_claim_map_sends_a_store_busy_as_internal() {
+        assert_eq!(claim_error_code(StorageError::Busy), PeerCode::Internal);
+        // Control: the total map, used by the status surfaces, keeps `busy`.
+        assert_eq!(storage_error_code(StorageError::Busy), PeerCode::Busy);
+        for error in [
+            StorageError::UnsafeState,
+            StorageError::Unknown,
+            StorageError::Incompatible,
+            StorageError::Corrupt,
+            StorageError::Unavailable,
+            StorageError::Refused(SecurityError::Bounds),
+            StorageError::Refused(SecurityError::Canonical),
+            StorageError::Refused(SecurityError::Conflict),
+            StorageError::Refused(SecurityError::Expired),
+            StorageError::Refused(SecurityError::Invalid),
+            StorageError::Refused(SecurityError::Unauthorized),
+        ] {
+            assert_eq!(
+                claim_error_code(error),
+                storage_error_code(error),
+                "{error:?}"
+            );
+        }
+    }
+
     /// Acceptance (11), internal types: the request types that hold the
     /// secret never show it.
     #[test]
@@ -1322,22 +1382,53 @@ mod tests {
             /// A claim answered in this thread, so thread-local seams apply.
             fn claim(&self) -> Result<Vec<u8>, PeerCode> {
                 self.clock.sleep(RATE_INTERVAL);
-                let payload = CanonicalJsonV1::encode(&PairClaimRequest {
-                    offer_id: hex_encode(&OFFER),
-                    protocol: PROTOCOL,
-                    secret: WireSecret(crate::state_store::Secret32::new(SECRET)),
-                })
-                .unwrap();
-                let frame = Frame {
-                    kind: FrameKind::Request,
-                    final_chunk: true,
-                    request_id: [0x33; 16],
-                    chunk_index: 0,
-                    chunk_count: 1,
-                    payload,
-                };
-                self.producer().answer(&frame, &INITIATOR, &[0x44; 32])
+                self.producer()
+                    .answer(&claim_frame(), &INITIATOR, &[0x44; 32])
             }
+        }
+
+        fn claim_frame() -> Frame {
+            let payload = CanonicalJsonV1::encode(&PairClaimRequest {
+                offer_id: hex_encode(&OFFER),
+                protocol: PROTOCOL,
+                secret: WireSecret(crate::state_store::Secret32::new(SECRET)),
+            })
+            .unwrap();
+            Frame {
+                kind: FrameKind::Request,
+                final_chunk: true,
+                request_id: [0x33; 16],
+                chunk_index: 0,
+                chunk_count: 1,
+                payload,
+            }
+        }
+
+        /// D3: a store `Busy` while serving Pair claim answers `internal`,
+        /// never `busy`. The OS clock read stands in for the store: every
+        /// store error of this surface goes through one map.
+        #[test]
+        fn a_store_busy_during_a_claim_answers_internal() {
+            struct BusyClock;
+            impl Clock for BusyClock {
+                fn monotonic(&self) -> Duration {
+                    Duration::ZERO
+                }
+                fn os_now_seconds(&self) -> Result<i64, StorageError> {
+                    Err(StorageError::Busy)
+                }
+                fn sleep(&self, _: Duration) {}
+            }
+            let node = node();
+            let producer = Producer {
+                clock: &BusyClock,
+                ..node.producer()
+            };
+            assert_eq!(
+                producer.answer(&claim_frame(), &INITIATOR, &[0x44; 32]),
+                Err(PeerCode::Internal)
+            );
+            assert!(node.store.state().unwrap().reference.pending.is_empty());
         }
 
         /// Acceptance (10): a claim whose commit fails answers `internal`

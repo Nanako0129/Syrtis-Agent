@@ -635,15 +635,29 @@ fn claim_reply(request: &Frame, secret_hash: &[u8; 32], h_final: &[u8; 32]) -> F
     )
 }
 
-/// Acceptance (14): five transport failures after the handshake use the
-/// five attempt records, and the sixth try ends as a lost attempt without
-/// connecting; an answer naming the first attempt's pending ID on the
-/// fifth try is still matched, so no record is ever evicted. Each failure
-/// is a lost reply (the receiver's ledger cannot hold it): the request
-/// reached the producer and may have been committed, so its record stays.
-/// (A `busy` answer drops its record, C1, so it cannot fill them.)
+/// The receiver's SAS for the connection with this `hFinal`.
+fn sas_for(responder: &StaticKey, receiver: &StaticKey, h_final: &[u8; 32]) -> String {
+    pair_sas(
+        1,
+        &offer_id(1),
+        responder.public(),
+        receiver.public(),
+        h_final,
+    )
+}
+
+/// Acceptance (14) and the record rule: a transport failure after the
+/// handshake keeps its record (the request reached the producer and may
+/// have been committed) and the call retries. Each failure here is a lost
+/// reply: the receiver's ledger cannot hold it.
+///
+/// Four replies are lost and the fifth names the pending ID the first try
+/// derived: it is matched, and only the fifth connection's own record is
+/// removed (rule (b)). Then five lost replies use all five records, and
+/// the next try ends as a lost attempt without connecting. (A `busy`
+/// answer drops its record, so it cannot fill them.)
 #[test]
-fn claim_attempts_are_capped_at_five_and_never_evicted() {
+fn transport_failures_after_the_handshake_keep_their_records_up_to_five() {
     let fake_key = StaticKey::generate().unwrap();
     let receiver = StaticKey::generate().unwrap();
     let time = Mutex::new(Duration::ZERO);
@@ -655,6 +669,34 @@ fn claim_attempts_are_capped_at_five_and_never_evicted() {
         clock: &clock,
     };
     let secret_hash = offer_secret_hash(&offer_id(1), &secret(1), fake_key.public());
+
+    let fill = Mutex::new(Some(ledger.reserve(REMOTE_MEMORY_MAX).unwrap()));
+    let mut first: Option<[u8; 32]> = None;
+    let mut attempts = ClaimAttempts::default();
+    let (result, count) = fake(
+        &fake_key,
+        |n, request, h_final| {
+            let first = *first.get_or_insert(*h_final);
+            if n < 4 {
+                return Some(claim_reply(request, &secret_hash, h_final));
+            }
+            // Released before the reply is written, so the client can read it.
+            fill.lock().unwrap().take();
+            Some(claim_reply(request, &secret_hash, &first))
+        },
+        |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
+    );
+    assert_eq!(count, 5);
+    let h_first = first.unwrap();
+    assert_eq!(
+        result.map(|claimed| (claimed.pending_id, claimed.sas)),
+        Ok((
+            derive_pending_id(&secret_hash, &h_first),
+            sas_for(&fake_key, &receiver, &h_first)
+        ))
+    );
+    assert_eq!(attempts.used(&offer_id(1)), 4);
+    assert_eq!(ledger.used(), 0);
 
     // Every reply would match its own attempt, but none can be read.
     let fill = ledger.reserve(REMOTE_MEMORY_MAX).unwrap();
@@ -674,54 +716,15 @@ fn claim_attempts_are_capped_at_five_and_never_evicted() {
     assert_eq!((result, count), (Err(ClientError::LostAttempt), 0));
     drop(fill);
     assert_eq!(ledger.used(), 0);
-
-    // Four replies are lost; the fifth, readable again, names the pending
-    // ID the first try derived.
-    let fill = Mutex::new(Some(ledger.reserve(REMOTE_MEMORY_MAX).unwrap()));
-    let mut first: Option<[u8; 32]> = None;
-    let mut attempts = ClaimAttempts::default();
-    let (result, count) = fake(
-        &fake_key,
-        |n, request, h_final| {
-            let first = *first.get_or_insert(*h_final);
-            if n < 4 {
-                return Some(claim_reply(request, &secret_hash, h_final));
-            }
-            // Released before the reply is written, so the client can read it.
-            fill.lock().unwrap().take();
-            Some(claim_reply(request, &secret_hash, &first))
-        },
-        |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
-    );
-    assert_eq!(count, 5);
-    let claimed = result.unwrap();
-    assert_eq!(attempts.used(&offer_id(1)), 5);
-    let h_first = first.unwrap();
-    assert_eq!(
-        claimed.sas,
-        pair_sas(
-            1,
-            &offer_id(1),
-            fake_key.public(),
-            receiver.public(),
-            &h_first
-        )
-    );
-    assert_eq!(
-        claimed.pending_id,
-        derive_pending_id(&secret_hash, &h_first)
-    );
-    assert_eq!(ledger.used(), 0);
 }
 
-/// C1: on Pair claim `busy` comes only from the rate limiter, before any
-/// state is read, so an authenticated `busy` drops its attempt record.
-/// Five `busy` answers end the call with `Busy` and no record; a later
-/// claim of the same offer succeeds with its own connection's SAS. Claim
-/// calls stay a second apart: a claim right after a finished one first
-/// waits out the interval, and takes one more record only.
+/// C1, D9: on Pair claim `busy` comes only from the rate limiter, before
+/// any state is read, so an authenticated `busy` drops its attempt record.
+/// Five `busy` answers, 1 s apart, end the call with `Code(Busy)` and no
+/// record; later claims of the same offer succeed with their own
+/// connection's SAS, each keeping its own record.
 #[test]
-fn busy_claims_keep_no_record_and_claim_calls_stay_a_second_apart() {
+fn busy_claims_keep_no_record() {
     let fake_key = StaticKey::generate().unwrap();
     let receiver = StaticKey::generate().unwrap();
     let time = Mutex::new(Duration::ZERO);
@@ -757,30 +760,185 @@ fn busy_claims_keep_no_record_and_claim_calls_stay_a_second_apart() {
     );
     assert_eq!(count, 7);
     let h_finals = h_finals.into_inner().unwrap();
-    let sas = |n: usize| {
-        pair_sas(
-            1,
-            &offer_id(1),
-            fake_key.public(),
-            receiver.public(),
-            &h_finals[n],
-        )
-    };
     // Five `busy` answers, four 1 s waits between them, no record.
-    assert_eq!(outcomes[0].0, Err(ClientError::Busy));
+    assert_eq!(outcomes[0].0, Err(ClientError::Code(PeerCode::Busy)));
+    // D9: the busy code has its own text, not the generic failure.
+    assert_ne!(
+        ClientError::Code(PeerCode::Busy).message(),
+        ClientError::Aborted.message()
+    );
     assert_eq!((outcomes[0].1, outcomes[0].2), (0, Duration::from_secs(4)));
-    // The next call waits a second after the last exchange, then succeeds.
+    // The next call succeeds with its own connection's SAS.
     let claimed = outcomes[1].0.clone().unwrap();
-    assert_eq!(claimed.sas, sas(5));
+    assert_eq!(claimed.sas, sas_for(&fake_key, &receiver, &h_finals[5]));
     assert_eq!(
         claimed.pending_id,
         derive_pending_id(&secret_hash, &h_finals[5])
     );
-    assert_eq!((outcomes[1].1, outcomes[1].2), (1, Duration::from_secs(5)));
-    // Called again at once: it waits a second first and adds one record.
+    assert_eq!(outcomes[1].1, 1);
+    // A success that matches its own record keeps it.
     let claimed = outcomes[2].0.clone().unwrap();
-    assert_eq!(claimed.sas, sas(6));
-    assert_eq!((outcomes[2].1, outcomes[2].2), (2, Duration::from_secs(6)));
+    assert_eq!(claimed.sas, sas_for(&fake_key, &receiver, &h_finals[6]));
+    assert_eq!(outcomes[2].1, 2);
+}
+
+/// D1: `internal` ends the claim call at once (one connection per call, no
+/// wait) and keeps its record, because the request may have been
+/// committed. Four calls answered `internal` keep four records; a fifth
+/// call answered with the first call's pending ID is matched to the first
+/// call's SAS, and only its own record goes (rule (b)).
+#[test]
+fn an_internal_answer_ends_the_call_and_keeps_its_record() {
+    let fake_key = StaticKey::generate().unwrap();
+    let receiver = StaticKey::generate().unwrap();
+    let time = Mutex::new(Duration::ZERO);
+    let clock = FakeClock::new(&time);
+    let ledger = MemoryLedger::default();
+    let client = PairingClient {
+        identity: &receiver,
+        ledger: &ledger,
+        clock: &clock,
+    };
+    let secret_hash = offer_secret_hash(&offer_id(1), &secret(1), fake_key.public());
+    let first = Mutex::new(None);
+    let mut attempts = ClaimAttempts::default();
+    for call in 1..=4 {
+        let (result, count) = fake(
+            &fake_key,
+            |_, request, h_final| {
+                first.lock().unwrap().get_or_insert(*h_final);
+                Some(frame(
+                    FrameKind::Error,
+                    request.request_id,
+                    error_payload(8),
+                ))
+            },
+            |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
+        );
+        assert_eq!(
+            (result, count),
+            (Err(ClientError::Code(PeerCode::Internal)), 1),
+            "call {call}"
+        );
+        assert_eq!(attempts.used(&offer_id(1)), call, "call {call}");
+    }
+    assert_eq!(*time.lock().unwrap(), Duration::ZERO, "no call waited");
+    let h_first = first.into_inner().unwrap().unwrap();
+    let (result, count) = fake(
+        &fake_key,
+        |_, request, _| Some(claim_reply(request, &secret_hash, &h_first)),
+        |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
+    );
+    assert_eq!(count, 1);
+    assert_eq!(
+        result.map(|claimed| (claimed.pending_id, claimed.sas)),
+        Ok((
+            derive_pending_id(&secret_hash, &h_first),
+            sas_for(&fake_key, &receiver, &h_first)
+        ))
+    );
+    assert_eq!(attempts.used(&offer_id(1)), 4);
+}
+
+/// D2: claiming an offer this device already claimed gets the first
+/// pending ID back every time (the frozen claim's retry answer). Each such
+/// success drops the record its own connection just made, so seven claims
+/// in a row all succeed with the first SAS and one record stays; keeping
+/// those records would end the sixth claim as a lost attempt.
+#[test]
+fn reclaiming_a_claimed_offer_keeps_one_record() {
+    let fake_key = StaticKey::generate().unwrap();
+    let receiver = StaticKey::generate().unwrap();
+    let time = Mutex::new(Duration::ZERO);
+    let clock = FakeClock::new(&time);
+    let ledger = MemoryLedger::default();
+    let client = PairingClient {
+        identity: &receiver,
+        ledger: &ledger,
+        clock: &clock,
+    };
+    let secret_hash = offer_secret_hash(&offer_id(1), &secret(1), fake_key.public());
+    let first = Mutex::new(None);
+    let mut attempts = ClaimAttempts::default();
+    let (outcomes, count) = fake(
+        &fake_key,
+        |_, request, h_final| {
+            let first = *first.lock().unwrap().get_or_insert(*h_final);
+            Some(claim_reply(request, &secret_hash, &first))
+        },
+        |port| {
+            let offer = fake_offer(&fake_key, port);
+            (0..7)
+                .map(|_| {
+                    let result = client.claim(&offer, &mut attempts);
+                    (
+                        result.map(|claimed| (claimed.pending_id, claimed.sas)),
+                        attempts.used(&offer_id(1)),
+                    )
+                })
+                .collect::<Vec<_>>()
+        },
+    );
+    assert_eq!(count, 7);
+    let h_first = first.into_inner().unwrap().unwrap();
+    let expected = (
+        derive_pending_id(&secret_hash, &h_first),
+        sas_for(&fake_key, &receiver, &h_first),
+    );
+    for (call, outcome) in outcomes.into_iter().enumerate() {
+        assert_eq!(outcome, (Ok(expected.clone()), 1), "claim {call}");
+    }
+}
+
+/// D4: within one call, a lost reply (record kept), then `busy` (that
+/// connection's record removed), then a success naming the first
+/// connection's pending ID. The client shows the first connection's SAS
+/// and keeps exactly that one record. Removing anything but the last
+/// record on `busy` (the whole list, or the first) loses the first
+/// connection's record, and the success matches nothing.
+#[test]
+fn busy_removes_only_its_own_record() {
+    let fake_key = StaticKey::generate().unwrap();
+    let receiver = StaticKey::generate().unwrap();
+    let time = Mutex::new(Duration::ZERO);
+    let ledger = MemoryLedger::default();
+    let fill = Mutex::new(Some(ledger.reserve(REMOTE_MEMORY_MAX).unwrap()));
+    let clock = FakeClock::new(&time);
+    // The first retry wait frees the ledger, so only the first reply is lost.
+    *clock.hook.lock().unwrap() = Box::new(|_| {
+        fill.lock().unwrap().take();
+    });
+    let client = PairingClient {
+        identity: &receiver,
+        ledger: &ledger,
+        clock: &clock,
+    };
+    let secret_hash = offer_secret_hash(&offer_id(1), &secret(1), fake_key.public());
+    let first = Mutex::new(None);
+    let mut attempts = ClaimAttempts::default();
+    let (result, count) = fake(
+        &fake_key,
+        |n, request, h_final| {
+            let first = *first.lock().unwrap().get_or_insert(*h_final);
+            Some(match n {
+                0 => claim_reply(request, &secret_hash, h_final),
+                1 => frame(FrameKind::Error, request.request_id, error_payload(5)),
+                _ => claim_reply(request, &secret_hash, &first),
+            })
+        },
+        |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
+    );
+    assert_eq!(count, 3);
+    let h_first = first.into_inner().unwrap().unwrap();
+    assert_eq!(
+        result.map(|claimed| (claimed.pending_id, claimed.sas)),
+        Ok((
+            derive_pending_id(&secret_hash, &h_first),
+            sas_for(&fake_key, &receiver, &h_first)
+        ))
+    );
+    assert_eq!(attempts.used(&offer_id(1)), 1);
+    assert_eq!(ledger.used(), 0);
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1305,7 +1463,8 @@ mod disk {
         });
         let claimed = claimed.unwrap();
         assert_eq!(accepted.len(), 2, "first response lost, one retry");
-        assert_eq!(attempts.used(&offer_id(1)), 2);
+        // The retry's own record goes: the first attempt consumed the offer.
+        assert_eq!(attempts.used(&offer_id(1)), 1);
         let state = node.store.state().unwrap();
         assert_eq!(state.reference.pending.len(), 1);
         let pending = &state.reference.pending[0];
