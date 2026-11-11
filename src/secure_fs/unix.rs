@@ -473,7 +473,7 @@ mod acl {
     /// `acl` must be a valid ACL handle that the caller owns (from
     /// `acl_get_fd_np` or `acl_init`) and does not use or free afterwards:
     /// `acl_free` releases it.
-    pub(super) unsafe fn free(acl: Acl) {
+    unsafe fn free(acl: Acl) {
         unsafe { acl_free(acl) };
         #[cfg(test)]
         if super::seams::clobbers_errno_after_acl_free() {
@@ -593,6 +593,8 @@ mod acl {
                 break;
             }
             let mut tag = ACL_UNDEFINED_TAG;
+            // SAFETY: `entry` is a live entry that `get_entry` just returned
+            // from `acl`, which is not freed until after the loop.
             if unsafe { acl_get_tag_type(entry, &mut tag) } != 0 || tag != ACL_EXTENDED_DENY {
                 break;
             }
@@ -1172,14 +1174,18 @@ mod tests {
             } else {
                 // Where it failed: `Library` was created but left at the
                 // umask-filtered `0500`, so creating `AppSupport` in it failed
-                // and the root was never created. The `NotFound` assertions
-                // assume a non-root test user: root bypasses the `EACCES`.
+                // and the root was never created. Root bypasses that
+                // `EACCES`, so when the tests run as root the `NotFound`
+                // assertions are skipped; the `Err(UnsafeState)` assertion
+                // above still runs.
                 let library = home.path.join(SUFFIX[0]);
                 let mode = std::fs::symlink_metadata(&library).unwrap().mode() & 0o7777;
                 assert_eq!(mode, 0o500);
-                for path in [library.join(SUFFIX[1]), home.root()] {
-                    let error = std::fs::symlink_metadata(&path).unwrap_err();
-                    assert_eq!(error.kind(), io::ErrorKind::NotFound, "{path:?}");
+                if unsafe { libc::geteuid() } != 0 {
+                    for path in [library.join(SUFFIX[1]), home.root()] {
+                        let error = std::fs::symlink_metadata(&path).unwrap_err();
+                        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{path:?}");
+                    }
                 }
             }
         }
