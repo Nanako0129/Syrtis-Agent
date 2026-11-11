@@ -117,7 +117,21 @@ impl SecureRoot {
         let home = CString::new(home).map_err(|_| StorageError::UnsafeState)?;
         let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
         let mut dir = file_from(unsafe { libc::open(home.as_ptr(), flags) })?;
-        check_owner(&metadata(&dir)?, Object::Home)?;
+        let meta = metadata(&dir)?;
+        check_owner(&meta, Object::Home)?;
+        // sshd StrictModes: a home others can write lets them replace any
+        // entry below it.
+        guard(
+            meta.mode() & 0o022 == 0,
+            HOME_MODE,
+            StorageError::UnsafeState,
+        )?;
+        #[cfg(target_os = "macos")]
+        guard(
+            acl::deny_only(&dir),
+            INTERMEDIATE_ACL,
+            StorageError::UnsafeState,
+        )?;
         for (index, component) in suffix.iter().enumerate() {
             let name = component_name(component)?;
             shim(Step::Descend(index), || Ok(())).map_err(|_| StorageError::UnsafeState)?;
@@ -128,9 +142,10 @@ impl SecureRoot {
                 // stripped: an existing one is checked as found.
                 set_exact_mode(&next, 0o700).map_err(|_| StorageError::UnsafeState)?;
                 #[cfg(target_os = "macos")]
-                if last {
-                    clear_acl(&next).map_err(|_| StorageError::UnsafeState)?;
-                }
+                clear_acl(&next).map_err(|_| StorageError::UnsafeState)?;
+            }
+            // A created intermediate's entry is made durable in its parent.
+            if created && !last {
                 shim(Step::SyncParent(index), || full_sync(&dir))
                     .map_err(|_| StorageError::UnsafeState)?;
             }
@@ -146,11 +161,31 @@ impl SecureRoot {
                     StorageError::UnsafeState,
                 )?;
                 guard(local_filesystem(&next), LOCAL_FS, StorageError::UnsafeState)?;
+                // The root's parent is synced on every open whose root
+                // passes its own checks, found or created, so a root an
+                // earlier run created but crashed before syncing is durable
+                // before any commit lands in it. After the root's own checks
+                // (a root that fails them, for example on a non-local
+                // filesystem, never pays for or hangs on the sync) and
+                // before the backup exclusion, the `owner.lock` checks and
+                // the lock, so an open that then fails there or gets `Busy`
+                // has already synced. Failure is `UnsafeState`: nothing was
+                // committed, so nothing is unknown.
+                if created || sync_found_root_parent() {
+                    shim(Step::SyncParent(index), || full_sync(&dir))
+                        .map_err(|_| StorageError::UnsafeState)?;
+                }
             } else {
                 check_owner(&meta, Object::Intermediate)?;
                 guard(
                     meta.mode() & 0o022 == 0,
                     INTERMEDIATE,
+                    StorageError::UnsafeState,
+                )?;
+                #[cfg(target_os = "macos")]
+                guard(
+                    acl::deny_only(&next),
+                    INTERMEDIATE_ACL,
                     StorageError::UnsafeState,
                 )?;
             }
@@ -261,11 +296,15 @@ enum Object {
 
 // Bypass flags; real values only in test builds, where `guard` consults them.
 #[cfg(all(test, target_os = "macos"))]
-use seams::ACL;
+use seams::{ACL, INTERMEDIATE_ACL};
 #[cfg(test)]
-use seams::{BYTE_CAP, INTERMEDIATE, LOCAL_FS, MODE, NLINK, OWNER};
+use seams::{BYTE_CAP, HOME_MODE, INTERMEDIATE, LOCAL_FS, MODE, NLINK, OWNER};
 #[cfg(all(not(test), target_os = "macos"))]
 const ACL: u32 = 0;
+#[cfg(all(not(test), target_os = "macos"))]
+const INTERMEDIATE_ACL: u32 = 0;
+#[cfg(not(test))]
+const HOME_MODE: u32 = 0;
 #[cfg(not(test))]
 const BYTE_CAP: u32 = 0;
 #[cfg(not(test))]
@@ -299,6 +338,16 @@ fn nofollow() -> libc::c_int {
         return 0;
     }
     libc::O_NOFOLLOW
+}
+
+/// Whether an agent root that already existed, and passed its own checks,
+/// has its parent synced on open. Always in a non-test build.
+fn sync_found_root_parent() -> bool {
+    #[cfg(test)]
+    if seams::bypassed(seams::SKIP_PARENT_SYNC) {
+        return false;
+    }
+    true
 }
 
 fn check_owner(
@@ -355,7 +404,8 @@ fn clear_acl(file: &File) -> io::Result<()> {
 }
 
 /// macOS extended ACLs. `libc` 0.2.189 has no bindings; these are libSystem.
-/// Constants from `<sys/acl.h>` (`acl_type_t` is a C enum, so `int`).
+/// Constants from `<sys/acl.h>` (`acl_type_t`, `acl_tag_t` and
+/// `acl_entry_id_t` are C enums, so `int`).
 #[cfg(target_os = "macos")]
 mod acl {
     use std::{
@@ -365,17 +415,63 @@ mod acl {
         os::fd::AsRawFd,
     };
 
-    type Acl = *mut c_void;
-    type AclEntry = *mut c_void;
+    pub(super) type Acl = *mut c_void;
+    pub(super) type AclEntry = *mut c_void;
     const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
     const ACL_FIRST_ENTRY: c_int = 0;
+    const ACL_NEXT_ENTRY: c_int = -1;
+    pub(super) const ACL_UNDEFINED_TAG: c_int = 0;
+    #[cfg(test)]
+    pub(super) const ACL_EXTENDED_ALLOW: c_int = 1;
+    pub(super) const ACL_EXTENDED_DENY: c_int = 2;
+    /// `ACL_MAX_ENTRIES`: an extended ACL holds at most this many entries.
+    const ACL_MAX_ENTRIES: usize = 128;
 
     unsafe extern "C" {
-        fn acl_init(count: c_int) -> Acl;
+        pub(super) fn acl_init(count: c_int) -> Acl;
         fn acl_free(object: *mut c_void) -> c_int;
         fn acl_get_entry(acl: Acl, entry_id: c_int, entry: *mut AclEntry) -> c_int;
+        pub(super) fn acl_get_tag_type(entry: AclEntry, tag: *mut c_int) -> c_int;
         fn acl_get_fd_np(fd: c_int, kind: c_int) -> Acl;
         fn acl_set_fd_np(fd: c_int, acl: Acl, kind: c_int) -> c_int;
+        #[cfg(test)]
+        pub(super) fn acl_create_entry(acl: *mut Acl, entry: *mut AclEntry) -> c_int;
+        #[cfg(test)]
+        pub(super) fn acl_set_tag_type(entry: AclEntry, tag: c_int) -> c_int;
+    }
+
+    /// `acl_get_entry`, the only call site for both `none` and the
+    /// deny-only walk. errno is cleared first, so the `EINVAL` read after a
+    /// −1 can only come from this call, never from an earlier one. Test
+    /// seams can make it fail with a chosen errno, or fail without setting
+    /// errno.
+    fn get_entry(acl: Acl, entry_id: c_int, entry: &mut AclEntry) -> c_int {
+        unsafe { *libc::__error() = 0 };
+        #[cfg(test)]
+        if let Some(errno) = super::seams::acl_get_entry_failure() {
+            unsafe { *libc::__error() = errno };
+            return -1;
+        }
+        #[cfg(test)]
+        if super::seams::acl_get_entry_fails_silently() {
+            return -1;
+        }
+        unsafe { acl_get_entry(acl, entry_id, entry) }
+    }
+
+    /// `acl_free`. When a test sets the seam, errno is then overwritten with
+    /// `EINVAL`, so code that reads errno after the free, instead of before
+    /// it, reads the "no more entries" value and is caught.
+    pub(super) fn free(acl: Acl) {
+        unsafe { acl_free(acl) };
+        #[cfg(test)]
+        if super::seams::clobbers_errno_after_acl_free() {
+            unsafe { *libc::__error() = libc::EINVAL };
+        }
+    }
+
+    fn errno() -> Option<i32> {
+        io::Error::last_os_error().raw_os_error()
     }
 
     /// Replaces the extended ACL with an empty one.
@@ -386,21 +482,105 @@ mod acl {
         }
         let rc = unsafe { acl_set_fd_np(file.as_raw_fd(), acl, ACL_TYPE_EXTENDED) };
         let error = io::Error::last_os_error();
-        unsafe { acl_free(acl) };
+        free(acl);
         if rc == 0 { Ok(()) } else { Err(error) }
+    }
+
+    /// The descriptor's extended ACL: `Ok(None)` when it has none, `Err`
+    /// when it cannot be read.
+    fn read(file: &File) -> Result<Option<Acl>, ()> {
+        // Cleared first, so an `ENOENT` left by an earlier call can never
+        // read as "no ACL".
+        unsafe { *libc::__error() = 0 };
+        // A test seam can make the call return NULL without setting errno.
+        #[cfg(test)]
+        let silent_null = super::seams::acl_get_fd_returns_null_silently();
+        #[cfg(not(test))]
+        let silent_null = false;
+        let acl = if silent_null {
+            std::ptr::null_mut()
+        } else {
+            unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) }
+        };
+        if !acl.is_null() {
+            Ok(Some(acl))
+        } else if errno() == Some(libc::ENOENT) {
+            Ok(None)
+        } else {
+            Err(())
+        }
     }
 
     /// True only when the descriptor verifiably carries no extended ACL
     /// entry; any error reading it counts as "has one".
     pub(crate) fn none(file: &File) -> bool {
-        let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
-        if acl.is_null() {
-            return io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT);
+        match read(file) {
+            Ok(None) => true,
+            Err(()) => false,
+            // SAFETY: `acl` is the handle `acl_get_fd_np` just returned,
+            // owned here and passed on exactly once.
+            Ok(Some(acl)) => unsafe { empty_then_free(acl) },
         }
+    }
+
+    /// Whether `acl` has no entry, then frees it.
+    ///
+    /// # Safety
+    ///
+    /// `acl` must be a valid ACL handle that the caller owns (from
+    /// `acl_get_fd_np` or `acl_init`) and does not use or free afterwards:
+    /// this function frees it exactly once.
+    pub(super) unsafe fn empty_then_free(acl: Acl) -> bool {
         let mut entry: AclEntry = std::ptr::null_mut();
-        let has_entry = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) } == 0;
-        unsafe { acl_free(acl) };
-        !has_entry
+        let rc = get_entry(acl, ACL_FIRST_ENTRY, &mut entry);
+        // errno is read before `acl_free`, which may change it. Only
+        // `EINVAL` means "no entry"; any other failure counts as one.
+        let empty = rc == -1 && errno() == Some(libc::EINVAL);
+        free(acl);
+        empty
+    }
+
+    /// True only when the descriptor has no extended ACL or every entry is
+    /// an explicit deny (a stock `~/Library` carries `everyone deny
+    /// delete`). An allow, undefined or unknown tag, a tag that cannot be
+    /// read, more than `ACL_MAX_ENTRIES` entries, or an unreadable ACL all
+    /// count as "may grant another UID access".
+    pub(crate) fn deny_only(file: &File) -> bool {
+        match read(file) {
+            Ok(None) => true,
+            Err(()) => false,
+            // SAFETY: `acl` is the handle `acl_get_fd_np` just returned,
+            // owned here and passed on exactly once.
+            Ok(Some(acl)) => unsafe { all_deny_then_free(acl) },
+        }
+    }
+
+    /// Walks every entry of `acl`, then frees it.
+    ///
+    /// # Safety
+    ///
+    /// `acl` must be a valid ACL handle that the caller owns (from
+    /// `acl_get_fd_np` or `acl_init`) and does not use or free afterwards:
+    /// this function frees it exactly once.
+    pub(super) unsafe fn all_deny_then_free(acl: Acl) -> bool {
+        let mut verdict = false;
+        let mut entry_id = ACL_FIRST_ENTRY;
+        // One more iteration than the cap, to see the end of a full ACL.
+        for _ in 0..=ACL_MAX_ENTRIES {
+            let mut entry: AclEntry = std::ptr::null_mut();
+            if get_entry(acl, entry_id, &mut entry) != 0 {
+                // Before `acl_free`. Only `EINVAL` is "no more entries".
+                verdict = errno() == Some(libc::EINVAL);
+                break;
+            }
+            let mut tag = ACL_UNDEFINED_TAG;
+            if unsafe { acl_get_tag_type(entry, &mut tag) } != 0 || tag != ACL_EXTENDED_DENY {
+                break;
+            }
+            entry_id = ACL_NEXT_ENTRY;
+        }
+        free(acl);
+        verdict
     }
 }
 
@@ -826,8 +1006,10 @@ mod tests {
         root.remove_stale_temp("state.json").unwrap();
     }
 
-    /// Creating a directory syncs its parent so the new entry is durable;
-    /// reopening an existing root creates and syncs nothing.
+    /// Creating a directory syncs its parent so the new entry is durable,
+    /// and every open whose root passes its own checks syncs the root's
+    /// parent, also when the root already exists. Creating the root records that sync once, not twice;
+    /// reopening creates nothing, so it syncs only the root's parent.
     #[test]
     fn each_created_directory_is_followed_by_a_sync_of_its_parent() {
         let home = TempHome::new();
@@ -840,7 +1022,14 @@ mod tests {
             }
             Ok(())
         })));
-        drop(open(&home).unwrap());
+        // A `Busy` retry would descend again: record only the last attempt.
+        let open_recorded = || {
+            retry_busy(|| {
+                seen.lock().unwrap().clear();
+                open_once(&home)
+            })
+        };
+        drop(open_recorded().unwrap());
         assert_eq!(
             *seen.lock().unwrap(),
             [
@@ -852,12 +1041,57 @@ mod tests {
                 Step::SyncParent(2),
             ]
         );
-        seen.lock().unwrap().clear();
-        drop(open(&home).unwrap());
+        drop(open_recorded().unwrap());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                Step::Descend(0),
+                Step::Descend(1),
+                Step::Descend(2),
+                Step::SyncParent(2),
+            ]
+        );
+        // Negative control: without the per-open sync, reopening an
+        // existing root syncs nothing.
+        seams::bypass(seams::SKIP_PARENT_SYNC);
+        drop(open_recorded().unwrap());
         assert_eq!(
             *seen.lock().unwrap(),
             [Step::Descend(0), Step::Descend(1), Step::Descend(2)]
         );
+    }
+
+    /// A failed sync of the root's parent on open is `UnsafeState`, not the
+    /// store's sticky `Unknown`: nothing was committed. A later open works.
+    #[test]
+    fn a_failed_root_parent_sync_on_open_is_unsafe_state() {
+        let home = TempHome::new();
+        drop(open(&home).unwrap());
+        let _reset = Reset;
+        seams::set_hook(Some(Box::new(|step| {
+            if step == Step::SyncParent(SUFFIX.len() - 1) {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(())
+            }
+        })));
+        assert_eq!(open(&home).err(), Some(StorageError::UnsafeState));
+        seams::set_hook(None);
+        drop(open(&home).unwrap());
+    }
+
+    /// sshd StrictModes: a home that group or other can write fails closed;
+    /// a `0755` home opens.
+    #[test]
+    fn a_group_or_other_writable_home_fails_closed() {
+        let home = TempHome::new();
+        drop(open(&home).unwrap());
+        chmod(&home.path, 0o775);
+        fails_closed_only_by(HOME_MODE, StorageError::UnsafeState, || open(&home));
+        chmod(&home.path, 0o757);
+        fails_closed_only_by(HOME_MODE, StorageError::UnsafeState, || open(&home));
+        chmod(&home.path, 0o755);
+        drop(open(&home).unwrap());
     }
 
     /// The child side of `a_restrictive_umask…`. A no-op in a normal run.
@@ -931,26 +1165,27 @@ mod tests {
     /// `ls -le` lists extended ACL entries as ` 0: …` lines.
     #[cfg(target_os = "macos")]
     fn ls_shows_acl(path: &Path) -> bool {
-        let output = std::process::Command::new("/bin/ls")
-            .arg("-led")
-            .arg(path)
-            .output()
-            .unwrap();
-        String::from_utf8(output.stdout).unwrap().contains("\n 0: ")
+        acl_listing(path).contains("\n 0: ")
     }
 
     #[cfg(target_os = "macos")]
     const INHERITED: &str = "everyone allow read,list,search,file_inherit,directory_inherit";
 
-    /// A home whose `Library` passes an inheritable "everyone may read" ACL
-    /// to everything created below it.
+    /// A deny-only inheritable entry: the shape of a stock `~/Library`
+    /// (`everyone deny delete`), made inheritable.
+    #[cfg(target_os = "macos")]
+    const INHERITED_DENY: &str = "everyone deny delete,file_inherit,directory_inherit";
+
+    /// A home whose `Library` passes an inheritable deny-only ACL to
+    /// everything created below it. Deny-only, so `Library` itself passes the
+    /// intermediate ACL check.
     #[cfg(target_os = "macos")]
     fn home_with_inheritable_acl() -> TempHome {
         let home = TempHome::new();
         let library = home.path.join("Library");
         std::fs::create_dir(&library).unwrap();
         chmod(&library, 0o700);
-        add_acl(&library, INHERITED);
+        add_acl(&library, INHERITED_DENY);
         assert!(ls_shows_acl(&library), "control: ls must show the ACL");
         home
     }
@@ -961,10 +1196,10 @@ mod tests {
         let home = home_with_inheritable_acl();
         let root = open(&home).unwrap();
         write_state(&root, b"{}");
-        // The intermediate the agent created did inherit it...
-        assert!(ls_shows_acl(&home.path.join("Library/AppSupport")));
-        // ...but nothing that holds secrets carries it.
+        // Every directory the agent created, intermediate and root, and
+        // every file it holds carries no ACL. No ACL check is bypassed.
         for path in [
+            home.path.join("Library/AppSupport"),
             home.root(),
             home.root().join("state.json"),
             home.root().join("owner.lock"),
@@ -974,13 +1209,163 @@ mod tests {
         assert_eq!(root.read_file("state.json", 64).unwrap().unwrap(), b"{}");
         drop(root);
 
-        // Negative control: without the clearing the root inherits the ACL,
-        // and the check fails it closed.
+        // Negative control: without the clearing the created intermediate
+        // and the root inherit the ACL, and the root check fails it closed.
         let home = home_with_inheritable_acl();
         let _reset = Reset;
         seams::bypass(seams::SKIP_ACL_CLEAR);
         assert_eq!(open(&home).err(), Some(StorageError::UnsafeState));
+        assert!(ls_shows_acl(&home.path.join("Library/AppSupport")));
         assert!(ls_shows_acl(&home.root()));
+    }
+
+    /// `ls -led` output, for asserting entry order.
+    #[cfg(target_os = "macos")]
+    fn acl_listing(path: &Path) -> String {
+        let output = std::process::Command::new("/bin/ls")
+            .arg("-led")
+            .arg(path)
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    const ALLOW_WRITE: &str = "everyone allow add_subdirectory,delete_child";
+
+    /// c2: an ACL on the home or an intermediate directory passes only when
+    /// every entry is a deny. Each case fails closed, and bypassing only the
+    /// deny-only check admits it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_allow_entry_on_the_home_or_an_intermediate_fails_closed() {
+        // One allow entry on an intermediate.
+        let home = TempHome::new();
+        drop(open(&home).unwrap());
+        let support = home.path.join("Library/AppSupport");
+        add_acl(&support, ALLOW_WRITE);
+        fails_closed_only_by(INTERMEDIATE_ACL, StorageError::UnsafeState, || open(&home));
+
+        // Deny first, allow second: the walk must read past the first entry.
+        let home = TempHome::new();
+        drop(open(&home).unwrap());
+        let support = home.path.join("Library/AppSupport");
+        add_acl(&support, "everyone deny delete");
+        add_acl(&support, ALLOW_WRITE);
+        let listing = acl_listing(&support);
+        assert!(
+            listing.contains("\n 0: group:everyone deny delete\n")
+                && listing.contains("\n 1: group:everyone allow add_subdirectory,delete_child\n"),
+            "control: deny is entry 0 and allow entry 1: {listing}"
+        );
+        fails_closed_only_by(INTERMEDIATE_ACL, StorageError::UnsafeState, || open(&home));
+
+        // An allow entry on the home itself.
+        let home = TempHome::new();
+        drop(open(&home).unwrap());
+        add_acl(&home.path, ALLOW_WRITE);
+        fails_closed_only_by(INTERMEDIATE_ACL, StorageError::UnsafeState, || open(&home));
+    }
+
+    /// c2: deny-only ACLs on the home and every intermediate, as on a stock
+    /// macOS account, open.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn deny_only_acls_on_the_home_and_intermediates_open() {
+        let home = TempHome::new();
+        drop(open(&home).unwrap());
+        for path in [
+            home.path.clone(),
+            home.path.join("Library"),
+            home.path.join("Library/AppSupport"),
+        ] {
+            add_acl(&path, "everyone deny delete");
+            assert!(ls_shows_acl(&path), "control: {}", path.display());
+        }
+        // A second principal, so `chmod +a` adds an entry instead of merging.
+        add_acl(
+            &home.path.join("Library"),
+            "group:wheel deny add_subdirectory",
+        );
+        assert!(acl_listing(&home.path.join("Library")).contains("\n 1: "));
+        drop(open(&home).unwrap());
+    }
+
+    /// An in-memory ACL with one entry per tag; `None` leaves a fresh
+    /// entry's tag as created. A control asserts each tag reads back.
+    #[cfg(target_os = "macos")]
+    fn in_memory_acl(tags: &[Option<libc::c_int>]) -> acl::Acl {
+        let mut list = unsafe { acl::acl_init(4) };
+        assert!(!list.is_null());
+        for tag in tags {
+            let mut entry: acl::AclEntry = std::ptr::null_mut();
+            assert_eq!(unsafe { acl::acl_create_entry(&mut list, &mut entry) }, 0);
+            if let Some(tag) = tag {
+                assert_eq!(unsafe { acl::acl_set_tag_type(entry, *tag) }, 0);
+            }
+            let mut read = -1;
+            assert_eq!(unsafe { acl::acl_get_tag_type(entry, &mut read) }, 0);
+            assert_eq!(read, tag.unwrap_or(acl::ACL_UNDEFINED_TAG), "control: tag");
+        }
+        list
+    }
+
+    /// c2 at the tag level, on in-memory ACLs: only `ACL_EXTENDED_DENY`
+    /// passes. `ACL_UNDEFINED_TAG` cannot be written to a file, so this is
+    /// where an "every tag except allow" rule is caught.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_explicit_deny_tags_pass_the_intermediate_acl_check() {
+        use acl::{ACL_EXTENDED_ALLOW, ACL_EXTENDED_DENY};
+        // SAFETY: each handle is freshly built and freed once by the walk.
+        let verdict =
+            |tags: &[Option<libc::c_int>]| unsafe { acl::all_deny_then_free(in_memory_acl(tags)) };
+        let (deny, allow) = (Some(ACL_EXTENDED_DENY), Some(ACL_EXTENDED_ALLOW));
+        assert!(verdict(&[]));
+        assert!(verdict(&[deny]));
+        assert!(verdict(&[deny, deny]));
+        assert!(!verdict(&[allow]));
+        assert!(!verdict(&[deny, allow]));
+        assert!(!verdict(&[None]));
+        assert!(!verdict(&[deny, None]));
+    }
+
+    /// c5: when `acl_get_entry` fails, only `EINVAL` ("no more entries")
+    /// counts as the end; any other errno counts as an ACL. This test makes
+    /// `acl_free` overwrite errno with `EINVAL`, so errno read after the free
+    /// instead of before it admits the failure and turns this red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_failed_acl_entry_read_counts_as_an_acl() {
+        // `acl::none`, through the state file. A deny entry that does not
+        // stop the owner reading makes `acl_get_fd_np` return an ACL.
+        let home = TempHome::new();
+        let root = open(&home).unwrap();
+        write_state(&root, b"{}");
+        add_acl(&home.root().join("state.json"), "everyone deny delete");
+        let _reset = Reset;
+        seams::clobber_errno_after_acl_free(true);
+        seams::fail_acl_get_entry(Some(libc::EIO));
+        assert_eq!(
+            root.read_file("state.json", 64).err(),
+            Some(StorageError::UnsafeState)
+        );
+        // Control: the same failure with `EINVAL` reads as "no entry", so
+        // errno alone decided.
+        seams::fail_acl_get_entry(Some(libc::EINVAL));
+        assert_eq!(root.read_file("state.json", 64).unwrap().unwrap(), b"{}");
+        seams::fail_acl_get_entry(None);
+        drop(root);
+
+        // The deny-only walk, through an intermediate that otherwise opens.
+        let home = TempHome::new();
+        drop(open(&home).unwrap());
+        add_acl(&home.path.join("Library"), "everyone deny delete");
+        drop(open(&home).unwrap());
+        seams::fail_acl_get_entry(Some(libc::EIO));
+        assert_eq!(open(&home).err(), Some(StorageError::UnsafeState));
+        seams::fail_acl_get_entry(Some(libc::EINVAL));
+        drop(open(&home).unwrap());
     }
 
     /// An ACL on an object the agent did not just create fails closed and is
@@ -1033,6 +1418,117 @@ mod tests {
         for file in ["owner.lock", "state.json"] {
             assert!(!ls_shows_acl(&home.root().join(file)), "{file}");
         }
+    }
+
+    /// B7: errno is cleared before every `acl_get_entry`, so an `EINVAL`
+    /// left by an earlier call can never read as "end of list". Each ACL is
+    /// built first; errno is set to `EINVAL` right before the call, so
+    /// nothing in between can change it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stale_einval_never_ends_the_acl_walk() {
+        use acl::{ACL_EXTENDED_ALLOW, ACL_EXTENDED_DENY};
+        let (deny, allow) = (Some(ACL_EXTENDED_DENY), Some(ACL_EXTENDED_ALLOW));
+        // SAFETY: each handle is freshly built and freed once by the call.
+        let walk = |tags: &[Option<libc::c_int>]| {
+            let list = in_memory_acl(tags);
+            unsafe { *libc::__error() = libc::EINVAL };
+            unsafe { acl::all_deny_then_free(list) }
+        };
+        let empty = |tags: &[Option<libc::c_int>]| {
+            let list = in_memory_acl(tags);
+            unsafe { *libc::__error() = libc::EINVAL };
+            unsafe { acl::empty_then_free(list) }
+        };
+        let _reset = Reset;
+        // Control: with a stale `EINVAL` in errno the walk still evaluates
+        // every real entry.
+        assert!(walk(&[deny, deny]));
+        assert!(!walk(&[deny, allow]));
+        assert!(!empty(&[deny]));
+        // A failure that sets no errno, after a stale `EINVAL`, is not the
+        // end of the list: the walk (second call) and `none` (first call)
+        // both refuse.
+        seams::fail_acl_get_entry_silently_at(Some(1));
+        assert!(!walk(&[deny, deny]));
+        seams::fail_acl_get_entry_silently_at(Some(0));
+        assert!(!empty(&[deny]));
+    }
+
+    /// E11: errno is cleared before `acl_get_fd_np`, so a NULL return that
+    /// sets no errno, after a stale `ENOENT`, never reads as "no ACL".
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stale_enoent_never_reads_as_no_acl() {
+        let home = TempHome::new();
+        let file = std::fs::File::create(home.path.join("probe")).unwrap();
+        let _reset = Reset;
+        // Control: the real call on a file with no ACL reads as none, even
+        // with a stale `ENOENT` set right before it.
+        unsafe { *libc::__error() = libc::ENOENT };
+        assert!(acl::none(&file));
+        unsafe { *libc::__error() = libc::ENOENT };
+        assert!(acl::deny_only(&file));
+        seams::acl_get_fd_null_silently(true);
+        unsafe { *libc::__error() = libc::ENOENT };
+        assert!(!acl::none(&file));
+        unsafe { *libc::__error() = libc::ENOENT };
+        assert!(!acl::deny_only(&file));
+    }
+
+    /// B4: the root's parent is synced only after the root passed its own
+    /// checks, so an open whose root is refused (here: injected non-local
+    /// filesystem) syncs no root parent, whether the root was just created
+    /// or found.
+    #[test]
+    fn a_refused_root_syncs_no_parent() {
+        let home = TempHome::new();
+        let _reset = Reset;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = std::sync::Arc::clone(&seen);
+        seams::set_hook(Some(Box::new(move |step| {
+            if matches!(step, Step::Descend(_) | Step::SyncParent(_)) {
+                record.lock().unwrap().push(step);
+            }
+            Ok(())
+        })));
+        seams::force_nonlocal(true);
+        assert_eq!(open_once(&home).err(), Some(StorageError::UnsafeState));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                Step::Descend(0),
+                Step::SyncParent(0),
+                Step::Descend(1),
+                Step::SyncParent(1),
+                Step::Descend(2),
+            ]
+        );
+        seen.lock().unwrap().clear();
+        assert_eq!(open_once(&home).err(), Some(StorageError::UnsafeState));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [Step::Descend(0), Step::Descend(1), Step::Descend(2)]
+        );
+        // Control: the same root, classified local, opens and syncs its
+        // parent.
+        seams::force_nonlocal(false);
+        drop(
+            retry_busy(|| {
+                seen.lock().unwrap().clear();
+                open_once(&home)
+            })
+            .unwrap(),
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                Step::Descend(0),
+                Step::Descend(1),
+                Step::Descend(2),
+                Step::SyncParent(2),
+            ]
+        );
     }
 
     #[test]

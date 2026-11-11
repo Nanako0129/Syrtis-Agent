@@ -141,10 +141,64 @@ const TABLES: [&str; 4] = [
 /// `[package]` keys. `build`, `links`, `workspace` and the rest are refused.
 const PACKAGE_KEYS: [&str; 5] = ["name", "version", "edition", "rust-version", "license"];
 
-fn quoted_after<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    let start = line.find(key)? + key.len();
-    let rest = line[start..].strip_prefix('"')?;
-    Some(&rest[..rest.find('"')?])
+/// The only keys a dependency's inline table may hold. `git`, `path`,
+/// `registry`, `registry-index`, `package`, `artifact`, `lib`, `target`,
+/// `branch`, `rev`, `tag` and anything else are refused, quoted or not.
+const DEPENDENCY_KEYS: [&str; 4] = ["version", "default-features", "features", "optional"];
+
+/// Byte offsets of `separator` outside strings and brackets. `None` when a
+/// string or bracket is left open.
+fn top_level_positions(text: &str, separator: u8) -> Option<Vec<usize>> {
+    let (mut positions, mut depth, mut quote, mut escaped) = (Vec::new(), 0usize, None, false);
+    for (index, byte) in text.bytes().enumerate() {
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' && open == b'"' {
+                escaped = true;
+            } else if byte == open {
+                quote = None;
+            }
+            continue;
+        }
+        match byte {
+            b'"' | b'\'' => quote = Some(byte),
+            b'[' | b'{' => depth += 1,
+            b']' | b'}' => depth = depth.checked_sub(1)?,
+            _ if byte == separator && depth == 0 => positions.push(index),
+            _ => {}
+        }
+    }
+    (quote.is_none() && depth == 0).then_some(positions)
+}
+
+/// The items of a one-line inline table `{ k = v, … }` as (key, value):
+/// the key with surrounding whitespace and quotes stripped, the value with
+/// surrounding whitespace stripped. `None` when it cannot be parsed: an open
+/// string or bracket, an empty item, or an item with no `=` outside a string.
+fn inline_table(spec: &str) -> Option<Vec<(String, String)>> {
+    let inner = spec.strip_prefix('{')?.strip_suffix('}')?;
+    if inner.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let mut bounds = vec![0];
+    for position in top_level_positions(inner, b',')? {
+        bounds.extend([position, position + 1]);
+    }
+    bounds.push(inner.len());
+    bounds
+        .chunks(2)
+        .map(|pair| {
+            let item = &inner[pair[0]..pair[1]];
+            let equals = *top_level_positions(item, b'=')?.first()?;
+            let (key, value) = (item[..equals].trim(), item[equals + 1..].trim());
+            let key = ['"', '\'']
+                .iter()
+                .find_map(|q| key.strip_prefix(*q)?.strip_suffix(*q))
+                .unwrap_or(key);
+            (!key.is_empty() && !value.is_empty()).then(|| (key.to_owned(), value.to_owned()))
+        })
+        .collect()
 }
 
 /// Only the allowlisted tables and `[package]` keys, `[package]` first; every
@@ -162,6 +216,11 @@ fn check_manifest(manifest: &str) -> Result<(), String> {
     let mut table: Option<&str> = None;
     let mut snow_count = 0;
     for line in manifest.lines().map(str::trim) {
+        // The checker reads line by line; a multi-line string could make a
+        // line it reads as a key be string content to cargo, or the reverse.
+        if line.contains("\"\"\"") || line.contains("'''") {
+            return Err(format!("multi-line string not allowed: {line}"));
+        }
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -200,25 +259,45 @@ fn check_manifest(manifest: &str) -> Result<(), String> {
         if spec.starts_with('{') != spec.ends_with('}') {
             return Err(format!("multi-line dependency: {name}"));
         }
-        for forbidden in ["git", "path", "registry", "package", "branch", "rev", "tag"] {
-            if spec.contains(&format!("{forbidden} =")) {
-                return Err(format!("{name}: forbidden key {forbidden}"));
+        let items = if spec.starts_with('{') {
+            let items =
+                inline_table(spec).ok_or_else(|| format!("{name}: unparsed inline table"))?;
+            let mut seen = BTreeSet::new();
+            for (key, _) in &items {
+                if !DEPENDENCY_KEYS.contains(&key.as_str()) {
+                    return Err(format!("{name}: forbidden key {key}"));
+                }
+                if !seen.insert(key.clone()) {
+                    return Err(format!("{name}: duplicate key {key}"));
+                }
             }
-        }
+            items
+        } else {
+            Vec::new()
+        };
+        // Values come from the parsed items, never from a substring search
+        // that a string inside another value could satisfy.
+        let value = |key: &str| {
+            items
+                .iter()
+                .find(|(item, _)| item == key)
+                .map(|(_, value)| value.as_str())
+        };
         let version = if spec.starts_with('"') {
             spec.trim_matches('"')
         } else {
-            quoted_after(spec, "version = ").ok_or_else(|| format!("{name}: no version"))?
+            value("version")
+                .and_then(|version| version.strip_prefix('"')?.strip_suffix('"'))
+                .ok_or_else(|| format!("{name}: no version"))?
         };
         if !version.starts_with('=') {
             return Err(format!("{name}: version {version} is not an exact pin"));
         }
         if name == "snow" {
             snow_count += 1;
-            let features: BTreeSet<String> = spec
-                .split_once("features = [")
-                .and_then(|(_, rest)| rest.split_once(']'))
-                .map(|(list, _)| {
+            let features: BTreeSet<String> = value("features")
+                .and_then(|list| list.strip_prefix('[')?.strip_suffix(']'))
+                .map(|list| {
                     list.split(',')
                         .map(|item| item.trim().trim_matches('"').to_owned())
                         .filter(|item| !item.is_empty())
@@ -226,7 +305,7 @@ fn check_manifest(manifest: &str) -> Result<(), String> {
                 })
                 .unwrap_or_default();
             if version != snow_version
-                || !spec.contains("default-features = false")
+                || value("default-features") != Some("false")
                 || features != snow_features
             {
                 return Err("snow version, default features or feature set changed".into());
@@ -368,4 +447,115 @@ fn the_manifest_checker_rejects_unpinned_patched_or_duplicated_dependencies() {
         assert_ne!(tampered, MANIFEST, "mutation did not apply: {expected}");
         assert_eq!(check_manifest(&tampered).unwrap_err(), expected);
     }
+}
+
+/// Every dependency key outside the allowlist is refused, however it is
+/// spelled: quoted, without spaces, or a key no denylist would name; and an
+/// inline table that cannot be parsed is refused. Control: the same in-test
+/// copy with the key renamed to an allowed one passes, so the refusal came
+/// from the key check.
+#[test]
+fn the_manifest_checker_rejects_any_dependency_key_outside_the_allowlist() {
+    let libc = "libc = { version = \"=0.2.189\", default-features = false }";
+    assert!(MANIFEST.contains(libc));
+    let with = |extra: &str| {
+        let tampered = MANIFEST.replace(
+            libc,
+            &format!("libc = {{ version = \"=0.2.189\", default-features = false, {extra} }}"),
+        );
+        assert_ne!(tampered, MANIFEST);
+        tampered
+    };
+    for (extra, key) in [
+        ("\"git\" = \"https://example.invalid/libc\"", "git"),
+        ("git=\"https://example.invalid/libc\"", "git"),
+        (
+            "registry-index = \"https://example.invalid/index\"",
+            "registry-index",
+        ),
+        ("artifact = \"bin\"", "artifact"),
+        ("path = \"../libc\"", "path"),
+        ("'lib' = true", "lib"),
+    ] {
+        assert_eq!(
+            check_manifest(&with(extra)).unwrap_err(),
+            format!("libc: forbidden key {key}"),
+            "{extra}"
+        );
+        let renamed = extra.replacen(key, "optional", 1);
+        check_manifest(&with(&renamed)).unwrap_or_else(|error| panic!("{renamed}: {error}"));
+    }
+    for extra in ["git", "features = [\"std\"", "version = \"=1\" = 2 \"x", ""] {
+        assert_eq!(
+            check_manifest(&with(extra)).unwrap_err(),
+            "libc: unparsed inline table",
+            "{extra:?}"
+        );
+    }
+    assert_eq!(
+        check_manifest(&with("version = \"=0.2.189\"")).unwrap_err(),
+        "libc: duplicate key version"
+    );
+}
+
+/// E6: the exact-pin check reads the parsed `version` item, so a
+/// `version = "=…"` string hidden inside another value cannot satisfy it;
+/// the same holds for snow's `default-features`. Controls: the real values
+/// in the same position pass.
+#[test]
+fn pinned_values_come_from_the_parsed_item_not_a_substring() {
+    let libc = "libc = { version = \"=0.2.189\", default-features = false }";
+    assert!(MANIFEST.contains(libc));
+    let decoy = MANIFEST.replace(
+        libc,
+        "libc = { features = ['version = \"=0.2.189\"'], version = \"0.2\" }",
+    );
+    assert_eq!(
+        check_manifest(&decoy).unwrap_err(),
+        "libc: version 0.2 is not an exact pin"
+    );
+    check_manifest(&MANIFEST.replace(
+        libc,
+        "libc = { features = ['version = \"=0.2.189\"'], version = \"=0.2.189\" }",
+    ))
+    .unwrap();
+
+    let snow_defaults = "\"=0.10.0\", default-features = false, features";
+    assert_eq!(MANIFEST.matches(snow_defaults).count(), 1);
+    let decoy = MANIFEST.replace(
+        snow_defaults,
+        "\"=0.10.0\", optional = 'default-features = false', default-features = true, features",
+    );
+    assert_eq!(
+        check_manifest(&decoy).unwrap_err(),
+        "snow version, default features or feature set changed"
+    );
+    check_manifest(&MANIFEST.replace(
+        snow_defaults,
+        "\"=0.10.0\", optional = 'default-features = false', default-features = false, features",
+    ))
+    .unwrap();
+}
+
+/// E7: a multi-line string is refused. In this copy the license string
+/// would make cargo read `build = "=evil.rs"` as a `[package]` key while a
+/// line reader sees it under a fake `[dependencies]` header and accepts it
+/// as a pinned dependency. The real manifest has no such line.
+#[test]
+fn a_multi_line_string_is_refused() {
+    let license = "license = \"MIT\"\n";
+    assert!(MANIFEST.contains(license));
+    for quote in ["\"\"\"", "'''"] {
+        let smuggled = MANIFEST.replace(
+            license,
+            &format!(
+                "license = {quote}MIT\n[dependencies]\nx = \"=1\" {quote}\nbuild = \"=evil.rs\"\n"
+            ),
+        );
+        assert_eq!(
+            check_manifest(&smuggled).unwrap_err(),
+            format!("multi-line string not allowed: license = {quote}MIT")
+        );
+    }
+    assert!(!MANIFEST.contains("\"\"\"") && !MANIFEST.contains("'''"));
 }

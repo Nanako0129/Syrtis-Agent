@@ -45,8 +45,12 @@ pub(crate) enum Step {
     /// Opening one component below the trusted home; test-only hook point
     /// for the deterministic path swap.
     Descend(usize),
-    /// Syncing the parent directory after creating component `n`, so the
-    /// new entry is durable.
+    /// Syncing the parent directory of component `n`: after creating an
+    /// intermediate directory, so the new entry is durable; and for the agent
+    /// root (the last component) on every open whose root passes its own
+    /// checks, whether it was created in this call or found, so a root left
+    /// unsynced by an earlier crash is made durable before any commit goes
+    /// into it. That sync runs before the `owner.lock` checks and the lock.
     SyncParent(usize),
     CreateTemp,
     /// First half of the bytes.
@@ -99,6 +103,14 @@ pub(crate) mod seams {
     /// Skips the "no extended ACL entry" check (macOS).
     #[cfg(target_os = "macos")]
     pub(crate) const ACL: u32 = 1 << 9;
+    /// Skips the "deny-only ACL" check on the home and intermediate
+    /// directories (macOS).
+    #[cfg(target_os = "macos")]
+    pub(crate) const INTERMEDIATE_ACL: u32 = 1 << 10;
+    /// Skips the "not group- or other-writable" check on the home.
+    pub(crate) const HOME_MODE: u32 = 1 << 11;
+    /// Skips the parent sync of an agent root that already existed.
+    pub(crate) const SKIP_PARENT_SYNC: u32 = 1 << 12;
 
     // Objects whose owner classification a test may force to "foreign".
     pub(crate) const HOME: u32 = 1 << 0;
@@ -114,6 +126,72 @@ pub(crate) mod seams {
         static NONLOCAL: Cell<bool> = const { Cell::new(false) };
         static LOCK_NAME: Cell<Option<&'static CStr>> = const { Cell::new(None) };
         static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        #[cfg(target_os = "macos")]
+        static ACL_GET_ENTRY_ERRNO: Cell<Option<i32>> = const { Cell::new(None) };
+        /// `acl_get_entry` calls left before one fails without setting errno.
+        #[cfg(target_os = "macos")]
+        static ACL_GET_ENTRY_SILENT_IN: Cell<Option<usize>> = const { Cell::new(None) };
+        #[cfg(target_os = "macos")]
+        static CLOBBER_ERRNO_AFTER_FREE: Cell<bool> = const { Cell::new(false) };
+        #[cfg(target_os = "macos")]
+        static ACL_GET_FD_NULL_SILENTLY: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Makes every `acl_get_entry` on this thread return −1 with `errno`
+    /// (macOS). `None` restores the real call.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn fail_acl_get_entry(errno: Option<i32>) {
+        ACL_GET_ENTRY_ERRNO.with(|cell| cell.set(errno));
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn acl_get_entry_failure() -> Option<i32> {
+        ACL_GET_ENTRY_ERRNO.with(Cell::get)
+    }
+
+    /// Makes the `n`-th (0-based) `acl_get_entry` wrapper call on this thread
+    /// that reaches this seam return −1 without touching errno, as a failure
+    /// that leaves the errno in place would (macOS). Counted from this call;
+    /// calls already failed by [`fail_acl_get_entry`] return before this
+    /// seam and are not counted.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn fail_acl_get_entry_silently_at(n: Option<usize>) {
+        ACL_GET_ENTRY_SILENT_IN.with(|cell| cell.set(n));
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn acl_get_entry_fails_silently() -> bool {
+        ACL_GET_ENTRY_SILENT_IN.with(|cell| match cell.get() {
+            Some(0) => {
+                cell.set(None);
+                true
+            }
+            Some(n) => {
+                cell.set(Some(n - 1));
+                false
+            }
+            None => false,
+        })
+    }
+
+    /// Makes `acl_get_fd_np` on this thread return NULL without touching
+    /// errno (macOS).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn acl_get_fd_null_silently(value: bool) {
+        ACL_GET_FD_NULL_SILENTLY.with(|cell| cell.set(value));
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn acl_get_fd_returns_null_silently() -> bool {
+        ACL_GET_FD_NULL_SILENTLY.with(Cell::get)
+    }
+
+    /// Makes `acl_free` overwrite errno with `EINVAL` on this thread
+    /// (macOS), so an errno read after the free is caught.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn clobber_errno_after_acl_free(value: bool) {
+        CLOBBER_ERRNO_AFTER_FREE.with(|cell| cell.set(value));
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn clobbers_errno_after_acl_free() -> bool {
+        CLOBBER_ERRNO_AFTER_FREE.with(Cell::get)
     }
 
     pub(crate) fn bypass(flags: u32) {
@@ -160,6 +238,14 @@ pub(crate) mod seams {
             force_nonlocal(false);
             lock_name_override(None);
             set_hook(None);
+            #[cfg(target_os = "macos")]
+            fail_acl_get_entry(None);
+            #[cfg(target_os = "macos")]
+            fail_acl_get_entry_silently_at(None);
+            #[cfg(target_os = "macos")]
+            clobber_errno_after_acl_free(false);
+            #[cfg(target_os = "macos")]
+            acl_get_fd_null_silently(false);
         }
     }
 }
@@ -204,7 +290,16 @@ pub(crate) mod test_support {
 
     impl Drop for TempHome {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
+            if std::fs::remove_dir_all(&self.path).is_err() && cfg!(target_os = "macos") {
+                // A test ACL with `deny delete` blocks the removal: strip
+                // every ACL below this temp home (`-P`: never follow a
+                // link), then retry.
+                let _ = std::process::Command::new("/bin/chmod")
+                    .args(["-R", "-P", "-N"])
+                    .arg(&self.path)
+                    .status();
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
         }
     }
 
