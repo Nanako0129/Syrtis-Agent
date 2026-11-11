@@ -647,6 +647,17 @@ fn no_cargo_config_in(dir: &std::path::Path) -> Result<(), String> {
     }
 }
 
+/// Whether a skipped permission-bypass control must fail the test instead
+/// of printing `SKIPPED`: true whenever `GITHUB_ACTIONS` is set (any value),
+/// with no exception, so CI can never pass by skipping the control. A CI job
+/// that bypasses directory permissions (root or `CAP_DAC_OVERRIDE`)
+/// therefore fails; this repository's workflow uses only GitHub-hosted
+/// runners.
+#[cfg(unix)]
+fn skip_must_fail_here() -> bool {
+    std::env::var_os("GITHUB_ACTIONS").is_some()
+}
+
 /// A fresh directory under `std::env::temp_dir()`, removed on drop.
 struct Scratch(std::path::PathBuf);
 
@@ -720,7 +731,12 @@ fn the_checkout_has_no_cargo_config() {
 
     // A directory whose `.cargo` lookup fails with an error other than
     // `NotFound`: no search permission. Root or `CAP_DAC_OVERRIDE` bypasses
-    // that, so the control runs only when the lookup really is refused.
+    // that, so the control runs only when the lookup fails with any error
+    // other than `NotFound`. Otherwise it is skipped, which under
+    // `GITHUB_ACTIONS` fails the test (`skip_must_fail_here`): CI must run the
+    // control. The chmod
+    // back to `0o700` comes first, or `Scratch` drop would leak `locked`.
+    // No test reaches this branch on Windows.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -729,7 +745,7 @@ fn the_checkout_has_no_cargo_config() {
         std::fs::create_dir(&locked).unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let refused = std::fs::symlink_metadata(locked.join(".cargo"))
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied);
+            .is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound);
         let result = no_cargo_config_in(&locked);
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
         if refused {
@@ -737,6 +753,10 @@ fn the_checkout_has_no_cargo_config() {
                 cannot_tell(&result),
                 "a directory without search permission: {result:?}"
             );
+        } else if skip_must_fail_here() {
+            panic!("directory permissions bypassed (root/CAP_DAC_OVERRIDE) under GITHUB_ACTIONS");
+        } else {
+            eprintln!("SKIPPED: the_checkout_has_no_cargo_config");
         }
     }
 }

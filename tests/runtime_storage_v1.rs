@@ -292,26 +292,33 @@ mod disk {
         }
     }
 
-    /// Retries only `Busy`, for at most 2 s. This binary spawns child
+    /// Retries only `Busy` (see `retry_busy` for the bound). This binary spawns child
     /// processes, and between fork and exec a child holds a copy of every
     /// descriptor (`O_CLOEXEC` closes it only at exec). `flock` belongs to the
     /// open file description, so a lock this process just released can stay
     /// held for that window (measured: 1 in 60 full-binary runs on macOS).
-    /// The child-side "lock" check calls `SecureRoot::open_under` directly.
+    /// The child-side checks call `SecureRoot::open_under` directly: "lock"
+    /// once (it must see `Busy` while the parent holds the lock), "lock-ok"
+    /// through `retry_busy` (it must see the lock free once released).
     fn try_open(home: &Path, install_wall: i64) -> Result<StateStore, StorageError> {
         // `Busy` comes from `open_under` (the lock), so the retry must wrap
         // it: a `?` on it would return the first `Busy` without retrying.
-        let attempt = || {
+        retry_busy(|| {
             SecureRoot::open_under(home, SUFFIX)
                 .and_then(|root| StateStore::open(root, install_wall))
-        };
+        })
+    }
+
+    /// Retries `f` while it returns `Busy`: up to 201 calls with a 10 ms sleep
+    /// after each of the first 200, so about 2 s of sleeping in total.
+    fn retry_busy<T>(mut f: impl FnMut() -> Result<T, StorageError>) -> Result<T, StorageError> {
         for _ in 0..200 {
-            match attempt() {
+            match f() {
                 Err(StorageError::Busy) => std::thread::sleep(std::time::Duration::from_millis(10)),
                 other => return other,
             }
         }
-        attempt()
+        f()
     }
 
     fn open(home: &TempHome) -> StateStore {
@@ -410,6 +417,13 @@ mod disk {
             }
             "lock" => {
                 let result = SecureRoot::open_under(&home, SUFFIX).map(|_| ());
+                println!("LOCK:{result:?}");
+            }
+            // "lock", but `Busy` is retried the way `try_open` retries it, for
+            // at most 2 s: a fork-to-exec child of the parent binary can
+            // still hold the lock the parent just released.
+            "lock-ok" => {
+                let result = retry_busy(|| SecureRoot::open_under(&home, SUFFIX).map(|_| ()));
                 println!("LOCK:{result:?}");
             }
             "home" => println!("HOME:{}", default_root_path().unwrap().display()),
@@ -605,7 +619,7 @@ mod disk {
         assert_eq!(child("lock", &home.path, &[], "LOCK"), "Err(Busy)");
         drop(store);
         // The child takes the lock and exits; exit releases it.
-        assert_eq!(child("lock", &home.path, &[], "LOCK"), "Ok(())");
+        assert_eq!(child("lock-ok", &home.path, &[], "LOCK"), "Ok(())");
         open(&home);
     }
 
