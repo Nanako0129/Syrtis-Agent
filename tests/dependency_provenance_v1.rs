@@ -128,16 +128,18 @@ fn check_lock(lock_text: &str, baseline: &[Package], allowlist: &[&str]) -> Resu
     Ok(())
 }
 
-fn is_dependency_table(header: &str) -> bool {
-    const KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
-    KINDS.contains(&header)
-        || header.strip_prefix("target.").is_some_and(|rest| {
-            KINDS.iter().any(|kind| {
-                rest.strip_suffix(kind)
-                    .is_some_and(|cfg| cfg.ends_with('.'))
-            })
-        })
-}
+/// The only tables the manifest may contain, spelled exactly. Anything else
+/// (`[features]`, `[profile.*]`, `[patch.*]`, `[replace]`, `[workspace]`, a
+/// dotted or quoted spelling, a header with a trailing comment) is refused
+/// rather than skipped. SA-2B1b extends this list for its Windows table.
+const TABLES: [&str; 4] = [
+    "package",
+    "dependencies",
+    "target.'cfg(unix)'.dependencies",
+    "dev-dependencies",
+];
+/// `[package]` keys. `build`, `links`, `workspace` and the rest are refused.
+const PACKAGE_KEYS: [&str; 5] = ["name", "version", "edition", "rust-version", "license"];
 
 fn quoted_after<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let start = line.find(key)? + key.len();
@@ -145,8 +147,8 @@ fn quoted_after<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     Some(&rest[..rest.find('"')?])
 }
 
-/// Every dependency in every dependency table is `=`-pinned and comes from the
-/// registry; no `[patch]` or `[replace]`; `snow` appears exactly once, with
+/// Only the allowlisted tables and `[package]` keys, `[package]` first; every
+/// dependency `=`-pinned and from the registry; `snow` exactly once, with
 /// default features off and exactly the frozen feature set.
 fn check_manifest(manifest: &str) -> Result<(), String> {
     let provenance: Value = serde_json::from_str(PROVENANCE).unwrap();
@@ -157,28 +159,44 @@ fn check_manifest(manifest: &str) -> Result<(), String> {
         .iter()
         .map(|feature| feature.as_str().unwrap().to_owned())
         .collect();
-    let mut table: Option<String> = None;
+    let mut table: Option<&str> = None;
     let mut snow_count = 0;
     for line in manifest.lines().map(str::trim) {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some(header) = line.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-            if header.starts_with("patch") || header.starts_with("replace") {
-                return Err(format!("forbidden table [{header}]"));
+        if line.starts_with('[') {
+            let header = line
+                .strip_prefix('[')
+                .and_then(|h| h.strip_suffix(']'))
+                .filter(|h| TABLES.contains(h))
+                .ok_or_else(|| format!("table not allowed: {line}"))?;
+            if table.is_none() && header != "package" {
+                return Err(format!("line before [package]: {line}"));
             }
-            if header.contains("dependencies.") {
-                return Err(format!("unsupported dependency layout [{header}]"));
-            }
-            table = Some(header.to_owned());
+            table = Some(header);
             continue;
         }
-        if !table.as_deref().is_some_and(is_dependency_table) {
-            continue;
+        match table {
+            None => return Err(format!("line before [package]: {line}")),
+            Some("package") => {
+                let key = line.split_once(" = ").map_or(line, |(key, _)| key);
+                if !PACKAGE_KEYS.contains(&key) {
+                    return Err(format!("package key not allowed: {key}"));
+                }
+                continue;
+            }
+            Some(_) => {}
         }
         let (name, spec) = line
             .split_once(" = ")
             .ok_or_else(|| format!("unparsed dependency line: {line}"))?;
+        if !name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_".contains(&byte))
+        {
+            return Err(format!("unsupported dependency key: {name}"));
+        }
         if spec.starts_with('{') != spec.ends_with('}') {
             return Err(format!("multi-line dependency: {name}"));
         }
@@ -288,11 +306,11 @@ fn the_manifest_checker_rejects_unpinned_patched_or_duplicated_dependencies() {
         ),
         (
             format!("{MANIFEST}\n[patch.crates-io]\nsha2 = {{ path = \"../sha2\" }}\n"),
-            "forbidden table [patch.crates-io]",
+            "table not allowed: [patch.crates-io]",
         ),
         (
             format!("{MANIFEST}\n[replace]\n"),
-            "forbidden table [replace]",
+            "table not allowed: [replace]",
         ),
         (
             MANIFEST.replace(", \"use-getrandom\"]", "]"),
@@ -311,6 +329,39 @@ fn the_manifest_checker_rejects_unpinned_patched_or_duplicated_dependencies() {
                 "libc = { git = \"https://example.invalid/libc\" }",
             ),
             "libc: forbidden key git",
+        ),
+        // A table the checker does not know is refused, not skipped.
+        (
+            format!("{MANIFEST}\n[features]\ndefault = [\"snow/use-sha2\"]\n"),
+            "table not allowed: [features]",
+        ),
+        (
+            MANIFEST.replace("[dependencies]\n", "[ dependencies ]\n"),
+            "table not allowed: [ dependencies ]",
+        ),
+        (
+            MANIFEST.replace("[dependencies]\n", "[dependencies] # runtime\n"),
+            "table not allowed: [dependencies] # runtime",
+        ),
+        (
+            format!("{MANIFEST}\n[\"patch\".crates-io]\nsha2 = {{ path = \"../sha2\" }}\n"),
+            "table not allowed: [\"patch\".crates-io]",
+        ),
+        (
+            format!("{MANIFEST}\n[profile.release]\ndebug = true\n"),
+            "table not allowed: [profile.release]",
+        ),
+        (
+            MANIFEST.replace("license = \"MIT\"\n", "license = \"MIT\"\nbuild = \"x.rs\"\n"),
+            "package key not allowed: build",
+        ),
+        (
+            format!("cargo-features = [\"x\"]\n{MANIFEST}"),
+            "line before [package]: cargo-features = [\"x\"]",
+        ),
+        (
+            MANIFEST.replace("[dependencies]\n", "[dependencies]\nsnow.default-features = true\n"),
+            "unsupported dependency key: snow.default-features",
         ),
     ];
     for (tampered, expected) in cases {

@@ -292,8 +292,26 @@ mod disk {
         }
     }
 
+    /// Retries only `Busy`, for at most 2 s. This binary spawns child
+    /// processes, and between fork and exec a child holds a copy of every
+    /// descriptor (`O_CLOEXEC` closes it only at exec). `flock` belongs to the
+    /// open file description, so a lock this process just released can stay
+    /// held for that window (measured: 1 in 60 full-binary runs on macOS).
+    /// The child-side "lock" check calls `SecureRoot::open_under` directly.
     fn try_open(home: &Path, install_wall: i64) -> Result<StateStore, StorageError> {
-        StateStore::open(SecureRoot::open_under(home, SUFFIX)?, install_wall)
+        // `Busy` comes from `open_under` (the lock), so the retry must wrap
+        // it: a `?` on it would return the first `Busy` without retrying.
+        let attempt = || {
+            SecureRoot::open_under(home, SUFFIX)
+                .and_then(|root| StateStore::open(root, install_wall))
+        };
+        for _ in 0..200 {
+            match attempt() {
+                Err(StorageError::Busy) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                other => return other,
+            }
+        }
+        attempt()
     }
 
     fn open(home: &TempHome) -> StateStore {
@@ -740,6 +758,71 @@ mod disk {
                 ..after
             }
         );
+    }
+
+    #[test]
+    fn the_listen_config_changes_only_through_validated_commits() {
+        let home = TempHome::new();
+        let store = open(&home);
+        store
+            .transition(|r| Ok(pair(&r.enable_sharing()?, 1, NOW_MS + DAY_MS)))
+            .unwrap();
+        let before = store.state().unwrap();
+        let wanted = ListenConfig {
+            bind_host: Some("192.168.1.20".into()),
+            bind_port: 49_200,
+            node_label: Some("studio-mac".into()),
+        };
+        store
+            .set_listen_config(
+                wanted.bind_host.clone(),
+                wanted.bind_port,
+                wanted.node_label.clone(),
+            )
+            .unwrap();
+        let after = store.state().unwrap();
+        assert_eq!(after.config, wanted);
+        // Counters, records and secrets are untouched.
+        assert_eq!(after.reference, before.reference);
+        assert_eq!(after.identity_private, before.identity_private);
+        assert_eq!(after.control_token, before.control_token);
+        drop(store);
+        let store = open(&home);
+        assert_eq!(store.state().unwrap(), after, "persisted across reopen");
+
+        let on_disk = std::fs::read(home.state_file()).unwrap();
+        let refused = StorageError::Refused(syrtis_agent::security::SecurityError::Invalid);
+        let invalid: [(Option<&str>, u16, Option<String>); 10] = [
+            (Some("Bad_Host"), 49_200, None),
+            (Some("192.168.1.20"), 80, None),
+            (Some("192.168.1.20"), 1_023, None),
+            (Some("0.0.0.0"), 49_200, None),
+            (Some("::"), 49_200, None),
+            (Some("::ffff:0.0.0.0"), 49_200, None),
+            (Some("0:0:0:0:0:0:0:0"), 49_200, None),
+            (Some("e\u{301}xample"), 49_200, None),
+            (None, 49_200, Some("n".repeat(129))),
+            (None, 49_200, Some("e\u{301}".into())),
+        ];
+        for (host, port, label) in invalid {
+            let result = store.set_listen_config(host.map(str::to_owned), port, label.clone());
+            assert_eq!(result, Err(refused), "{host:?} {port} {label:?}");
+            assert_eq!(
+                std::fs::read(home.state_file()).unwrap(),
+                on_disk,
+                "{host:?}"
+            );
+            assert_eq!(store.state().unwrap(), after, "{host:?}");
+        }
+        // Boundaries that are accepted: port 1024 with a host, any port and a
+        // 128-byte label with no host, a hostname.
+        store
+            .set_listen_config(Some("studio.local".into()), 1_024, None)
+            .unwrap();
+        store
+            .set_listen_config(None, 80, Some("n".repeat(128)))
+            .unwrap();
+        assert_eq!(store.state().unwrap().reference, before.reference);
     }
 
     #[test]

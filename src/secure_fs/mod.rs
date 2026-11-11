@@ -45,6 +45,9 @@ pub(crate) enum Step {
     /// Opening one component below the trusted home; test-only hook point
     /// for the deterministic path swap.
     Descend(usize),
+    /// Syncing the parent directory after creating component `n`, so the
+    /// new entry is durable.
+    SyncParent(usize),
     CreateTemp,
     /// First half of the bytes.
     Write,
@@ -88,6 +91,14 @@ pub(crate) mod seams {
     pub(crate) const NLINK: u32 = 1 << 4;
     pub(crate) const LOCAL_FS: u32 = 1 << 5;
     pub(crate) const BYTE_CAP: u32 = 1 << 6;
+    /// Skips the exact-mode `fchmod` on objects the agent creates.
+    pub(crate) const SKIP_FCHMOD: u32 = 1 << 7;
+    /// Skips clearing the extended ACL on objects the agent creates (macOS).
+    #[cfg(target_os = "macos")]
+    pub(crate) const SKIP_ACL_CLEAR: u32 = 1 << 8;
+    /// Skips the "no extended ACL entry" check (macOS).
+    #[cfg(target_os = "macos")]
+    pub(crate) const ACL: u32 = 1 << 9;
 
     // Objects whose owner classification a test may force to "foreign".
     pub(crate) const HOME: u32 = 1 << 0;
@@ -195,5 +206,26 @@ pub(crate) mod test_support {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    /// Reopen after this process dropped the previous owner. Tests in the
+    /// same binary spawn child processes, and between fork and exec a child
+    /// holds a copy of every descriptor; `O_CLOEXEC` closes it only at exec.
+    /// `flock` belongs to the open file description, so a lock this process
+    /// just released can stay held for that window and an immediate reopen
+    /// sees `Busy` (measured: 1 in 60 full-binary runs on macOS). Only `Busy`
+    /// is retried, for at most 2 s; tests that assert `Busy` must not use this.
+    pub(crate) fn retry_busy<T>(
+        mut attempt: impl FnMut() -> Result<T, super::StorageError>,
+    ) -> Result<T, super::StorageError> {
+        for _ in 0..200 {
+            match attempt() {
+                Err(super::StorageError::Busy) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                other => return other,
+            }
+        }
+        attempt()
     }
 }

@@ -8,12 +8,13 @@
 use std::{
     collections::BTreeSet,
     fmt,
-    sync::{Mutex, RwLock, RwLockWriteGuard},
+    net::IpAddr,
+    sync::{Mutex, PoisonError, RwLock, RwLockWriteGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use snow::resolvers::{CryptoResolver, DefaultResolver};
 
 use crate::{
@@ -191,6 +192,29 @@ impl StateStore {
         self.transition(|state| state.uninstall_commit(record_id, terminal_at_ms))
     }
 
+    /// Replaces the listen config. Counters and records are unchanged. The
+    /// same rules as load apply: a non-null host must pass the frozen
+    /// `listenConfigure` validator (canonical host, port 1024–65535) and must
+    /// not be an unspecified address; a label is at most 128 bytes. Anything
+    /// else is `Refused(Invalid)` with nothing written.
+    pub fn set_listen_config(
+        &self,
+        bind_host: Option<String>,
+        bind_port: u16,
+        node_label: Option<String>,
+    ) -> Result<(), StorageError> {
+        self.commit(WallMay::OnlyAdvance, |current| {
+            Ok(StoredState {
+                config: ListenConfig {
+                    bind_host,
+                    bind_port,
+                    node_label,
+                },
+                ..current.clone()
+            })
+        })
+    }
+
     /// Clock checkpoint: `compact_terminals`, which advances the durable wall.
     pub fn checkpoint(&self, os_now_seconds: i64) -> Result<(), StorageError> {
         self.transition(|state| state.compact_terminals(os_now_seconds))
@@ -235,13 +259,24 @@ impl StateStore {
         wall: WallMay,
         change: impl FnOnce(&StoredState) -> Result<StoredState, StorageError>,
     ) -> Result<(), StorageError> {
-        let _serial = self.commit.lock().map_err(|_| StorageError::Unknown)?;
+        // The mutex guards `()`: a panic in an earlier closure leaves nothing
+        // half-done behind it, so its poison carries no information. Treating
+        // it as fatal would block every later revoke while `authorize` still
+        // answered from the last durable state.
+        let _serial = self.commit.lock().unwrap_or_else(PoisonError::into_inner);
         let current = self.state()?;
         let next = change(&current)?;
         counters_never_go_backwards(&current.reference, &next.reference, wall)?;
         // Never write a state that load would refuse.
-        validate(&next)?;
-        let bytes = encode_state(&next)?;
+        // A caller-produced state that load would refuse, or that would exceed
+        // the read bound, is a caller bug: refused, nothing written, not sticky.
+        validate(&next).map_err(|_| StorageError::Refused(SecurityError::Invalid))?;
+        // Encoding fails only on a non-NFC string, e.g. a node label.
+        let bytes =
+            encode_state(&next).map_err(|_| StorageError::Refused(SecurityError::Invalid))?;
+        if bytes.len() > STATE_FILE_MAX_BYTES {
+            return Err(StorageError::Refused(SecurityError::Invalid));
+        }
         #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
         if seams::bypassed(seams::EARLY_SWAP) {
             *self.write()? = Some(next.clone());
@@ -565,9 +600,15 @@ pub fn encode_state(state: &StoredState) -> Result<Vec<u8>, StorageError> {
 /// key set, and every load invariant.
 pub fn decode_state(bytes: &[u8]) -> Result<StoredState, StorageError> {
     let value = CanonicalJsonV1::decode_value(bytes).map_err(|_| StorageError::Corrupt)?;
-    let schema = value.get("schema").and_then(Value::as_u64);
+    // Only an integer schema other than 1 is "incompatible"; a missing or
+    // non-integer schema, or a top level that is not an object, is corrupt.
+    let schema = value
+        .as_object()
+        .and_then(|object| object.get("schema"))
+        .filter(|schema| schema.is_u64() || schema.is_i64())
+        .ok_or(StorageError::Corrupt)?;
     check(
-        schema == Some(u64::from(STATE_SCHEMA_VERSION)),
+        schema.as_u64() == Some(u64::from(STATE_SCHEMA_VERSION)),
         Check::Schema,
     )?;
     // `decode` re-encodes the typed value and compares bytes, so a missing,
@@ -738,12 +779,20 @@ fn validate(state: &StoredState) -> Result<(), StorageError> {
             bind_host_valid(host, state.config.bind_port),
             Check::BindHost,
         )?;
-        check(host != "0.0.0.0" && host != "::", Check::Wildcard)?;
+        check(!unspecified(host), Check::Wildcard)?;
     }
     if let Some(label) = &state.config.node_label {
         check(label.len() <= NODE_LABEL_MAX_BYTES, Check::NodeLabel)?;
     }
     Ok(())
+}
+
+/// An IP literal that binds every interface (`0.0.0.0`, `::`, and their
+/// IPv4-mapped forms). Hostnames are not resolved here; binding one that
+/// resolves to the wildcard is refused at bind time (SA-2B2).
+fn unspecified(host: &str) -> bool {
+    host.parse::<IpAddr>()
+        .is_ok_and(|ip| ip.to_canonical().is_unspecified())
 }
 
 /// The frozen host/port rule, reached through the public `listenConfigure`
@@ -887,6 +936,11 @@ mod tests {
             (Check::Wildcard, StorageError::Corrupt, |v| {
                 v["config"]["bindHost"] = "::".into()
             }),
+            // The frozen validator accepts this spelling; only the
+            // unspecified-address check refuses it.
+            (Check::Wildcard, StorageError::Corrupt, |v| {
+                v["config"]["bindHost"] = "::ffff:0.0.0.0".into()
+            }),
             (Check::NodeLabel, StorageError::Corrupt, |v| {
                 v["config"]["nodeLabel"] = "n".repeat(NODE_LABEL_MAX_BYTES + 1).into()
             }),
@@ -908,6 +962,23 @@ mod tests {
                 "case {index}: {check:?} is not what refused it: {skipped:?}"
             );
         }
+        // `0:0:0:0:0:0:0:0` is refused twice over: the frozen validator
+        // rejects the non-canonical spelling, and it is unspecified. Each
+        // check alone still refuses it; only skipping both lets it load.
+        let mut value = golden_value();
+        value["config"]["bindHost"] = "0:0:0:0:0:0:0:0".into();
+        let bytes = bytes_of(&value);
+        for skipped in [&[][..], &[Check::BindHost], &[Check::Wildcard]] {
+            seams::skip(skipped);
+            assert_eq!(
+                decode_state(&bytes).err(),
+                Some(StorageError::Corrupt),
+                "{skipped:?}"
+            );
+        }
+        seams::skip(&[Check::BindHost, Check::Wildcard]);
+        assert!(decode_state(&bytes).is_ok());
+        seams::skip(&[]);
         // Boundaries that must still load: 16 active grants, a 128-byte label.
         let mut value = golden_value();
         value["config"]["nodeLabel"] = "n".repeat(NODE_LABEL_MAX_BYTES).into();
@@ -959,6 +1030,43 @@ mod tests {
         assert_eq!(decode_state(&spaced).err(), Some(StorageError::Corrupt));
     }
 
+    /// Only an integer schema other than 1 is incompatible; every other
+    /// malformed schema, and a non-object top level, is corrupt.
+    #[test]
+    fn only_an_integer_schema_other_than_one_is_incompatible() {
+        type Mutation = fn(&mut Value);
+        let corrupt: &[Mutation] = &[
+            |v| {
+                v.as_object_mut().unwrap().remove("schema");
+            },
+            |v| v["schema"] = "1".into(),
+            |v| v["schema"] = Value::Null,
+            |v| v["schema"] = true.into(),
+            |v| v["schema"] = serde_json::json!([1]),
+        ];
+        for (index, mutate) in corrupt.iter().enumerate() {
+            let mut value = golden_value();
+            mutate(&mut value);
+            assert_eq!(
+                decode_state(&bytes_of(&value)).err(),
+                Some(StorageError::Corrupt),
+                "case {index}"
+            );
+        }
+        for top in [b"[]".as_slice(), b"1", b"\"schema\"", b"null"] {
+            assert_eq!(decode_state(top).err(), Some(StorageError::Corrupt));
+        }
+        for schema in [-1_i64, 0, 2, 70_000] {
+            let mut value = golden_value();
+            value["schema"] = schema.into();
+            assert_eq!(
+                decode_state(&bytes_of(&value)).err(),
+                Some(StorageError::Incompatible),
+                "schema {schema}"
+            );
+        }
+    }
+
     #[test]
     fn the_state_codec_round_trips_and_redacts_secrets() {
         let state = decode_state(GOLDEN.trim_end().as_bytes()).unwrap();
@@ -987,7 +1095,7 @@ mod tests {
             secure_fs::{
                 Step,
                 seams::{self as fs_seams, Reset as FsReset},
-                test_support::{SUFFIX, TempHome},
+                test_support::{SUFFIX, TempHome, retry_busy},
             },
             security::{OfferClaim, PendingApproval, offer_secret_hash},
         };
@@ -1007,6 +1115,11 @@ mod tests {
         ];
 
         fn open(home: &Path) -> Result<StateStore, StorageError> {
+            retry_busy(|| open_once(home))
+        }
+
+        /// No retry: for the assertion that expects `Busy`.
+        fn open_once(home: &Path) -> Result<StateStore, StorageError> {
             StateStore::open(SecureRoot::open_under(home, SUFFIX)?, NOW)
         }
 
@@ -1113,7 +1226,7 @@ mod tests {
                     Err(StorageError::Unknown)
                 );
                 assert_eq!(store.checkpoint(NOW), Err(StorageError::Unknown));
-                assert_eq!(open(&home.path).err(), Some(StorageError::Busy));
+                assert_eq!(open_once(&home.path).err(), Some(StorageError::Busy));
                 drop(store);
                 let reopened = open(&home.path).unwrap().state().unwrap();
                 let new = matches!(step, Step::SyncDir);
@@ -1386,6 +1499,86 @@ mod tests {
                     }
                 }
             }
+        }
+
+        /// A panic inside a caller's closure must not leave revoke blocked
+        /// while grants keep authorizing.
+        #[test]
+        fn a_panicking_closure_does_not_block_a_later_revoke() {
+            let home = TempHome::new();
+            let store = store_with_grant(&home);
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                store.transition(|_| -> Result<ReferenceState, SecurityError> {
+                    panic!("caller bug inside a transition closure")
+                })
+            }));
+            assert!(panicked.is_err());
+            assert!(store.authorize(&query(1, 1)), "the panic changed nothing");
+            store
+                .transition(|r| r.revoke_commit(id(21), NOW_MS))
+                .unwrap();
+            assert!(!store.authorize(&query(1, 1)));
+        }
+
+        /// A caller-produced state that load would refuse, or one too large
+        /// to read back, is refused before anything is written; not sticky.
+        #[test]
+        fn a_commit_load_would_refuse_is_refused_and_not_sticky() {
+            let home = TempHome::new();
+            let store = store_with_grant(&home);
+            let file = || std::fs::read(home.root().join("state.json")).unwrap();
+            let before = file();
+            let sharing_off_with_active_grant = store.transition(|r| {
+                let mut next = r.clone();
+                next.sharing_enabled = false;
+                Ok(next)
+            });
+            assert_eq!(
+                sharing_off_with_active_grant,
+                Err(StorageError::Refused(SecurityError::Invalid))
+            );
+            assert_eq!(file(), before);
+            assert!(store.authorize(&query(1, 1)));
+
+            fn with_terminals(
+                count: u32,
+            ) -> impl FnOnce(&ReferenceState) -> Result<ReferenceState, SecurityError> {
+                move |r| {
+                    let mut next = r.clone();
+                    for n in 0..count {
+                        let mut record_id = [0xfe; 16];
+                        record_id[..4].copy_from_slice(&n.to_be_bytes());
+                        next.terminal.push(Terminal {
+                            record_id,
+                            kind: TerminalKind::Offer,
+                            auth_epoch: 0,
+                            terminal_at_ms: NOW_MS,
+                            cleanup_complete: true,
+                        });
+                    }
+                    Ok(next)
+                }
+            }
+            assert_eq!(
+                store.transition(with_terminals(41_000)),
+                Err(StorageError::Refused(SecurityError::Invalid))
+            );
+            assert_eq!(file(), before);
+            // Control: the same closure under the read bound commits, so
+            // size alone refused the larger one; and the store is not sticky.
+            store.transition(with_terminals(30_000)).unwrap();
+            assert!(file().len() <= STATE_FILE_MAX_BYTES);
+            drop(store);
+            assert_eq!(
+                open(&home.path)
+                    .unwrap()
+                    .state()
+                    .unwrap()
+                    .reference
+                    .terminal
+                    .len(),
+                30_000
+            );
         }
 
         #[test]
