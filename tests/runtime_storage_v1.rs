@@ -292,7 +292,7 @@ mod disk {
         }
     }
 
-    /// Retries only `Busy`, for at most 2 s. This binary spawns child
+    /// Retries only `Busy` (see `retry_busy` for the bound). This binary spawns child
     /// processes, and between fork and exec a child holds a copy of every
     /// descriptor (`O_CLOEXEC` closes it only at exec). `flock` belongs to the
     /// open file description, so a lock this process just released can stay
@@ -309,7 +309,8 @@ mod disk {
         })
     }
 
-    /// Retries `f` while it returns `Busy`, 10 ms apart, for at most 2 s.
+    /// Retries `f` while it returns `Busy`: up to 201 calls with a 10 ms sleep
+    /// after each of the first 200, so about 2 s of sleeping in total.
     fn retry_busy<T>(mut f: impl FnMut() -> Result<T, StorageError>) -> Result<T, StorageError> {
         for _ in 0..200 {
             match f() {

@@ -1136,19 +1136,13 @@ mod tests {
     }
 
     /// Whether a skipped permission-bypass control must fail the test instead
-    /// of printing `SKIPPED`. Three cases:
-    /// - `GITHUB_ACTIONS` set (any value) and `RUNNER_ENVIRONMENT` unset or
-    ///   anything but exactly `self-hosted` (for example `github-hosted`):
-    ///   true, so the skip fails closed;
-    /// - `GITHUB_ACTIONS` set and `RUNNER_ENVIRONMENT` exactly `self-hosted`:
-    ///   false, so a self-hosted root job is not failed for no code reason;
-    /// - `GITHUB_ACTIONS` unset: false.
-    ///
-    /// What the two variables mean comes from GitHub's documentation; which of
-    /// them a runner exports is not measured here.
+    /// of printing `SKIPPED`: true whenever `GITHUB_ACTIONS` is set (any
+    /// value), with no exception, so CI can never pass by skipping the
+    /// control. A CI job that bypasses directory permissions (root or
+    /// `CAP_DAC_OVERRIDE`) therefore fails; this repository's workflow uses
+    /// only GitHub-hosted runners.
     fn skip_must_fail_here() -> bool {
         std::env::var_os("GITHUB_ACTIONS").is_some()
-            && std::env::var_os("RUNNER_ENVIRONMENT").is_none_or(|v| v != "self-hosted")
     }
 
     /// Whether this process is refused a `mkdir` inside a `0500` directory it
@@ -1221,8 +1215,7 @@ mod tests {
                 // created `0500` and refused by the exact-`0700` check. That
                 // branch has never run: hosted CI (macOS and Linux) is
                 // measured to take the `NotFound` branch, and so is the
-                // maintainer's Mac. Under `GITHUB_ACTIONS`, unless
-                // `RUNNER_ENVIRONMENT` is exactly `self-hosted`, the bypassed
+                // maintainer's Mac. Under `GITHUB_ACTIONS` the bypassed
                 // branch fails the test (`skip_must_fail_here`), because CI
                 // must run the `NotFound` branch; elsewhere it prints
                 // `SKIPPED`. The `Err(UnsafeState)` assertion above and the
@@ -1242,7 +1235,7 @@ mod tests {
                     assert_eq!(root.mode() & 0o7777, 0o500);
                     if skip_must_fail_here() {
                         panic!(
-                            "directory permissions bypassed (root/CAP_DAC_OVERRIDE) under GITHUB_ACTIONS without RUNNER_ENVIRONMENT=self-hosted"
+                            "directory permissions bypassed (root/CAP_DAC_OVERRIDE) under GITHUB_ACTIONS"
                         );
                     }
                     eprintln!("SKIPPED: a_restrictive_umask_still_yields_exact_modes");
