@@ -297,21 +297,27 @@ mod disk {
     /// descriptor (`O_CLOEXEC` closes it only at exec). `flock` belongs to the
     /// open file description, so a lock this process just released can stay
     /// held for that window (measured: 1 in 60 full-binary runs on macOS).
-    /// The child-side "lock" check calls `SecureRoot::open_under` directly.
+    /// The child-side checks call `SecureRoot::open_under` directly: "lock"
+    /// once (it must see `Busy` while the parent holds the lock), "lock-ok"
+    /// through `retry_busy` (it must see the lock free once released).
     fn try_open(home: &Path, install_wall: i64) -> Result<StateStore, StorageError> {
         // `Busy` comes from `open_under` (the lock), so the retry must wrap
         // it: a `?` on it would return the first `Busy` without retrying.
-        let attempt = || {
+        retry_busy(|| {
             SecureRoot::open_under(home, SUFFIX)
                 .and_then(|root| StateStore::open(root, install_wall))
-        };
+        })
+    }
+
+    /// Retries `f` while it returns `Busy`, 10 ms apart, for at most 2 s.
+    fn retry_busy<T>(mut f: impl FnMut() -> Result<T, StorageError>) -> Result<T, StorageError> {
         for _ in 0..200 {
-            match attempt() {
+            match f() {
                 Err(StorageError::Busy) => std::thread::sleep(std::time::Duration::from_millis(10)),
                 other => return other,
             }
         }
-        attempt()
+        f()
     }
 
     fn open(home: &TempHome) -> StateStore {
@@ -416,15 +422,7 @@ mod disk {
             // at most 2 s: a fork-to-exec child of the parent binary can
             // still hold the lock the parent just released.
             "lock-ok" => {
-                let attempt = || SecureRoot::open_under(&home, SUFFIX).map(|_| ());
-                let mut result = attempt();
-                for _ in 0..200 {
-                    if !matches!(result, Err(StorageError::Busy)) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    result = attempt();
-                }
+                let result = retry_busy(|| SecureRoot::open_under(&home, SUFFIX).map(|_| ()));
                 println!("LOCK:{result:?}");
             }
             "home" => println!("HOME:{}", default_root_path().unwrap().display()),

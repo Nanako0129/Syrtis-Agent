@@ -647,6 +647,23 @@ fn no_cargo_config_in(dir: &std::path::Path) -> Result<(), String> {
     }
 }
 
+/// Whether a skipped permission-bypass control must fail the test instead
+/// of printing `SKIPPED`. Three cases:
+/// - `GITHUB_ACTIONS` set (any value) and `RUNNER_ENVIRONMENT` unset or
+///   anything but exactly `self-hosted` (for example `github-hosted`):
+///   true, so the skip fails closed;
+/// - `GITHUB_ACTIONS` set and `RUNNER_ENVIRONMENT` exactly `self-hosted`:
+///   false, so a self-hosted root job is not failed for no code reason;
+/// - `GITHUB_ACTIONS` unset: false.
+///
+/// What the two variables mean comes from GitHub's documentation; which of
+/// them a runner exports is not measured here.
+#[cfg(unix)]
+fn skip_must_fail_here() -> bool {
+    std::env::var_os("GITHUB_ACTIONS").is_some()
+        && std::env::var_os("RUNNER_ENVIRONMENT").is_none_or(|v| v != "self-hosted")
+}
+
 /// A fresh directory under `std::env::temp_dir()`, removed on drop.
 struct Scratch(std::path::PathBuf);
 
@@ -722,7 +739,8 @@ fn the_checkout_has_no_cargo_config() {
     // `NotFound`: no search permission. Root or `CAP_DAC_OVERRIDE` bypasses
     // that, so the control runs only when the lookup fails with any error
     // other than `NotFound`. Otherwise it is skipped, which under
-    // `GITHUB_ACTIONS` fails the test: CI must run the control. The chmod
+    // `GITHUB_ACTIONS` fails the test unless `RUNNER_ENVIRONMENT` is exactly
+    // `self-hosted` (`skip_must_fail_here`): CI must run the control. The chmod
     // back to `0o700` comes first, or `Scratch` drop would leak `locked`.
     // No test reaches this branch on Windows.
     #[cfg(unix)]
@@ -741,8 +759,10 @@ fn the_checkout_has_no_cargo_config() {
                 cannot_tell(&result),
                 "a directory without search permission: {result:?}"
             );
-        } else if std::env::var_os("GITHUB_ACTIONS").is_some() {
-            panic!("directory permissions bypassed (root/CAP_DAC_OVERRIDE) under GITHUB_ACTIONS");
+        } else if skip_must_fail_here() {
+            panic!(
+                "directory permissions bypassed (root/CAP_DAC_OVERRIDE) under GITHUB_ACTIONS without RUNNER_ENVIRONMENT=self-hosted"
+            );
         } else {
             eprintln!("SKIPPED: the_checkout_has_no_cargo_config");
         }
