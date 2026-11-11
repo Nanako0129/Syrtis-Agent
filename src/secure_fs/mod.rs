@@ -46,10 +46,11 @@ pub(crate) enum Step {
     /// for the deterministic path swap.
     Descend(usize),
     /// Syncing the parent directory of component `n`: after creating an
-    /// intermediate directory, so the new entry is durable, and on every open
-    /// for the agent root (the last component), whether it was created in
-    /// this call or found, so a root left unsynced by an earlier crash is
-    /// made durable before any commit goes into it.
+    /// intermediate directory, so the new entry is durable; and for the agent
+    /// root (the last component) on every open whose root passes its own
+    /// checks, whether it was created in this call or found, so a root left
+    /// unsynced by an earlier crash is made durable before any commit goes
+    /// into it. That sync runs before the `owner.lock` checks and the lock.
     SyncParent(usize),
     CreateTemp,
     /// First half of the bytes.
@@ -132,6 +133,8 @@ pub(crate) mod seams {
         static ACL_GET_ENTRY_SILENT_IN: Cell<Option<usize>> = const { Cell::new(None) };
         #[cfg(target_os = "macos")]
         static CLOBBER_ERRNO_AFTER_FREE: Cell<bool> = const { Cell::new(false) };
+        #[cfg(target_os = "macos")]
+        static ACL_GET_FD_NULL_SILENTLY: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Makes every `acl_get_entry` on this thread return −1 with `errno`
@@ -145,9 +148,11 @@ pub(crate) mod seams {
         ACL_GET_ENTRY_ERRNO.with(Cell::get)
     }
 
-    /// Makes call number `n` (0-based, counted from now) of `acl_get_entry`
-    /// on this thread return −1 without touching errno, as a failure that
-    /// leaves an earlier call's errno in place would (macOS).
+    /// Makes the `n`-th (0-based) `acl_get_entry` wrapper call on this thread
+    /// that reaches this seam return −1 without touching errno, as a failure
+    /// that leaves the errno in place would (macOS). Counted from this call;
+    /// calls already failed by [`fail_acl_get_entry`] return before this
+    /// seam and are not counted.
     #[cfg(target_os = "macos")]
     pub(crate) fn fail_acl_get_entry_silently_at(n: Option<usize>) {
         ACL_GET_ENTRY_SILENT_IN.with(|cell| cell.set(n));
@@ -165,6 +170,17 @@ pub(crate) mod seams {
             }
             None => false,
         })
+    }
+
+    /// Makes `acl_get_fd_np` on this thread return NULL without touching
+    /// errno (macOS).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn acl_get_fd_null_silently(value: bool) {
+        ACL_GET_FD_NULL_SILENTLY.with(|cell| cell.set(value));
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn acl_get_fd_returns_null_silently() -> bool {
+        ACL_GET_FD_NULL_SILENTLY.with(Cell::get)
     }
 
     /// Makes `acl_free` overwrite errno with `EINVAL` on this thread
@@ -228,6 +244,8 @@ pub(crate) mod seams {
             fail_acl_get_entry_silently_at(None);
             #[cfg(target_os = "macos")]
             clobber_errno_after_acl_free(false);
+            #[cfg(target_os = "macos")]
+            acl_get_fd_null_silently(false);
         }
     }
 }

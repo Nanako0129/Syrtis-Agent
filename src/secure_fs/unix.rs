@@ -161,12 +161,15 @@ impl SecureRoot {
                     StorageError::UnsafeState,
                 )?;
                 guard(local_filesystem(&next), LOCAL_FS, StorageError::UnsafeState)?;
-                // The root's parent is synced on every open, found or
-                // created, so a root an earlier run created but crashed
-                // before syncing is durable before any commit lands in it.
-                // Only after every root check: an open that is refused, or
-                // a root on a non-local filesystem, never pays for (or hangs
-                // on) the sync. Failure is `UnsafeState`: nothing was
+                // The root's parent is synced on every open whose root
+                // passes its own checks, found or created, so a root an
+                // earlier run created but crashed before syncing is durable
+                // before any commit lands in it. After the root's own checks
+                // (a root that fails them, for example on a non-local
+                // filesystem, never pays for or hangs on the sync) and
+                // before the backup exclusion, the `owner.lock` checks and
+                // the lock, so an open that then fails there or gets `Busy`
+                // has already synced. Failure is `UnsafeState`: nothing was
                 // committed, so nothing is unknown.
                 if created || sync_found_root_parent() {
                     shim(Step::SyncParent(index), || full_sync(&dir))
@@ -337,8 +340,8 @@ fn nofollow() -> libc::c_int {
     libc::O_NOFOLLOW
 }
 
-/// Whether an agent root that already existed has its parent synced on
-/// open. Always in a non-test build.
+/// Whether an agent root that already existed, and passed its own checks,
+/// has its parent synced on open. Always in a non-test build.
 fn sync_found_root_parent() -> bool {
     #[cfg(test)]
     if seams::bypassed(seams::SKIP_PARENT_SYNC) {
@@ -486,7 +489,19 @@ mod acl {
     /// The descriptor's extended ACL: `Ok(None)` when it has none, `Err`
     /// when it cannot be read.
     fn read(file: &File) -> Result<Option<Acl>, ()> {
-        let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+        // Cleared first, so an `ENOENT` left by an earlier call can never
+        // read as "no ACL".
+        unsafe { *libc::__error() = 0 };
+        // A test seam can make the call return NULL without setting errno.
+        #[cfg(test)]
+        let silent_null = super::seams::acl_get_fd_returns_null_silently();
+        #[cfg(not(test))]
+        let silent_null = false;
+        let acl = if silent_null {
+            std::ptr::null_mut()
+        } else {
+            unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) }
+        };
         if !acl.is_null() {
             Ok(Some(acl))
         } else if errno() == Some(libc::ENOENT) {
@@ -502,12 +517,20 @@ mod acl {
         match read(file) {
             Ok(None) => true,
             Err(()) => false,
-            Ok(Some(acl)) => empty_then_free(acl),
+            // SAFETY: `acl` is the handle `acl_get_fd_np` just returned,
+            // owned here and passed on exactly once.
+            Ok(Some(acl)) => unsafe { empty_then_free(acl) },
         }
     }
 
     /// Whether `acl` has no entry, then frees it.
-    pub(super) fn empty_then_free(acl: Acl) -> bool {
+    ///
+    /// # Safety
+    ///
+    /// `acl` must be a valid ACL handle that the caller owns (from
+    /// `acl_get_fd_np` or `acl_init`) and does not use or free afterwards:
+    /// this function frees it exactly once.
+    pub(super) unsafe fn empty_then_free(acl: Acl) -> bool {
         let mut entry: AclEntry = std::ptr::null_mut();
         let rc = get_entry(acl, ACL_FIRST_ENTRY, &mut entry);
         // errno is read before `acl_free`, which may change it. Only
@@ -526,12 +549,20 @@ mod acl {
         match read(file) {
             Ok(None) => true,
             Err(()) => false,
-            Ok(Some(acl)) => all_deny_then_free(acl),
+            // SAFETY: `acl` is the handle `acl_get_fd_np` just returned,
+            // owned here and passed on exactly once.
+            Ok(Some(acl)) => unsafe { all_deny_then_free(acl) },
         }
     }
 
     /// Walks every entry of `acl`, then frees it.
-    pub(super) fn all_deny_then_free(acl: Acl) -> bool {
+    ///
+    /// # Safety
+    ///
+    /// `acl` must be a valid ACL handle that the caller owns (from
+    /// `acl_get_fd_np` or `acl_init`) and does not use or free afterwards:
+    /// this function frees it exactly once.
+    pub(super) unsafe fn all_deny_then_free(acl: Acl) -> bool {
         let mut verdict = false;
         let mut entry_id = ACL_FIRST_ENTRY;
         // One more iteration than the cap, to see the end of a full ACL.
@@ -976,8 +1007,8 @@ mod tests {
     }
 
     /// Creating a directory syncs its parent so the new entry is durable,
-    /// and every open syncs the agent root's parent, also when the root
-    /// already exists. Creating the root records that sync once, not twice;
+    /// and every open whose root passes its own checks syncs the root's
+    /// parent, also when the root already exists. Creating the root records that sync once, not twice;
     /// reopening creates nothing, so it syncs only the root's parent.
     #[test]
     fn each_created_directory_is_followed_by_a_sync_of_its_parent() {
@@ -1260,9 +1291,6 @@ mod tests {
         drop(open(&home).unwrap());
     }
 
-    /// c2 at the tag level, on in-memory ACLs: only `ACL_EXTENDED_DENY`
-    /// passes. `ACL_UNDEFINED_TAG` cannot be written to a file, so this is
-    /// where an "every tag except allow" rule is caught.
     /// An in-memory ACL with one entry per tag; `None` leaves a fresh
     /// entry's tag as created. A control asserts each tag reads back.
     #[cfg(target_os = "macos")]
@@ -1282,11 +1310,16 @@ mod tests {
         list
     }
 
+    /// c2 at the tag level, on in-memory ACLs: only `ACL_EXTENDED_DENY`
+    /// passes. `ACL_UNDEFINED_TAG` cannot be written to a file, so this is
+    /// where an "every tag except allow" rule is caught.
     #[cfg(target_os = "macos")]
     #[test]
     fn only_explicit_deny_tags_pass_the_intermediate_acl_check() {
         use acl::{ACL_EXTENDED_ALLOW, ACL_EXTENDED_DENY};
-        let verdict = |tags: &[Option<libc::c_int>]| acl::all_deny_then_free(in_memory_acl(tags));
+        // SAFETY: each handle is freshly built and freed once by the walk.
+        let verdict =
+            |tags: &[Option<libc::c_int>]| unsafe { acl::all_deny_then_free(in_memory_acl(tags)) };
         let (deny, allow) = (Some(ACL_EXTENDED_DENY), Some(ACL_EXTENDED_ALLOW));
         assert!(verdict(&[]));
         assert!(verdict(&[deny]));
@@ -1388,36 +1421,65 @@ mod tests {
     }
 
     /// B7: errno is cleared before every `acl_get_entry`, so an `EINVAL`
-    /// left by an earlier call can never read as "end of list".
+    /// left by an earlier call can never read as "end of list". Each ACL is
+    /// built first; errno is set to `EINVAL` right before the call, so
+    /// nothing in between can change it.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_stale_einval_never_ends_the_acl_walk() {
         use acl::{ACL_EXTENDED_ALLOW, ACL_EXTENDED_DENY};
         let (deny, allow) = (Some(ACL_EXTENDED_DENY), Some(ACL_EXTENDED_ALLOW));
-        let stale_einval = || unsafe { *libc::__error() = libc::EINVAL };
+        // SAFETY: each handle is freshly built and freed once by the call.
+        let walk = |tags: &[Option<libc::c_int>]| {
+            let list = in_memory_acl(tags);
+            unsafe { *libc::__error() = libc::EINVAL };
+            unsafe { acl::all_deny_then_free(list) }
+        };
+        let empty = |tags: &[Option<libc::c_int>]| {
+            let list = in_memory_acl(tags);
+            unsafe { *libc::__error() = libc::EINVAL };
+            unsafe { acl::empty_then_free(list) }
+        };
         let _reset = Reset;
         // Control: with a stale `EINVAL` in errno the walk still evaluates
         // every real entry.
-        stale_einval();
-        assert!(acl::all_deny_then_free(in_memory_acl(&[deny, deny])));
-        stale_einval();
-        assert!(!acl::all_deny_then_free(in_memory_acl(&[deny, allow])));
-        stale_einval();
-        assert!(!acl::empty_then_free(in_memory_acl(&[deny])));
+        assert!(walk(&[deny, deny]));
+        assert!(!walk(&[deny, allow]));
+        assert!(!empty(&[deny]));
         // A failure that sets no errno, after a stale `EINVAL`, is not the
         // end of the list: the walk (second call) and `none` (first call)
         // both refuse.
         seams::fail_acl_get_entry_silently_at(Some(1));
-        stale_einval();
-        assert!(!acl::all_deny_then_free(in_memory_acl(&[deny, deny])));
+        assert!(!walk(&[deny, deny]));
         seams::fail_acl_get_entry_silently_at(Some(0));
-        stale_einval();
-        assert!(!acl::empty_then_free(in_memory_acl(&[deny])));
+        assert!(!empty(&[deny]));
     }
 
-    /// B4: the root's parent is synced only after the root passed every
-    /// check, so a refused open (here: injected non-local filesystem) syncs
-    /// no root parent, whether the root was just created or found.
+    /// E11: errno is cleared before `acl_get_fd_np`, so a NULL return that
+    /// sets no errno, after a stale `ENOENT`, never reads as "no ACL".
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stale_enoent_never_reads_as_no_acl() {
+        let home = TempHome::new();
+        let file = std::fs::File::create(home.path.join("probe")).unwrap();
+        let _reset = Reset;
+        // Control: the real call on a file with no ACL reads as none, even
+        // with a stale `ENOENT` set right before it.
+        unsafe { *libc::__error() = libc::ENOENT };
+        assert!(acl::none(&file));
+        unsafe { *libc::__error() = libc::ENOENT };
+        assert!(acl::deny_only(&file));
+        seams::acl_get_fd_null_silently(true);
+        unsafe { *libc::__error() = libc::ENOENT };
+        assert!(!acl::none(&file));
+        unsafe { *libc::__error() = libc::ENOENT };
+        assert!(!acl::deny_only(&file));
+    }
+
+    /// B4: the root's parent is synced only after the root passed its own
+    /// checks, so an open whose root is refused (here: injected non-local
+    /// filesystem) syncs no root parent, whether the root was just created
+    /// or found.
     #[test]
     fn a_refused_root_syncs_no_parent() {
         let home = TempHome::new();
