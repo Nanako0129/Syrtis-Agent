@@ -172,6 +172,20 @@ fn top_level_positions(text: &str, separator: u8) -> Option<Vec<usize>> {
     (quote.is_none() && depth == 0).then_some(positions)
 }
 
+/// `text` split at its top-level commas, items untrimmed (a trailing comma
+/// yields a last item that is empty). `None` when a string or bracket is
+/// left open.
+fn top_level_items(text: &str) -> Option<Vec<&str>> {
+    let mut items = Vec::new();
+    let mut start = 0;
+    for position in top_level_positions(text, b',')? {
+        items.push(&text[start..position]);
+        start = position + 1;
+    }
+    items.push(&text[start..]);
+    Some(items)
+}
+
 /// The items of a one-line inline table `{ k = v, … }` as (key, value):
 /// the key with surrounding whitespace and quotes stripped, the value with
 /// surrounding whitespace stripped. `None` when it cannot be parsed: an open
@@ -181,15 +195,9 @@ fn inline_table(spec: &str) -> Option<Vec<(String, String)>> {
     if inner.trim().is_empty() {
         return Some(Vec::new());
     }
-    let mut bounds = vec![0];
-    for position in top_level_positions(inner, b',')? {
-        bounds.extend([position, position + 1]);
-    }
-    bounds.push(inner.len());
-    bounds
-        .chunks(2)
-        .map(|pair| {
-            let item = &inner[pair[0]..pair[1]];
+    top_level_items(inner)?
+        .into_iter()
+        .map(|item| {
             let equals = *top_level_positions(item, b'=')?.first()?;
             let (key, value) = (item[..equals].trim(), item[equals + 1..].trim());
             let key = ['"', '\'']
@@ -199,6 +207,19 @@ fn inline_table(spec: &str) -> Option<Vec<(String, String)>> {
             (!key.is_empty() && !value.is_empty()).then(|| (key.to_owned(), value.to_owned()))
         })
         .collect()
+}
+
+/// `=` followed by exactly three non-empty runs of ASCII digits joined by
+/// `.`: `=0.2.189`, never `=0.2`, `=0.2.189.1`, `=0..189` or `=+0.2.189`.
+/// Digits are checked byte by byte; `u64::from_str` would accept a `+`.
+fn exact_pin(version: &str) -> bool {
+    version.strip_prefix('=').is_some_and(|rest| {
+        let parts: Vec<&str> = rest.split('.').collect();
+        parts.len() == 3
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    })
 }
 
 /// Only the allowlisted tables and `[package]` keys, `[package]` first; every
@@ -290,23 +311,29 @@ fn check_manifest(manifest: &str) -> Result<(), String> {
                 .and_then(|version| version.strip_prefix('"')?.strip_suffix('"'))
                 .ok_or_else(|| format!("{name}: no version"))?
         };
-        if !version.starts_with('=') {
+        if !exact_pin(version) {
             return Err(format!("{name}: version {version} is not an exact pin"));
         }
         if name == "snow" {
             snow_count += 1;
-            let features: BTreeSet<String> = value("features")
+            // Item by item at top-level commas, so a comma inside a string
+            // stays in its item; an empty item (`[]`, `[,]`, a trailing
+            // comma) makes the whole list unreadable rather than dropped.
+            let features: Option<BTreeSet<String>> = value("features")
                 .and_then(|list| list.strip_prefix('[')?.strip_suffix(']'))
-                .map(|list| {
-                    list.split(',')
-                        .map(|item| item.trim().trim_matches('"').to_owned())
-                        .filter(|item| !item.is_empty())
+                .and_then(top_level_items)
+                .and_then(|items| {
+                    items
+                        .into_iter()
+                        .map(|item| {
+                            let item = item.trim();
+                            (!item.is_empty()).then(|| item.trim_matches('"').to_owned())
+                        })
                         .collect()
-                })
-                .unwrap_or_default();
+                });
             if version != snow_version
                 || value("default-features") != Some("false")
-                || features != snow_features
+                || features.as_ref() != Some(&snow_features)
             {
                 return Err("snow version, default features or feature set changed".into());
             }
@@ -538,9 +565,12 @@ fn pinned_values_come_from_the_parsed_item_not_a_substring() {
 }
 
 /// E7: a multi-line string is refused. In this copy the license string
-/// would make cargo read `build = "=evil.rs"` as a `[package]` key while a
-/// line reader sees it under a fake `[dependencies]` header and accepts it
-/// as a pinned dependency. The real manifest has no such line.
+/// spans the fake `[dependencies]` header, so cargo would read
+/// `build = "=evil.rs"` as a `[package]` key (inferred from TOML 1.0; not
+/// run through cargo). The multi-line check is defense in depth: the line
+/// reader before the three-part pin check (P4-a) took the smuggled lines
+/// for pinned dependencies; with P4-a, `=evil.rs` and `=1" ` are no exact
+/// pins either. The real manifest has no such line.
 #[test]
 fn a_multi_line_string_is_refused() {
     let license = "license = \"MIT\"\n";
@@ -557,5 +587,156 @@ fn a_multi_line_string_is_refused() {
             format!("multi-line string not allowed: license = {quote}MIT")
         );
     }
-    assert!(!MANIFEST.contains("\"\"\"") && !MANIFEST.contains("'''"));
+}
+
+/// P4-a: a version is an exact pin only with three numeric parts. Control:
+/// each refused spelling differs from the real pin only in that spelling.
+#[test]
+fn a_version_pin_needs_exactly_three_numeric_parts() {
+    let libc = "version = \"=0.2.189\"";
+    assert_eq!(MANIFEST.matches(libc).count(), 1);
+    for version in ["=0.2", "=0.2.189.1", "=0..189", "=+0.2.189"] {
+        let tampered = MANIFEST.replace(libc, &format!("version = \"{version}\""));
+        assert_eq!(
+            check_manifest(&tampered),
+            Err(format!("libc: version {version} is not an exact pin")),
+            "{version}"
+        );
+    }
+    check_manifest(MANIFEST).unwrap();
+}
+
+/// P4-b: snow's features are read item by item. A comma inside a string
+/// stays in its item, so a merged item does not match the frozen set; an
+/// empty item from a trailing comma is refused, not dropped. Control: the
+/// real list passes.
+#[test]
+fn snow_features_are_parsed_item_by_item() {
+    let features = "\"use-curve25519\", \"use-getrandom\"]";
+    assert_eq!(MANIFEST.matches(features).count(), 1);
+    for tampered in [
+        "\"use-curve25519,use-getrandom\"]",
+        "\"use-curve25519\", \"use-getrandom\",]",
+    ] {
+        assert_eq!(
+            check_manifest(&MANIFEST.replace(features, tampered)),
+            Err("snow version, default features or feature set changed".into()),
+            "{tampered}"
+        );
+    }
+    check_manifest(MANIFEST).unwrap();
+}
+
+/// `Ok` only when `dir` is a directory with no `.cargo` entry of any kind:
+/// directory, file or symlink, dangling or not. `dir` itself must be a
+/// directory first, so a non-directory is an error on every OS. After that,
+/// any error other than `NotFound` is an error, never "absent".
+fn no_cargo_config_in(dir: &std::path::Path) -> Result<(), String> {
+    let cannot =
+        |error: &dyn std::fmt::Display| format!("cannot tell whether .cargo is present: {error}");
+    if !std::fs::metadata(dir)
+        .map_err(|error| cannot(&error))?
+        .is_dir()
+    {
+        return Err(cannot(&"not a directory"));
+    }
+    match std::fs::symlink_metadata(dir.join(".cargo")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(".cargo is present".into()),
+        Err(error) => Err(cannot(&error)),
+    }
+}
+
+/// A fresh directory under `std::env::temp_dir()`, removed on drop.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("syrtis-provenance-{tag}-{}-{nanos}", std::process::id());
+        let path = std::env::temp_dir().join(name);
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// P4-c: cargo source replacement (`.cargo/config.toml`) is outside every
+/// check above, and this package has no `.cargo/` in its directory. This is
+/// a tripwire against adding one there by accident. It checks only the
+/// package (manifest) directory, `CARGO_MANIFEST_DIR`, which is the
+/// repository root today: a `.cargo/` in a subdirectory (for example
+/// `tests/.cargo/`), in a parent directory or in `$CARGO_HOME` is not seen,
+/// so it is no defence against a malicious source replacement. Negative
+/// controls run in temp directories, never in the checkout.
+#[test]
+fn the_checkout_has_no_cargo_config() {
+    no_cargo_config_in(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+
+    let scratch = Scratch::new("cargo-config");
+    no_cargo_config_in(&scratch.0).unwrap();
+    std::fs::create_dir(scratch.0.join(".cargo")).unwrap();
+    assert_eq!(
+        no_cargo_config_in(&scratch.0),
+        Err(".cargo is present".into()),
+        "a .cargo directory"
+    );
+
+    #[cfg(unix)]
+    {
+        let scratch = Scratch::new("cargo-dangling");
+        let link = scratch.0.join(".cargo");
+        std::os::unix::fs::symlink(scratch.0.join("missing"), &link).unwrap();
+        assert!(!link.exists(), "the control link must dangle");
+        assert_eq!(
+            no_cargo_config_in(&scratch.0),
+            Err(".cargo is present".into()),
+            "a dangling .cargo symlink"
+        );
+    }
+
+    let cannot_tell = |result: &Result<(), String>| {
+        result
+            .as_ref()
+            .is_err_and(|error| error.starts_with("cannot tell whether .cargo is present:"))
+    };
+
+    let scratch = Scratch::new("cargo-notdir");
+    let file = scratch.0.join("file");
+    std::fs::write(&file, b"").unwrap();
+    let result = no_cargo_config_in(&file);
+    assert!(
+        cannot_tell(&result),
+        "a file passed as the directory: {result:?}"
+    );
+
+    // A directory whose `.cargo` lookup fails with an error other than
+    // `NotFound`: no search permission. Root or `CAP_DAC_OVERRIDE` bypasses
+    // that, so the control runs only when the lookup really is refused.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("cargo-nosearch");
+        let locked = scratch.0.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let refused = std::fs::symlink_metadata(locked.join(".cargo"))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied);
+        let result = no_cargo_config_in(&locked);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if refused {
+            assert!(
+                cannot_tell(&result),
+                "a directory without search permission: {result:?}"
+            );
+        }
+    }
 }
