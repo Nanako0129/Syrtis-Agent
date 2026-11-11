@@ -200,8 +200,12 @@ fn check_manifest(manifest: &str) -> Result<(), String> {
         if spec.starts_with('{') != spec.ends_with('}') {
             return Err(format!("multi-line dependency: {name}"));
         }
+        // Whitespace is stripped first, so `git="…"` is caught like
+        // `git = "…"`. A quoted key (`"git" = …`) is not matched here; the
+        // lock's source and checksum comparison catches what it would pull.
+        let compact: String = spec.chars().filter(|c| !c.is_whitespace()).collect();
         for forbidden in ["git", "path", "registry", "package", "branch", "rev", "tag"] {
-            if spec.contains(&format!("{forbidden} =")) {
+            if compact.contains(&format!("{forbidden}=")) {
                 return Err(format!("{name}: forbidden key {forbidden}"));
             }
         }
@@ -367,5 +371,31 @@ fn the_manifest_checker_rejects_unpinned_patched_or_duplicated_dependencies() {
     for (tampered, expected) in cases {
         assert_ne!(tampered, MANIFEST, "mutation did not apply: {expected}");
         assert_eq!(check_manifest(&tampered).unwrap_err(), expected);
+    }
+}
+
+/// A forbidden key written without spaces is still refused. Control: the
+/// same in-test copy with that key renamed to one the checker does not
+/// forbid passes, so the refusal came from the forbidden-key branch.
+#[test]
+fn the_manifest_checker_rejects_forbidden_keys_written_without_spaces() {
+    let libc = "libc = { version = \"=0.2.189\", default-features = false }";
+    assert!(MANIFEST.contains(libc));
+    for (key, renamed) in [("git", "gix"), ("path", "pith")] {
+        let with = |name: &str| {
+            MANIFEST.replace(
+                libc,
+                &format!(
+                    "libc = {{ version = \"=0.2.189\", default-features = false, {name}=\"https://example.invalid/libc\" }}"
+                ),
+            )
+        };
+        let tampered = with(key);
+        assert_ne!(tampered, MANIFEST);
+        assert_eq!(
+            check_manifest(&tampered).unwrap_err(),
+            format!("libc: forbidden key {key}")
+        );
+        check_manifest(&with(renamed)).unwrap();
     }
 }

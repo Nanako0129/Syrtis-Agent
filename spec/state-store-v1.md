@@ -16,18 +16,28 @@ This document fixes how the agent's durable state is stored: where, in what byte
 
 `HOME`, `XDG_*`, `LOCALAPPDATA` and every other environment variable are ignored. A home that is not absolute (`/`, not `//`) fails closed.
 
-The home is opened by path and its owner is checked on the descriptor. Every component below it is opened with `openat(parent, name, O_DIRECTORY | O_NOFOLLOW)`; a missing component is created with `mkdirat(…, 0700)`, reopened the same way, set to exactly `0700` with `fchmod` on the new descriptor (the `mkdirat` mode is filtered by the process umask), and then the parent directory is synced (`F_FULLFSYNC` on macOS, `fsync` on Linux) so the new entry is durable. Nothing is ever reopened by pathname after a check.
+The home is opened by path and checked on the descriptor. Every component below it is opened with `openat(parent, name, O_DIRECTORY | O_NOFOLLOW)`; a missing component is created with `mkdirat(…, 0700)`, reopened the same way, set to exactly `0700` with `fchmod` on the new descriptor (the `mkdirat` mode is filtered by the process umask), has its extended ACL cleared on macOS, and then its parent directory is synced (`F_FULLFSYNC` on macOS, `fsync` on Linux) so the new entry is durable. Nothing is ever reopened by pathname after a check.
 
-**Created versus found.** Only an object the agent created in the same call (a directory from `mkdirat`, `owner.lock` from `O_CREAT|O_EXCL`, the commit temp file) is ever `fchmod`-ed or has its ACL cleared. An object that already existed is checked exactly as found, and if it fails a rule it fails closed and is left in place for manual repair. A restrictive umask (for example `0277`) therefore cannot make the root unopenable.
+**Root parent sync.** Every open syncs the agent root's parent directory, whether the root was created in this call or found, so a root that an earlier run created but crashed before syncing is durable before any commit lands in it. Creating the root syncs its parent once, not twice. A failure of this sync is `unsafeState` (nothing was committed, so the store does not become sticky unknown). Only the root's parent is synced on every open: an intermediate directory the agent created is synced once, right after its `mkdirat`, so a crash between that `mkdirat` and its sync, followed by a later open that finds the directory and a power loss, can lose it on ext4. That affects availability only (the root is then missing and is created again), not confidentiality.
+
+**Created versus found.** Whether an object is `fchmod`-ed and has its ACL cleared is decided by name: a directory whose `mkdirat` succeeded in this call, `owner.lock` whose `O_CREAT|O_EXCL` open succeeded, and the commit temp file. The object is then reopened by the same name, so another process of the same UID can substitute it in between; an object owned by another UID is stopped there because `fchmod` on it fails with `EPERM`, which fails closed. An object that already existed is checked exactly as found, and if it fails a rule it fails closed and is left in place for manual repair. A restrictive umask (for example `0277`) therefore cannot make the root unopenable.
+
+**Interrupted creation.** A crash between creating an object and its `fchmod` or ACL clearing leaves an object that the next open finds, checks as found and refuses: it fails closed and needs manual repair (the agent never fixes an object it did not just create). Two processes starting for the first time at once can race the same way without a crash: the one whose `mkdirat` or `O_EXCL` lost finds the winner's object before the winner has fixed its mode or ACL and gets a transient `unsafeState`. Retrying the open succeeds; no repair is needed.
 
 | Object | Required on the open descriptor |
 |---|---|
-| Home | Owner is the effective UID |
-| Intermediate directory | Directory, owner is the effective UID, not group- or other-writable (`0755` is accepted) |
+| Home | Owner is the effective UID, not group- or other-writable (`0755` is accepted; the same rule as sshd `StrictModes`), and on macOS any extended ACL is deny-only (below) |
+| Intermediate directory | Directory, owner is the effective UID, not group- or other-writable (`0755` is accepted), and on macOS any extended ACL is deny-only (below) |
 | Agent root | Directory, owner is the effective UID, mode exactly `0700`, local filesystem, no extended ACL entry (macOS) |
 | Agent file (`state.json`, `owner.lock`) | Regular file, owner is the effective UID, mode exactly `0600`, link count 1, opened `O_NOFOLLOW`, no extended ACL entry (macOS) |
 
-**macOS ACLs.** An inheritable ACL on a parent (for example `everyone allow read,…,file_inherit,directory_inherit`) is inherited by a new `0700` directory or `0600` file and grants other UIDs access whatever the mode says. The agent therefore replaces the extended ACL with an empty one (`acl_init(0)` + `acl_set_fd_np(fd, acl, ACL_TYPE_EXTENDED)`) on the root, `owner.lock` and the commit temp file right after creating each, before any secret byte is written. The root, `state.json` and `owner.lock` must carry no extended ACL entry (`acl_get_fd_np` + `acl_get_entry(ACL_FIRST_ENTRY)`). An ACL that cannot be read counts as present. An ACL on an object the agent did not just create fails closed and is not stripped. Intermediate directories are not checked; they may legitimately carry ACLs and are traversed, not read. **Linux** needs no ACL handling: with the mode exactly `0700`/`0600`, the POSIX ACL mask is zero, so no named entry can grant group or other access.
+**macOS ACLs.** An extended ACL grants or denies access whatever the mode says, and an inheritable entry on a parent is copied onto every new directory or file below it. The agent therefore replaces the extended ACL with an empty one (`acl_init(0)` + `acl_set_fd_np(fd, acl, ACL_TYPE_EXTENDED)`) on every directory it creates (each intermediate and the root), on `owner.lock` and on the commit temp file, right after creating each and before any secret byte is written.
+
+- The root, `state.json` and `owner.lock` must carry no extended ACL entry at all (`acl_get_fd_np` + `acl_get_entry(ACL_FIRST_ENTRY)`).
+- The home and every intermediate directory pass only if they carry no extended ACL, or if every entry's tag is `ACL_EXTENDED_DENY`. A stock account's `~`, `~/Library` and `~/Library/Application Support` carry only `everyone deny delete`, which passes. Every entry is read, `acl_get_entry(ACL_FIRST_ENTRY)` and then `ACL_NEXT_ENTRY`, up to `ACL_MAX_ENTRIES` (128); an `ACL_EXTENDED_ALLOW` entry (for example `everyone allow add_subdirectory,delete_child`, which would let another UID replace the next component), an `ACL_UNDEFINED_TAG` or unknown tag, a tag `acl_get_tag_type` cannot read, or more than 128 entries fails closed. A deny entry followed by an allow entry fails closed: the walk does not stop at the first entry.
+- When `acl_get_entry` returns −1, errno is read immediately, before `acl_free`. Only `EINVAL` means "no more entries"; any other errno counts as an entry that may grant access, and fails closed. An ACL that `acl_get_fd_np` cannot read (any errno except `ENOENT`) also counts as present.
+- An ACL on an object the agent did not just create fails closed and is not stripped.
+ **Linux** needs no ACL handling: with the mode exactly `0700`/`0600`, the POSIX ACL mask is zero, so no named entry can grant group or other access.
 
 Local filesystem: macOS requires `MNT_LOCAL` in `fstatfs` `f_flags`. Linux requires `fstatfs` `f_type` to be one of ext2/3/4 (`0xEF53`), XFS (`0x58465342`), Btrfs (`0x9123683E`) or tmpfs (`0x01021994`).
 
@@ -110,6 +120,8 @@ The store never writes a state it could not load. Before staging, a commit whose
 
 Errors are a stable enum with no path, OS error text or file content.
 
+The listen-host rule recognises unspecified addresses only in the IP-literal spellings Rust's `IpAddr` parser accepts. Other spellings a resolver may accept for the wildcard, such as `0x0`, are treated as hostnames here and are not refused at load; refusing them belongs to the bind-time check of SA-2B2, which must bind only a resolved address that is not unspecified.
+
 ## Commit
 
 Every change is a full replace of one agent-owned file in the root:
@@ -129,6 +141,7 @@ directory sync     macOS fcntl(F_FULLFSYNC) on the root; Linux fsync on the root
 - The store's exclusive guard is held from before the rename until the in-memory state is replaced. Authorization takes the shared guard and reads only that in-memory state, which is always the last durable commit. After the rename no authorization can read the pre-commit state; before it, none can read the new one.
 - Any failure during the commit (create, write, sync, rename, directory sync, including `ENOSPC`) makes the store **sticky unknown** until the process restarts: no state reads, no authorization (always false), no further commits, and a sync is never retried and then trusted. The durable result is then the old or the new state.
 - On open, a leftover `.state.json.tmp` from a crash is removed with `unlinkat`, which never follows a link; only that exact name is touched.
+- A panic inside the staging step (between creating the temp file and the rename) unwinds without making the store sticky, but leaves `.state.json.tmp` behind; the next commit's `O_EXCL` create then fails and the store becomes sticky unknown until the process restarts, whose open removes the temp file.
 - **Not observable in CI:** durability across power loss. Tests prove the order of the calls and the old-or-new outcome after an injected error or a process abort at every step, not what a disk does with its cache.
 
 ## Listen config
