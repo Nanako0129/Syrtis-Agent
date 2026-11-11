@@ -562,7 +562,8 @@ fn an_offer_with_a_bad_version_or_port_is_refused_without_connecting() {
 }
 
 /// B10: `unauthorized`, `invalid` and `incompatible` stop both the claim
-/// and the poll on the first answer.
+/// and the poll on the first answer. The claim keeps that connection's
+/// attempt record: none of these answers removes one.
 #[test]
 fn a_refusing_answer_stops_claim_and_poll_at_once() {
     let fake_key = StaticKey::generate().unwrap();
@@ -601,6 +602,11 @@ fn a_refusing_answer_stops_claim_and_poll_at_once() {
             |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
         );
         assert_eq!((result, count), (Err(claim_error), 1), "claim {code}");
+        assert_eq!(
+            attempts.used(&offer_id(1)),
+            1,
+            "claim {code} keeps its record"
+        );
         let (result, count) = fake(
             &fake_key,
             |_, request, _| Some(answer(request)),
@@ -776,10 +782,13 @@ fn busy_claims_keep_no_record() {
         derive_pending_id(&secret_hash, &h_finals[5])
     );
     assert_eq!(outcomes[1].1, 1);
+    // A call's first try does not wait, even after a call ended on `busy`.
+    assert_eq!(outcomes[1].2, Duration::from_secs(4));
     // A success that matches its own record keeps it.
     let claimed = outcomes[2].0.clone().unwrap();
     assert_eq!(claimed.sas, sas_for(&fake_key, &receiver, &h_finals[6]));
     assert_eq!(outcomes[2].1, 2);
+    assert_eq!(outcomes[2].2, Duration::from_secs(4));
 }
 
 /// D1: `internal` ends the claim call at once (one connection per call, no
@@ -2256,6 +2265,33 @@ mod disk {
             |port| client.poll(&claimed_for(&fake_key, port, pending_id)),
         );
         assert_eq!((result, count), (Err(ClientError::Aborted), 1));
+
+        // Pair claim: a reply that breaks the protocol aborts the claim, and
+        // a success naming a pending ID no attempt derived is a lost attempt.
+        // Neither removes the record this connection made.
+        let claim_cases: Vec<(&str, Reply, ClientError)> = vec![
+            ("claim code 7", error(7, 1), ClientError::Aborted),
+            (
+                "claim response protocol",
+                respond(br#"{"expiresAt":1,"pendingId":"21212121212121212121212121212121","protocol":2}"#.to_vec()),
+                ClientError::Aborted,
+            ),
+            (
+                "claim unknown pending id",
+                respond(br#"{"expiresAt":1,"pendingId":"99999999999999999999999999999999","protocol":1}"#.to_vec()),
+                ClientError::LostAttempt,
+            ),
+        ];
+        for (label, reply, expected) in &claim_cases {
+            let mut attempts = ClaimAttempts::default();
+            let (result, count) = fake(
+                &fake_key,
+                |_, request, _| Some(reply(request)),
+                |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
+            );
+            assert_eq!((result, count), (Err(*expected), 1), "{label}");
+            assert_eq!(attempts.used(&offer_id(1)), 1, "{label} keeps its record");
+        }
     }
 
     /// Acceptance (15): a producer that keeps answering `awaiting` is

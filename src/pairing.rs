@@ -709,9 +709,13 @@ pub enum ClientError {
     /// derived, or every attempt slot for the offer is used.
     LostAttempt,
     /// The producer answered with this error code. From `claim`,
-    /// `Code(Busy)` means [`CLAIM_BUSY_MAX`] `busy` answers in one call
-    /// (nothing was committed), and `Code(Internal)` ends the call at once;
-    /// a later call may succeed.
+    /// `Code(Busy)` means [`CLAIM_BUSY_MAX`] `busy` answers in one call.
+    /// Those `busy` connections committed nothing, but the call can still
+    /// leave records from its earlier tries (a transport failure after the
+    /// handshake keeps one), so the caller must keep its [`ClaimAttempts`].
+    /// `Code(Internal)` ends the call at once and spends one record per
+    /// call, because the request may have been committed; the UI must not
+    /// retry it automatically.
     Code(PeerCode),
     Rejected,
     Expired,
@@ -734,7 +738,9 @@ impl ClientError {
             Self::LostAttempt => {
                 "This device lost track of an earlier attempt. Ask the owner to reject the request and create a new offer."
             }
-            Self::Code(PeerCode::Busy) => "The other device is busy. Try again in a moment.",
+            Self::Code(PeerCode::Busy) => {
+                "The other device cannot answer right now. Try again later."
+            }
             Self::SelfPairing => "This offer was created on this device.",
             Self::InvalidOffer => "This offer is not valid.",
             Self::Rejected => "The owner rejected the request.",
@@ -756,8 +762,8 @@ struct Attempt {
 }
 
 /// Claim attempts, per offer, at most [`CLAIM_ATTEMPTS_MAX`]. A retry
-/// against the frozen claim returns the *first* pending ID, so a record is
-/// kept while it may still be answered.
+/// against the frozen claim returns the ID of the first attempt whose claim
+/// was committed, so a record is kept while it may still be answered.
 ///
 /// Record rule: a record is created after the handshake (a pending ID
 /// exists only from `hFinal` on) and before the request is written. It is
