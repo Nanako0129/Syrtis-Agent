@@ -1921,74 +1921,178 @@ fn consent_surface_and_privacy_registry() {
             "turnCount",
         ],
     ];
-    let protocol_surfaces: &[&[&str]] = &[
-        &[
-            "expiresAt",
-            "host",
-            "offerId",
-            "port",
-            "responderStatic",
-            "secret",
-            "version",
-        ],
-        &[
-            "aggregationRevision",
-            "authEpoch",
-            "clients",
-            "endDateExclusive",
-            "endpoint",
-            "grantId",
-            "protocol",
-            "reportSchema",
-            "requestId",
-            "sourceScopeGeneration",
-            "startDate",
-            "timezone",
-            "tzdbRevision",
-        ],
-        &[
-            "aggregationRevision",
-            "authEpoch",
-            "clients",
-            "endDateExclusive",
-            "endpoint",
-            "grantId",
-            "protocol",
-            "records",
-            "reportSchema",
-            "requestId",
-            "saturated",
-            "sourceScopeGeneration",
-            "startDate",
-            "timezone",
-            "tzdbRevision",
-        ],
-        &["body", "commandId", "controlVersion", "requestId"],
-        &[
-            "bindHost",
-            "bindPort",
-            "grantId",
-            "offerId",
-            "pendingId",
-            "sasGeneration",
-            "ttlSeconds",
-        ],
-        &["code", "controlVersion", "data", "requestId"],
-        &[
-            "activeGrantCount",
-            "activeOfferCount",
-            "bindHost",
-            "bindPort",
-            "lastScanAt",
-            "nodeLabel",
-            "pendingCount",
-            "scanStatus",
-            "sharingEnabled",
-            "sourceFamilies",
-        ],
-        &["expiresAt", "offerId", "pairUrl"],
-        &["expiresAt", "pendingId", "sasCode"],
+    // Named after the spec/v1.md surface rows (`Control bodies` is the union
+    // of the control command bodies) so the checks below select surfaces by
+    // name, never by position.
+    let named_protocol_surfaces: &[(&str, &[&str])] = &[
+        (
+            "Pair URL object",
+            &[
+                "expiresAt",
+                "host",
+                "offerId",
+                "port",
+                "responderStatic",
+                "secret",
+                "version",
+            ],
+        ),
+        (
+            "Peer request",
+            &[
+                "aggregationRevision",
+                "authEpoch",
+                "clients",
+                "endDateExclusive",
+                "endpoint",
+                "grantId",
+                "protocol",
+                "reportSchema",
+                "requestId",
+                "sourceScopeGeneration",
+                "startDate",
+                "timezone",
+                "tzdbRevision",
+            ],
+        ),
+        (
+            "Peer response envelope",
+            &[
+                "aggregationRevision",
+                "authEpoch",
+                "clients",
+                "endDateExclusive",
+                "endpoint",
+                "grantId",
+                "protocol",
+                "records",
+                "reportSchema",
+                "requestId",
+                "saturated",
+                "sourceScopeGeneration",
+                "startDate",
+                "timezone",
+                "tzdbRevision",
+            ],
+        ),
+        ("Pair claim request", &["offerId", "protocol", "secret"]),
+        (
+            "Pair claim response",
+            &["expiresAt", "pendingId", "protocol"],
+        ),
+        ("Pair status request", &["pendingId", "protocol"]),
+        ("Pair status response (pending)", &["protocol", "state"]),
+        (
+            "Pair status response (approved)",
+            &[
+                "authEpoch",
+                "expiresAt",
+                "grantId",
+                "protocol",
+                "sourceScopeGeneration",
+                "state",
+            ],
+        ),
+        ("Grant status request", &["grantId", "protocol"]),
+        (
+            "Grant status response",
+            &[
+                "authEpoch",
+                "expiresAt",
+                "grantId",
+                "protocol",
+                "sourceScopeGeneration",
+                "state",
+            ],
+        ),
+        ("Peer error payload", &["code", "protocol"]),
+        (
+            "Control command envelope",
+            &["body", "commandId", "controlVersion", "requestId"],
+        ),
+        (
+            "Control bodies",
+            &[
+                "bindHost",
+                "bindPort",
+                "grantId",
+                "offerId",
+                "pendingId",
+                "sasGeneration",
+                "ttlSeconds",
+            ],
+        ),
+        (
+            "Control response envelope",
+            &["code", "controlVersion", "data", "requestId"],
+        ),
+        (
+            "Status success data",
+            &[
+                "activeGrantCount",
+                "activeOfferCount",
+                "bindHost",
+                "bindPort",
+                "lastScanAt",
+                "nodeLabel",
+                "pendingCount",
+                "scanStatus",
+                "sharingEnabled",
+                "sourceFamilies",
+            ],
+        ),
+        (
+            "Offer-create success data",
+            &["expiresAt", "offerId", "pairUrl"],
+        ),
+        ("Pending-list item", &["expiresAt", "pendingId", "sasCode"]),
     ];
+    let protocol_surfaces: &[&[&str]] = &named_protocol_surfaces
+        .iter()
+        .map(|(_, fields)| *fields)
+        .collect::<Vec<_>>();
+    fn surface<'a>(surfaces: &[(&str, &[&'a str])], name: &str) -> BTreeSet<&'a str> {
+        let (_, fields) = surfaces
+            .iter()
+            .find(|(surface, _)| *surface == name)
+            .unwrap_or_else(|| panic!("no protocol surface named {name}"));
+        fields.iter().copied().collect()
+    }
+    // spec/v1.md "Peer wire obligations": the four peer request key sets are
+    // pairwise distinct.
+    let requests = [
+        "Peer request",
+        "Pair claim request",
+        "Pair status request",
+        "Grant status request",
+    ];
+    for (index, first) in requests.iter().enumerate() {
+        for second in &requests[index + 1..] {
+            assert_ne!(
+                surface(named_protocol_surfaces, first),
+                surface(named_protocol_surfaces, second),
+                "{first} and {second} share a key set"
+            );
+        }
+    }
+    // These are legal on control surfaces and must never reach a peer.
+    for name in [
+        "Peer request",
+        "Peer response envelope",
+        "Pair claim request",
+        "Pair status request",
+        "Grant status request",
+        "Pair claim response",
+        "Pair status response (pending)",
+        "Pair status response (approved)",
+        "Grant status response",
+        "Peer error payload",
+    ] {
+        let fields = surface(named_protocol_surfaces, name);
+        for local in ["initiatorStatic", "sasCode", "sasGeneration", "secretHash"] {
+            assert!(!fields.contains(local), "{name} carries {local}");
+        }
+    }
     let local_surfaces: &[&[&str]] = &[
         &[
             "config",
@@ -2074,11 +2178,13 @@ fn consent_surface_and_privacy_registry() {
     {
         assert!(fields.iter().all(|field| !forbidden.contains(field)));
     }
-    assert!(
-        protocol_surfaces[1..]
-            .iter()
-            .all(|fields| !fields.contains(&"secret"))
-    );
+    for (name, fields) in named_protocol_surfaces {
+        assert_eq!(
+            fields.contains(&"secret"),
+            ["Pair URL object", "Pair claim request"].contains(name),
+            "{name}"
+        );
+    }
     assert_eq!(consent["duplicateWarning"], true);
     assert_eq!(consent["transitiveSharing"], false);
 }

@@ -1736,6 +1736,7 @@ pub const PROTOCOL_FIELDS: &[&str] = &[
     "sourceFamilies",
     "sourceScopeGeneration",
     "startDate",
+    "state",
     "timezone",
     "ttlSeconds",
     "tzdbRevision",
