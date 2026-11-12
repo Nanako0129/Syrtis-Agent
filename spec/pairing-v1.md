@@ -2,9 +2,9 @@
 
 ## Purpose and boundary
 
-This document fixes how two agents pair over the peer wire: the Noise transport, the derivation of pairing IDs, how the producer answers Pair claim, Pair status and Grant status, how the owner approves, and how the receiver claims, polls and confirms a grant. Field sets, value rules and obligations (i)–(iii) are frozen by `spec/v1.md` ("Surface field registry" and "Peer wire obligations"); this document adds none. Implementation: `src/noise.rs` and `src/pairing.rs`; acceptance: `tests/runtime_pairing_v1.rs` and the unit tests in both files.
+This document fixes how two agents pair over the peer wire: the Noise transport, the derivation of pairing IDs, how the producer answers Pair claim, Pair status and Grant status, how the owner approves, and how the receiver claims, polls and confirms a grant. Field sets, value rules and obligations (i)–(iii) are frozen by `spec/v1.md` ("Surface field registry" and "Peer wire obligations"); this document adds none. Implementation: `src/noise.rs`, `src/pairing.rs` and `src/listener.rs`; acceptance: `tests/runtime_pairing_v1.rs`, `tests/runtime_listener_v1.rs` and the unit tests in those files.
 
-Not in this slice: the product listener and its bind rules and the handshake concurrency cap (`SA-2B2a3`); the peer report path (`SA-2B2b`); the control command that calls approval, and the disable half of F-7 (`SA-2B2c`). The receiver client returns what it confirmed and stores nothing; its caller stores a confirmed grant in the receiver peer store (`spec/peer-store-v1.md`).
+Not in this slice: the peer report path (`SA-2B2b`); the control command that calls approval, and the disable half of F-7 (`SA-2B2c`). The receiver client returns what it confirmed and stores nothing; its caller stores a confirmed grant in the receiver peer store (`spec/peer-store-v1.md`).
 
 > Grant status is advisory. It releases no byte, and no admission decision may be taken from it: the report path authorizes through `StateStore::authorize` only.
 
@@ -19,11 +19,12 @@ One TCP connection carries one handshake, one request frame and one reply frame 
 | Initiator | The receiver; pins the Pair URL's `responderStatic` as the remote static |
 | Initiator connect | The host is resolved first (`getaddrinfo`); resolution is not bounded by the handshake deadline, because std offers no way to bound it. Each resolved address is then tried in order, all under the one 10 s connect-plus-handshake deadline; each address's connect gets the time left divided by the number of addresses not yet tried, so an unresponsive first address cannot take the whole deadline. Once a TCP connection is up, a handshake failure (the pinned static among its causes) ends the attempt: no other address is tried |
 | Blocking mode | The responder puts an accepted stream in blocking mode before the handshake, whatever it inherited from the listener (this differs by OS), so a deadline loop waits instead of spinning. The initiator's stream comes from `TcpStream::connect_timeout` and is used as returned; a unit test in `src/noise.rs` checks that its handshake read waits rather than spins |
-| Responder identity | The agent identity in `state.json`, read once by the caller before serving; a handshake reads and writes no state |
+| Responder identity | The agent identity in `state.json`, read by the listener from the in-memory state once per accepted connection, before serving it ("Listener"); a handshake reads and writes no state |
 | Message 1 on the wire | `u32be(96) ‖ 96 bytes` (`e` 32, encrypted `s` 48, tag 16; empty payload) |
 | Message 2 on the wire | `u32be(48) ‖ 48 bytes` (`e` 32, tag 16; empty payload) |
 | Wrong length prefix | Connection closed at once: no body byte is read and nothing is written |
 | Non-empty handshake payload | Refused. Under exact framing it cannot arrive (the length leaves room only for the tag), so this check is defense in depth; a unit test feeds a longer message to the read helper directly |
+| Low-order remote static | Refused on both sides. When the handshake completes, each side computes X25519(own static private key, remote static) through `snow`'s resolver; an all-zero result (a low-order, non-contributory key, which every clamped scalar maps to zero) fails the handshake as a crypto error: the connection is closed and no frame is sent. `snow` `0.10.0` does not refuse that output itself. A unit test in `src/noise.rs` covers the check; that both `connect` and `accept` reach it is checked by review, not by a test, since sending a low-order static needs a hand-built handshake message |
 | After the handshake | `hFinal` is the handshake hash; the initiator identity is the Noise remote static, and nothing else |
 
 Every read and write runs against an absolute monotonic deadline. Each system call gets only the time left, so a peer that sends partial bytes cannot extend it.
@@ -35,6 +36,23 @@ Every read and write runs against an absolute monotonic deadline. Each system ca
 | Read the request | — | 10 s |
 | Write the reply | — | 15 s |
 | Read the reply | 15 s | — |
+
+## Listener
+
+`Listener::start(store, ledger, limiter, clock)` is the producer's product TCP listener (`src/listener.rs`).
+
+| Item | Rule |
+|---|---|
+| Address | `bindHost` and `bindPort` from one `store.state()` snapshot, the only source. `bindHost` null: an error, nothing bound |
+| Re-validation before binding | `bindHost` must parse as an IP literal: a hostname (such as `localhost`) or `0x0` is refused. The store accepts `0x0` (its wildcard check applies only to strings that parse as an IP), and the OS resolver would turn it into `0.0.0.0`. Then an unspecified address (`0.0.0.0`, `::`, `::ffff:0.0.0.0`, after `to_canonical`) and a port below 1024 are refused. The listener does not reuse the store's wildcard check |
+| Bind | Only `SocketAddr::new(ip, port)`; a string never reaches `bind`. A failed bind (a port in use among the causes) is an error; no other address or port is tried. `local_addr()` returns the address actually bound |
+| Threads | One accept thread; one thread per connection, which serves it with `Producer::serve` |
+| Concurrency cap | At most 8 connections at once, in the handshake or after it. A connection over the cap is closed without reading a byte. A connection's slot is freed when its thread ends |
+| Identity | Read from `store.state()` once per accepted connection, before serving it; a reset takes effect on the next connection. If the state cannot be read (sticky unknown), the connection is closed |
+| Stop | `stop()` stops accepting, calls `shutdown(Both)` on every in-flight connection through a `try_clone` handle the listener keeps, and joins every thread. It returns within 1 s even with 8 connections stalled in the handshake. Dropping the listener stops it. A connection that cannot be cloned is closed instead of served |
+| Logging | None |
+
+The accept loop polls a non-blocking socket every 50 ms, so `stop` never depends on waking a blocked `accept`.
 
 ## Transport frames and memory
 
@@ -67,8 +85,7 @@ Non-claims:
 - The frozen claim refuses a full record table as `unauthorized`, indistinguishable from the other causes; the receiver never infers why an offer was refused.
 - An offer keeps at most 5 attempt records on the receiver. Only `internal` and a transport failure after the handshake keep a record, one per claim call, so an on-path attacker who resets each connection after the handshake, or a producer that keeps answering `internal`, can fill all five. A full table does not stop the receiver from connecting: a reply that names a kept record or the connection's own pending ID still succeeds. But a connection made with all five in use has no record, so if its successful reply is lost after the producer committed it, every later claim of that offer is answered with that connection's pending ID, matches nothing and ends as a lost attempt; the owner must reject that pending request and create a new offer. This affects availability only.
 - The Pair URL carries the bearer secret. The receiver client takes it only as a string argument, parses it with the frozen `parse_pair_url`, and never formats, logs or returns it, nor the parsed `PairOffer` (whose derived `Debug` prints the secret); it is not stored, and `peers.json` holds no secret.
-- A low-order (small-subgroup) remote static key is not rejected. Binding a pairing to it still needs the Pair URL's bearer secret and the owner's SAS check.
-- The producer's identity is read once by its caller, not per handshake, so a handshake touches no state. Obligation on `SA-2B2a3` and `SA-2B2c`, not enforced or tested here: after a reset, creating offers, serving handshakes and approving must all use the same, current identity. On the receiver side, a stored peer record is usable only while its `initiatorStatic` equals the identity read from `state.json` at the time of use (`spec/peer-store-v1.md`).
+- The listener reads the producer's identity once per accepted connection, before the handshake, so a handshake touches no state and the first connection accepted after a reset uses the new identity. A connection accepted before a reset is served to its end with the identity read when it was accepted. Obligation on `SA-2B2c`, not enforced or tested here: after a reset, creating offers and approving must use the same, current identity. On the receiver side, a stored peer record is usable only while its `initiatorStatic` equals the identity read from `state.json` at the time of use (`spec/peer-store-v1.md`).
 
 ## Producer processing order
 

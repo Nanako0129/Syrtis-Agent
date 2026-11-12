@@ -32,7 +32,13 @@
 # sent before any commit removes the record its own connection created, a
 # transport failure after the handshake ends the call, and a full record
 # table no longer stops the client from connecting).
-decd029ad3b036e22536443602a7664c94d5b92802e40b0f9f2e2791f7a7d159  spec/pairing-v1.md
+#
+# SA-2B2a3 changed spec/pairing-v1.md on purpose: it adds the "Listener"
+# section (bind re-validation, the 8-connection cap, per-connection
+# identity, stop), and the low-order remote static non-claim became a
+# rule: both handshake sides refuse an all-zero X25519 with the remote
+# static.
+bee8e79862328e1606a59b2ef908032990114f253d32c566530832beaeeb2c7f  spec/pairing-v1.md
 1d982b186a00e4ddaaa8b47f6569cd3c68bcc170b17a74044ed3ed515ea5b83f  spec/peer-store-v1.md
 79d1c0363e4576d67827ebfa029fad7e3a5981474f4aafba3bd71e54f1a98172  spec/report-cache-v1.md
 3e0b75e33fd362eab1040254de8f656e3a1bf855e0f3c008915b33e3ec2ee523  spec/security-v1.md

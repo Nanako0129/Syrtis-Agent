@@ -15,9 +15,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
+use snow::{
+    Builder, HandshakeState, TransportState,
+    params::{DHChoice, NoiseParams},
+    resolvers::{CryptoResolver, DefaultResolver},
+};
 
 use crate::{
+    canonical::constant_time_eq,
     secure_fs::StorageError,
     security::{
         FRAME_CIPHERTEXT_MAX, Frame, MemoryLedger, MemoryReservation, NOISE_PROLOGUE, NOISE_SUITE,
@@ -187,7 +192,7 @@ pub fn connect(
     write_handshake(&mut stream, &message1, deadline)?;
     let message2 = read_handshake::<MESSAGE2_LEN>(&mut stream, deadline)?;
     read_handshake_payload(&mut state, &message2)?;
-    finish(stream, state)
+    finish(stream, state, local)
 }
 
 /// Responder: runs IK on an accepted stream within one [`HANDSHAKE_TIMEOUT`].
@@ -209,7 +214,7 @@ pub fn accept(mut stream: TcpStream, local: &StaticKey) -> Result<Session, Noise
         return Err(NoiseError::Crypto);
     }
     write_handshake(&mut stream, &message2, deadline)?;
-    finish(stream, state)
+    finish(stream, state, local)
 }
 
 impl Session {
@@ -310,7 +315,13 @@ pub(crate) fn read_handshake_payload(
     Ok(())
 }
 
-fn finish(stream: TcpStream, state: HandshakeState) -> Result<Session, NoiseError> {
+/// Both `connect` and `accept` end here, so both sides refuse a
+/// non-contributory remote static before any frame is sent.
+fn finish(
+    stream: TcpStream,
+    state: HandshakeState,
+    local: &StaticKey,
+) -> Result<Session, NoiseError> {
     let h_final = state
         .get_handshake_hash()
         .try_into()
@@ -319,6 +330,7 @@ fn finish(stream: TcpStream, state: HandshakeState) -> Result<Session, NoiseErro
         .get_remote_static()
         .and_then(|key| key.try_into().ok())
         .ok_or(NoiseError::Crypto)?;
+    refuse_low_order(local, &remote_static)?;
     let transport = state
         .into_transport_mode()
         .map_err(|_| NoiseError::Crypto)?;
@@ -328,6 +340,24 @@ fn finish(stream: TcpStream, state: HandshakeState) -> Result<Session, NoiseErro
         h_final,
         remote_static,
     })
+}
+
+/// Refuses a remote static whose X25519 with the local private key is all
+/// zero: a low-order (small-subgroup) point, which every clamped scalar
+/// maps to zero. snow 0.10's `Dh25519::dh` returns that zero without an
+/// error, so the handshake alone does not refuse it.
+fn refuse_low_order(local: &StaticKey, remote_static: &[u8; 32]) -> Result<(), NoiseError> {
+    let mut dh = DefaultResolver
+        .resolve_dh(&DHChoice::Curve25519)
+        .ok_or(NoiseError::Unavailable)?;
+    dh.set(local.private.expose());
+    let mut shared = [0; 32];
+    dh.dh(remote_static, &mut shared)
+        .map_err(|_| NoiseError::Crypto)?;
+    if constant_time_eq(&shared, &[0; 32]) {
+        return Err(NoiseError::Crypto);
+    }
+    Ok(())
 }
 
 /// `u32be(N) || message`. A prefix other than `N` closes the connection
@@ -594,6 +624,41 @@ mod tests {
             initiator.get_handshake_hash(),
             responder.get_handshake_hash()
         );
+    }
+
+    /// SA-2B2a3 acceptance (8): low-order remote statics are refused, a
+    /// normal key passes. The first assertion is the reason the check
+    /// exists: snow's own X25519 returns the all-zero output without error.
+    #[test]
+    fn a_low_order_remote_static_is_refused() {
+        let local = StaticKey::generate().unwrap();
+        let mut dh = DefaultResolver.resolve_dh(&DHChoice::Curve25519).unwrap();
+        dh.set(local.private.expose());
+        let mut shared = [0xaa; 32];
+        assert!(dh.dh(&[0; 32], &mut shared).is_ok());
+        assert_eq!(shared, [0; 32], "snow refuses nothing itself");
+
+        let hex = |text: &str| -> [u8; 32] { crate::security::decode_fixed_hex(text).unwrap() };
+        let mut one = [0; 32];
+        one[0] = 1;
+        let low_order = [
+            [0; 32],
+            one,
+            // p - 1 (order 2).
+            hex("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+            // An order-8 point.
+            hex("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"),
+        ];
+        for point in &low_order {
+            assert_eq!(
+                refuse_low_order(&local, point),
+                Err(NoiseError::Crypto),
+                "{point:02x?}"
+            );
+        }
+        // Control: a normal key passes.
+        let normal = StaticKey::generate().unwrap();
+        assert_eq!(refuse_low_order(&local, normal.public()), Ok(()));
     }
 
     #[test]
