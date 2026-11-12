@@ -50,6 +50,13 @@ impl SecureRoot {
         match self.0 {}
     }
 
+    /// Uncallable, as [`Self::private_subdir`]; its only caller
+    /// (`agent.rs`) is `cfg(unix)`.
+    #[allow(dead_code)]
+    pub(crate) fn clear_private_subdir(&self, _: &str) -> Result<(), StorageError> {
+        match self.0 {}
+    }
+
     pub(crate) fn read_file_sized(
         &self,
         _: &str,

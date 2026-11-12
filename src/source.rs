@@ -9,10 +9,10 @@
 #![cfg(unix)]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,7 @@ use tokscale_core::{
 
 use crate::{
     canonical::CanonicalJsonV1,
+    control::{ScanState, ScanStatus},
     report::{
         AgentsRecord, Endpoint, GraphRecord, HourlyRecord, ModelsRecord, ReportRecord,
         ReportRequest, ReportResponse, encode_response,
@@ -53,6 +54,15 @@ struct ApprovedScope {
     generation: u64,
     owner_inputs_sha256: String,
     schema: u64,
+}
+
+/// What [`EngineSource::scope_record`] reports about `source-scope.json`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScopeRecord {
+    /// The `sourceScopeGeneration` the record was approved at.
+    pub generation: u64,
+    /// Its `ownerInputsSha256` equals this source's inputs.
+    pub inputs_match: bool,
 }
 
 /// What the consent binds to: only inputs the owner controls, in an
@@ -135,6 +145,8 @@ pub struct EngineSource {
     owner_inputs_sha256: String,
     /// Serializes `approve`'s read-compare-write.
     approving: Mutex<()>,
+    /// The last scan's outcome, for control `status`.
+    scan: Mutex<ScanStatus>,
 }
 
 impl std::fmt::Debug for EngineSource {
@@ -185,6 +197,7 @@ impl EngineSource {
             settings,
             owner_inputs_sha256,
             approving: Mutex::new(()),
+            scan: Mutex::new(ScanStatus::default()),
         })
     }
 
@@ -231,6 +244,29 @@ impl EngineSource {
         self.root.stage(SCOPE_FILE, &bytes)?.publish()
     }
 
+    /// The approved-scope record, read-only: its generation and whether
+    /// its digest equals this source's inputs. `None` when there is none;
+    /// a record that cannot be read or decoded is that error.
+    pub fn scope_record(&self) -> Result<Option<ScopeRecord>, StorageError> {
+        Ok(self.read_scope()?.map(|scope| ScopeRecord {
+            generation: scope.generation,
+            inputs_match: scope.owner_inputs_sha256 == self.owner_inputs_sha256,
+        }))
+    }
+
+    /// The scan fields of control `status`: when the last successful scan
+    /// finished (Unix seconds, OS clock), whether the last scan succeeded,
+    /// and the clients of the last successful scan, sorted and unique. A
+    /// scan is every `report` call that passed its first deadline check:
+    /// one refused by the scope check, or that fails or ends late, is
+    /// `error`.
+    pub fn scan_status(&self) -> ScanStatus {
+        self.scan
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     fn read_scope(&self) -> Result<Option<ApprovedScope>, StorageError> {
         let Some(bytes) = self.root.read_file(SCOPE_FILE, SCOPE_FILE_MAX_BYTES)? else {
             return Ok(None);
@@ -254,7 +290,8 @@ impl EngineSource {
         )
     }
 
-    fn body(&self, request: &ReportRequest) -> Result<Vec<u8>, SourceError> {
+    /// The body, and the clients of the whole bundle.
+    fn body(&self, request: &ReportRequest) -> Result<(Vec<u8>, BTreeSet<String>), SourceError> {
         let endpoint = Endpoint::try_from(request.endpoint).map_err(|_| SourceError)?;
         if !self.approved(request) {
             return Err(SourceError);
@@ -291,23 +328,60 @@ impl EngineSource {
         let bundle = aggregate_remote_usage_from_source_v1(&context, &query, &pricing)
             .map_err(|_| SourceError)?;
         let saturated = bundle.saturated;
-        match endpoint {
+        let families: BTreeSet<String> = (bundle.graph.iter().map(|r| &r.client))
+            .chain(bundle.models.iter().map(|r| &r.client))
+            .chain(bundle.hourly.iter().map(|r| &r.client))
+            .chain(bundle.agents.iter().map(|r| &r.client))
+            .cloned()
+            .collect();
+        let body = match endpoint {
             Endpoint::Graph => encode(request, bundle.graph.into_iter().map(graph), saturated),
             Endpoint::Models => encode(request, bundle.models.into_iter().map(models), saturated),
             Endpoint::Hourly => encode(request, bundle.hourly.into_iter().map(hourly), saturated),
             Endpoint::Agents => encode(request, bundle.agents.into_iter().map(agents), saturated),
+        }?;
+        Ok((body, families))
+    }
+
+    fn record_scan(&self, families: Option<BTreeSet<String>>) {
+        let mut scan = self.scan.lock().unwrap_or_else(PoisonError::into_inner);
+        match families {
+            Some(families) => {
+                scan.state = ScanState::Ok;
+                scan.last_scan_at = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .and_then(|since| i64::try_from(since.as_secs()).ok());
+                // The frozen bound of `sourceFamilies`.
+                scan.families = families.into_iter().take(128).collect();
+            }
+            None => scan.state = ScanState::Error,
         }
     }
 }
 
 impl ReportSource for EngineSource {
     /// Errors carry no path or engine text: every failure is [`SourceError`].
+    /// A deadline already passed is refused before anything is read.
     fn report(&self, request: &ReportRequest, deadline: Instant) -> Result<Vec<u8>, SourceError> {
-        let body = self.body(request)?;
         if Instant::now() > deadline {
             return Err(SourceError);
         }
-        Ok(body)
+        let result = self.body(request).and_then(|done| {
+            (Instant::now() <= deadline)
+                .then_some(done)
+                .ok_or(SourceError)
+        });
+        match result {
+            Ok((body, families)) => {
+                self.record_scan(Some(families));
+                Ok(body)
+            }
+            Err(error) => {
+                self.record_scan(None);
+                Err(error)
+            }
+        }
     }
 }
 

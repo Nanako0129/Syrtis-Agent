@@ -1,9 +1,11 @@
+pub mod agent;
 pub mod cache;
 pub mod cache_store;
 pub mod canonical;
 pub mod control;
 pub mod install;
 pub mod listener;
+pub mod merge;
 pub mod noise;
 pub mod pairing;
 pub mod peer_store;

@@ -313,6 +313,36 @@ impl SecureRoot {
         Ok(self.path.join(name))
     }
 
+    /// Empties the directory `name` directly below the root, which is
+    /// checked as [`Self::private_subdir`] checks it but never created or
+    /// chmod-ed; absent is success. The directory itself stays. Every entry
+    /// is classified with a no-follow `fstatat` on its parent's descriptor:
+    /// a directory is opened `O_DIRECTORY|O_NOFOLLOW` relative to that
+    /// descriptor, emptied the same way, then removed with `AT_REMOVEDIR`;
+    /// anything else, a symlink included, is `unlinkat`-ed, which removes
+    /// the link and never its target. Nesting deeper than
+    /// [`CLEAR_DEPTH_MAX`] or any failed call is `UnsafeState`; what was
+    /// removed before it stays removed.
+    pub(crate) fn clear_private_subdir(&self, name: &str) -> Result<(), StorageError> {
+        let c_name = file_name(name)?;
+        let dir = match open_dir_at(&self.dir, &c_name) {
+            Ok(dir) => dir,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
+            Err(_) => return Err(StorageError::UnsafeState),
+        };
+        let meta = metadata(&dir)?;
+        guard(meta.is_dir(), 0, StorageError::UnsafeState)?;
+        check_owner(&meta, Object::Root)?;
+        #[cfg(target_os = "macos")]
+        guard(acl::none(&dir), ACL, StorageError::UnsafeState)?;
+        guard(
+            meta.mode() & 0o7777 == 0o700,
+            MODE,
+            StorageError::UnsafeState,
+        )?;
+        clear_dir(&dir, 0)
+    }
+
     /// Reads an agent-owned file under the checks of [`Self::read_file`]
     /// into one buffer of exactly `size + 1` bytes, allocated before the
     /// first read and never grown, so the buffer's capacity is the
@@ -904,6 +934,62 @@ fn acquire_lock(dir: &File) -> Result<File, StorageError> {
     }
 }
 
+/// How many directory levels below the cleared directory
+/// [`SecureRoot::clear_private_subdir`] descends before it gives up.
+const CLEAR_DEPTH_MAX: usize = 32;
+
+/// Removes every entry of `dir` (see [`SecureRoot::clear_private_subdir`]).
+fn clear_dir(dir: &File, depth: usize) -> Result<(), StorageError> {
+    for name in entry_names(dir)? {
+        let stat = stat_at(dir, &name)?;
+        let flag = if (stat.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+            guard(depth < CLEAR_DEPTH_MAX, 0, StorageError::UnsafeState)?;
+            let child = open_dir_at(dir, &name).map_err(|_| StorageError::UnsafeState)?;
+            clear_dir(&child, depth + 1)?;
+            libc::AT_REMOVEDIR
+        } else {
+            0
+        };
+        cvt(unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), flag) })
+            .map_err(|_| StorageError::UnsafeState)?;
+    }
+    Ok(())
+}
+
+/// Every entry name of `dir` except `.` and `..`, read through a fresh
+/// descriptor (`openat(dir, ".")`). Uncapped: the only caller empties a
+/// `0700` directory of the agent's own.
+// ponytail: a same-UID process can make this list as large as it likes;
+// that UID can already delete the whole root (same-UID non-claim).
+fn entry_names(dir: &File) -> Result<Vec<CString>, StorageError> {
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let fd = file_from(unsafe { libc::openat(dir.as_raw_fd(), c".".as_ptr(), flags) })?;
+    let stream = unsafe { libc::fdopendir(fd.as_raw_fd()) };
+    if stream.is_null() {
+        return Err(StorageError::UnsafeState);
+    }
+    // `closedir` now owns the descriptor.
+    std::mem::forget(fd);
+    let mut names = Vec::new();
+    let result = loop {
+        unsafe { *errno_location() = 0 };
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break if io::Error::last_os_error().raw_os_error() == Some(0) {
+                Ok(names)
+            } else {
+                Err(StorageError::UnsafeState)
+            };
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if !matches!(name.to_bytes(), b"." | b"..") {
+            names.push(name.to_owned());
+        }
+    };
+    unsafe { libc::closedir(stream) };
+    result
+}
+
 fn open_dir_at(parent: &File, name: &CStr) -> io::Result<File> {
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | nofollow();
     cvt_file(unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) })
@@ -1167,6 +1253,92 @@ mod tests {
             std::fs::symlink_metadata(&path).unwrap().mode() & 0o7777,
             0o755
         );
+    }
+
+    /// A decoy directory outside the root holding one file.
+    fn decoy(home: &TempHome) -> std::path::PathBuf {
+        let decoy = home.path.join("decoy");
+        std::fs::create_dir_all(decoy.join("inner")).unwrap();
+        std::fs::write(decoy.join("keep"), b"decoy").unwrap();
+        std::fs::write(decoy.join("inner/keep"), b"decoy").unwrap();
+        decoy
+    }
+
+    fn decoy_intact(decoy: &Path) -> bool {
+        std::fs::read(decoy.join("keep")).ok().as_deref() == Some(b"decoy".as_slice())
+            && std::fs::read(decoy.join("inner/keep")).ok().as_deref() == Some(b"decoy".as_slice())
+    }
+
+    /// SA-2C2a acceptance (8b): nested directories are emptied, a symlink
+    /// inside is removed as a link while its target (a decoy directory
+    /// outside the root) keeps every file; the cleared directory itself
+    /// stays, `0700`. Absent is success.
+    #[test]
+    fn clear_private_subdir_empties_nested_dirs_and_unlinks_symlinks_only() {
+        let home = TempHome::new();
+        let root = open(&home).unwrap();
+        assert_eq!(root.clear_private_subdir("source-cache"), Ok(()));
+        let path = root.private_subdir("source-cache").unwrap();
+        let decoy = decoy(&home);
+        std::fs::create_dir_all(path.join("a/b/c")).unwrap();
+        std::fs::write(path.join("a/b/c/session"), b"id").unwrap();
+        std::fs::write(path.join("top"), b"id").unwrap();
+        symlink(&decoy, path.join("link-dir")).unwrap();
+        symlink(decoy.join("keep"), path.join("a/link-file")).unwrap();
+
+        root.clear_private_subdir("source-cache").unwrap();
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.is_dir());
+        assert_eq!(meta.mode() & 0o7777, 0o700);
+        assert!(decoy_intact(&decoy));
+    }
+
+    /// SA-2C2a acceptance (8b), negative control: with the no-follow
+    /// guard bypassed the same layout follows the link into the decoy, so
+    /// that guard is what keeps the decoy intact.
+    #[test]
+    fn clear_private_subdir_follows_a_symlink_only_without_nofollow() {
+        let _reset = Reset;
+        let home = TempHome::new();
+        let root = open(&home).unwrap();
+        let path = root.private_subdir("source-cache").unwrap();
+        let decoy = decoy(&home);
+        symlink(&decoy, path.join("link-dir")).unwrap();
+        seams::bypass(seams::NOFOLLOW);
+        let _ = root.clear_private_subdir("source-cache");
+        seams::bypass(0);
+        assert!(!decoy_intact(&decoy));
+    }
+
+    /// SA-2C2a acceptance (8b): `source-cache` itself a symlink to a decoy
+    /// is refused, the link and the decoy untouched; so is one that is not
+    /// exactly `0700`.
+    #[test]
+    fn clear_private_subdir_refuses_a_symlinked_or_loose_directory() {
+        let home = TempHome::new();
+        let root = open(&home).unwrap();
+        let decoy = decoy(&home);
+        let link = home.root().join("source-cache");
+        symlink(&decoy, &link).unwrap();
+        assert_eq!(
+            root.clear_private_subdir("source-cache"),
+            Err(StorageError::UnsafeState)
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(decoy_intact(&decoy));
+
+        let path = root.private_subdir("pricing").unwrap();
+        std::fs::write(path.join("keep"), b"x").unwrap();
+        chmod(&path, 0o755);
+        fails_closed_only_by(MODE, StorageError::UnsafeState, || {
+            root.clear_private_subdir("pricing")
+        });
     }
 
     #[test]
