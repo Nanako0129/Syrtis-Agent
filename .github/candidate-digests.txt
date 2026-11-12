@@ -62,8 +62,18 @@
 # control.sock admission rules and pathname exception, the handshake
 # framing over the frozen control MACs, deadlines, the nine commands, the
 # client). No existing line changed.
-e39b19cca9d5c24ea9e8a296c241f1f14dc1934e52dc4d0a5645639a959bb19a  spec/control-v1.md
-7fcd1eefd06566e9de262fa2645f289025cac7e52a0b050fa12c7533d12281ea  spec/pairing-v1.md
+#
+# SA-2B2c2 adds spec/runtime-v1.md, the runtime contract (assembly, the
+# listener slot, stop order, the shutdown hook, the F-7 disable
+# composition and the enable gate, the housekeeping schedule).
+# spec/control-v1.md changed on purpose: listenConfigure calls the
+# runtime's listen hook before its reply, the shutdown hook's effect is
+# the runtime's, and status and pendingList leave out offers and pending
+# records past expiresAt. spec/pairing-v1.md changed on purpose: the F-7
+# disable-half non-claim now points at the runtime's entry points.
+cb6f2e04a7968c74612fac18fcb9ed0e9e5b1a6d6ce746830463165e77f64e40  spec/control-v1.md
+6ba187336666045a8766cf1a03bad7b17a4133c3b6eb72270fc58f6588d5beff  spec/pairing-v1.md
+d1f92bed88a39a8e320f9cb6bc84ca5d51817b16287a649620593c86dd09ab7d  spec/runtime-v1.md
 686951d4a0d463d5a29d5d3e9d2be97198211cba3ab81202da66643c1c79e6bc  spec/report-peer-v1.md
 3cce5944bf106ca5e5503505f3b4150f192eead0db3f9b1a3fdaf3617ae1c59b  spec/peer-store-v1.md
 79d1c0363e4576d67827ebfa029fad7e3a5981474f4aafba3bd71e54f1a98172  spec/report-cache-v1.md
