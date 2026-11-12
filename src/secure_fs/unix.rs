@@ -283,6 +283,36 @@ impl SecureRoot {
         }
     }
 
+    /// Opens the directory `name` directly below the root, creating it `0700`
+    /// when missing, and returns its path. Checked like the root itself:
+    /// opened no-follow relative to the root's descriptor, a directory, owned
+    /// by the effective UID, exactly `0700`, no extended ACL (macOS). An
+    /// existing directory is checked as found, never chmod-ed. `name` follows
+    /// the agent file-name rule. The returned path is for an API that takes a
+    /// path (the engine's source cache and pricing roots); whoever opens it
+    /// later resolves it again (`spec/source-v1.md`, non-claims).
+    // ponytail: no parent sync after mkdir; the directories hold re-creatable caches.
+    pub(crate) fn private_subdir(&self, name: &str) -> Result<PathBuf, StorageError> {
+        let c_name = file_name(name)?;
+        let (dir, created) = open_or_create_dir(&self.dir, &c_name)?;
+        if created {
+            set_exact_mode(&dir, 0o700).map_err(|_| StorageError::UnsafeState)?;
+            #[cfg(target_os = "macos")]
+            clear_acl(&dir).map_err(|_| StorageError::UnsafeState)?;
+        }
+        let meta = metadata(&dir)?;
+        guard(meta.is_dir(), 0, StorageError::UnsafeState)?;
+        check_owner(&meta, Object::Root)?;
+        #[cfg(target_os = "macos")]
+        guard(acl::none(&dir), ACL, StorageError::UnsafeState)?;
+        guard(
+            meta.mode() & 0o7777 == 0o700,
+            MODE,
+            StorageError::UnsafeState,
+        )?;
+        Ok(self.path.join(name))
+    }
+
     #[cfg(test)]
     pub(crate) fn dir_metadata(&self) -> Metadata {
         self.dir.metadata().unwrap()
@@ -897,6 +927,61 @@ mod tests {
     }
 
     #[test]
+    fn a_private_subdir_is_created_0700_and_reopened_as_found() {
+        let home = TempHome::new();
+        let root = open(&home).unwrap();
+        let path = root.private_subdir("source-cache").unwrap();
+        assert_eq!(path, home.root().join("source-cache"));
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.is_dir());
+        assert_eq!(meta.mode() & 0o7777, 0o700);
+        assert_eq!(root.private_subdir("source-cache").unwrap(), path);
+        for name in ["", ".hidden", "a/b", "Upper"] {
+            assert_eq!(
+                root.private_subdir(name),
+                Err(StorageError::UnsafeState),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_symlinked_private_subdir_fails_closed() {
+        let home = TempHome::new();
+        let root = open(&home).unwrap();
+        let decoy = home.path.join("decoy");
+        std::fs::create_dir(&decoy).unwrap();
+        chmod(&decoy, 0o700);
+        symlink(&decoy, home.root().join("pricing")).unwrap();
+        fails_closed_only_by(seams::NOFOLLOW, StorageError::UnsafeState, || {
+            root.private_subdir("pricing")
+        });
+        // The link was not followed into, replaced or removed.
+        assert!(
+            std::fs::symlink_metadata(home.root().join("pricing"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn a_private_subdir_that_is_not_exactly_0700_fails_closed() {
+        let home = TempHome::new();
+        let root = open(&home).unwrap();
+        let path = root.private_subdir("pricing").unwrap();
+        chmod(&path, 0o755);
+        fails_closed_only_by(MODE, StorageError::UnsafeState, || {
+            root.private_subdir("pricing")
+        });
+        // Checked as found: the mode was not repaired.
+        assert_eq!(
+            std::fs::symlink_metadata(&path).unwrap().mode() & 0o7777,
+            0o755
+        );
+    }
+
+    #[test]
     fn a_symlinked_state_file_fails_closed() {
         let home = TempHome::new();
         let root = open(&home).unwrap();
@@ -1147,6 +1232,7 @@ mod tests {
         }
         let result = SecureRoot::open_under(Path::new(&home), SUFFIX).and_then(|root| {
             root.stage("state.json", b"{}")?.publish()?;
+            root.private_subdir("pricing")?;
             root.read_file("state.json", 64).map(|_| ())
         });
         println!("UMASK:{result:?}");
@@ -1221,6 +1307,8 @@ mod tests {
                     let meta = std::fs::symlink_metadata(home.root().join(file)).unwrap();
                     assert_eq!(meta.mode() & 0o7777, 0o600, "{file}");
                 }
+                let pricing = std::fs::symlink_metadata(home.root().join("pricing")).unwrap();
+                assert_eq!(pricing.mode() & 0o7777, 0o700, "private_subdir");
             } else {
                 // Where it failed: `Library` was created but left at the
                 // umask-filtered `0500`. When directory permissions are

@@ -41,6 +41,14 @@ impl SecureRoot {
     pub(crate) fn remove_stale_temp(&self, _: &str) -> Result<(), StorageError> {
         match self.0 {}
     }
+
+    /// Uncallable: no `SecureRoot` value can exist here, so every path to a
+    /// subdirectory already failed with `UnsafeState` at open. Its only
+    /// caller (`source.rs`) is `cfg(unix)`, hence the allow.
+    #[allow(dead_code)]
+    pub(crate) fn private_subdir(&self, _: &str) -> Result<PathBuf, StorageError> {
+        match self.0 {}
+    }
 }
 
 impl Staged<'_> {
