@@ -211,6 +211,12 @@ impl EngineSource {
         &self.pricing_dir
     }
 
+    /// The `ownerInputsSha256` of the inputs this source was built with:
+    /// the digest control `scopeApprove` must name (`SA-2C2b`).
+    pub fn owner_inputs_sha256(&self) -> &str {
+        &self.owner_inputs_sha256
+    }
+
     /// Owner action: records this source's inputs as approved at the
     /// store's current `sourceScopeGeneration`. When an approved record for
     /// *different* inputs exists, the generation must have advanced past it

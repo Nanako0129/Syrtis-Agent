@@ -2,6 +2,7 @@ pub mod agent;
 pub mod cache;
 pub mod cache_store;
 pub mod canonical;
+pub mod cli;
 pub mod control;
 pub mod install;
 pub mod listener;

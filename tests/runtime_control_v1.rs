@@ -32,19 +32,20 @@ mod disk {
     use syrtis_agent::{
         canonical::CanonicalJsonV1,
         control::{
-            APPROVE, Client, Command, ControlError, INTERNAL, INVALID, LISTEN_CONFIGURE,
-            OFFER_CANCEL, OFFER_CREATE, OK, PENDING_LIST, PRE_AUTH_CONNECTIONS, REJECT, REVOKE,
-            Response, SCOPE_APPROVE, SHARING_SET, SHUTDOWN, SOCKET_NAME, STATUS, ScanStatus,
-            Server, UNAUTHORIZED,
+            APPROVE, BUSY, Client, Command, ControlError, Hooks, INTERNAL, INVALID,
+            LISTEN_CONFIGURE, OFFER_CANCEL, OFFER_CREATE, OK, PENDING_LIST, PRE_AUTH_CONNECTIONS,
+            REJECT, REVOKE, Response, SCOPE_APPROVE, SHARING_SET, SHUTDOWN, SOCKET_NAME, STATUS,
+            ScanStatus, Server, UNAUTHORIZED,
         },
         listener::Listener,
         pairing::{ClaimAttempts, Clock, PairingClient, RateLimiter},
         report_peer::{NoSource, Reports},
+        runtime::{Options, Runtime, RuntimeError},
         secure_fs::{SecureRoot, StorageError},
         security::{
-            MemoryLedger, Offer, OfferClaim, OfferState, control_command_mac, control_key,
-            control_response_mac, control_server_mac, decode_fixed_hex, hex_encode,
-            offer_secret_hash, parse_pair_url,
+            MemoryLedger, Offer, OfferClaim, OfferState, Terminal, TerminalKind,
+            control_command_mac, control_key, control_response_mac, control_server_mac,
+            decode_fixed_hex, hex_encode, offer_secret_hash, parse_pair_url,
         },
         state_store::{Secret32, StateStore, encode_state},
     };
@@ -130,11 +131,24 @@ mod disk {
         store: Arc<StateStore>,
         clock: Arc<TestClock>,
         shutdowns: Arc<AtomicUsize>,
+        /// What the `sharingSet` and `scopeApprove` hooks were called with
+        /// (`with_effect_hooks` only).
+        effects: Arc<Mutex<Vec<String>>>,
         home: TempHome,
     }
 
     impl Node {
+        /// `Server::start`: no `sharingSet` or `scopeApprove` hook.
         fn new(sharing: bool) -> Self {
+            Self::build(sharing, false)
+        }
+
+        /// Recording `sharingSet` and `scopeApprove` hooks that succeed.
+        fn with_effect_hooks() -> Self {
+            Self::build(true, true)
+        }
+
+        fn build(sharing: bool, effect_hooks: bool) -> Self {
             let home = TempHome::new();
             let store = open_store(&home);
             if sharing {
@@ -143,19 +157,44 @@ mod disk {
             let clock = Arc::new(TestClock::default());
             let shutdowns = Arc::new(AtomicUsize::new(0));
             let counter = Arc::clone(&shutdowns);
-            let server = Server::start(
-                Arc::clone(&store),
-                Arc::clone(&clock) as Arc<dyn Clock>,
-                Arc::new(move || {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                }),
-            )
+            let on_shutdown = Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            });
+            let effects = Arc::new(Mutex::new(Vec::new()));
+            let server = if effect_hooks {
+                let (sharing, scope) = (Arc::clone(&effects), Arc::clone(&effects));
+                Server::start_with_all_hooks(
+                    Arc::clone(&store),
+                    Arc::clone(&clock) as Arc<dyn Clock>,
+                    Hooks {
+                        on_shutdown,
+                        on_listen_configured: Arc::new(|| {}),
+                        scan: Arc::new(ScanStatus::default),
+                        scope: Arc::new(|_: &StateStore| false),
+                        sharing: Some(Arc::new(move |enabled| {
+                            sharing.lock().unwrap().push(format!("sharing {enabled}"));
+                            Ok(())
+                        })),
+                        scope_approve: Some(Arc::new(move |_: &StateStore, digest: &str| {
+                            scope.lock().unwrap().push(format!("scope {digest}"));
+                            Ok(())
+                        })),
+                    },
+                )
+            } else {
+                Server::start(
+                    Arc::clone(&store),
+                    Arc::clone(&clock) as Arc<dyn Clock>,
+                    on_shutdown,
+                )
+            }
             .unwrap();
             Self {
                 server,
                 store,
                 clock,
                 shutdowns,
+                effects,
                 home,
             }
         }
@@ -613,6 +652,31 @@ mod disk {
         }
     }
 
+    /// SA-2C2b review: once the whole command was written, a missing reply
+    /// is `NoReply` (the command may have run), not `Socket`; a server that
+    /// is not there at all is `Socket` (nothing sent).
+    #[test]
+    fn a_reply_missing_after_the_command_was_sent_is_no_reply() {
+        let home = TempHome::new();
+        let token = [0x45; 32];
+        let command = Command {
+            id: REVOKE,
+            body: json!({ "grantId": hex_encode(&[1; 16]) }),
+        };
+        let path = home.0.join("gone.sock");
+        let received = rogue(path.clone(), Some(token), Some(|_, _, _, _| Vec::new()));
+        let result = Client::new(Secret32::new(token), path).call(&command);
+        let count = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(count > 0, "the command did not reach the endpoint");
+        assert_eq!(result, Err(ControlError::NoReply));
+
+        let absent = home.0.join("absent.sock");
+        assert_eq!(
+            Client::new(Secret32::new(token), absent).call(&command),
+            Err(ControlError::Socket)
+        );
+    }
+
     /// Acceptance (3): the client bytes of a complete exchange, replayed on
     /// a new connection, fail the command MAC (fresh server nonce): no
     /// response, state unchanged.
@@ -643,12 +707,15 @@ mod disk {
         assert_eq!(node.state_bytes(), before);
     }
 
-    /// Acceptance (4): each of the nine commands succeeds once, and each
+    /// Acceptance (4): each of the eleven commands succeeds once, and each
     /// gets `invalid` for a body the frozen validator refuses, with the
-    /// state unchanged and no shutdown signalled.
+    /// state unchanged, no shutdown signalled and no hook called. Commands
+    /// 10 and 11 reach their hooks with the body's value (their effects:
+    /// `sharing_set_runs_the_runtime_gate_and_maps_its_errors` here and
+    /// `tests/agent_v1.rs`).
     #[test]
     fn each_command_succeeds_and_each_validator_refusal_is_invalid() {
-        let node = Node::new(true);
+        let node = Node::with_effect_hooks();
         let refusals = [
             (STATUS, json!({"extra": 1})),
             (OFFER_CREATE, json!({"ttlSeconds": 901})),
@@ -662,6 +729,8 @@ mod disk {
                 json!({"bindHost": LOOPBACK, "bindPort": 80}),
             ),
             (SHUTDOWN, json!({"now": true})),
+            (SHARING_SET, json!({"enabled": 1})),
+            (SCOPE_APPROVE, json!({"ownerInputsSha256": "AB".repeat(32)})),
         ];
         let before = node.state_bytes();
         for (id, body) in refusals {
@@ -671,8 +740,22 @@ mod disk {
         }
         assert_eq!(node.state_bytes(), before);
         assert_eq!(node.shutdowns.load(Ordering::SeqCst), 0);
+        assert!(node.effects.lock().unwrap().is_empty());
 
         assert_eq!(node.call(STATUS, json!({})).code, OK);
+        let digest = "0123456789abcdef".repeat(4);
+        for (id, body) in [
+            (SHARING_SET, json!({"enabled": false})),
+            (SHARING_SET, json!({"enabled": true})),
+            (SCOPE_APPROVE, json!({ "ownerInputsSha256": digest })),
+        ] {
+            let response = node.call(id, body);
+            assert_eq!((response.code, response.data), (OK, Value::Null));
+        }
+        assert_eq!(
+            *node.effects.lock().unwrap(),
+            ["sharing false", "sharing true", &format!("scope {digest}")]
+        );
         node.configure(free_port());
         let (cancelled, _) = node.offer();
         let cancel = node.call(OFFER_CANCEL, json!({"offerId": hex_encode(&cancelled)}));
@@ -709,11 +792,11 @@ mod disk {
         assert_eq!(node.shutdowns.load(Ordering::SeqCst), 1);
     }
 
-    /// SA-0G acceptance (d): `sharingSet` and `scopeApprove` with bodies the
-    /// frozen validator accepts are answered `internal` with `null` data and
-    /// write nothing; a refused body is still `invalid`.
+    /// A server started without the `sharingSet` and `scopeApprove` hooks
+    /// (`Server::start`, as SA-0G left it) answers `internal` with `null`
+    /// data and writes nothing; a refused body is still `invalid`.
     #[test]
-    fn sharing_set_and_scope_approve_are_internal_and_change_nothing() {
+    fn without_hooks_sharing_set_and_scope_approve_are_internal_and_change_nothing() {
         for sharing in [false, true] {
             let node = Node::new(sharing);
             let before = node.state_bytes();
@@ -743,6 +826,110 @@ mod disk {
         }
     }
 
+    /// SA-2C2b acceptance (2): `sharingSet` on a runtime runs the
+    /// runtime's own entry points. Off twice while off: `ok` both times,
+    /// nothing written. On: `ok`; on again: `invalid` (the frozen
+    /// `Conflict`), nothing written. Off with a full record table leaves
+    /// an offer that can still be claimed; on is then the gate's `busy`,
+    /// nothing written. A runtime without a scope approval hook answers
+    /// `scopeApprove` with `internal`.
+    #[test]
+    fn sharing_set_runs_the_runtime_gate_and_maps_its_errors() {
+        let home = TempHome::new();
+        let clock = Arc::new(TestClock::default());
+        let options = Options {
+            clock: Arc::clone(&clock) as Arc<dyn Clock>,
+            housekeeping_period: Duration::from_secs(60),
+        };
+        let runtime = retry_busy(|| {
+            Runtime::start(
+                SecureRoot::open_under(&home.0, SUFFIX)?,
+                Arc::new(NoSource),
+                options.clone(),
+            )
+            .map_err(|error| match error {
+                RuntimeError::Store(error) => error,
+                _ => StorageError::Unknown,
+            })
+        })
+        .unwrap();
+        let store = runtime.store();
+        let token = *store.state().unwrap().control_token.expose();
+        let call = |id: u16, body: Value| {
+            Client::new(Secret32::new(token), runtime.socket_path().to_path_buf())
+                .call(&Command { id, body })
+                .unwrap()
+        };
+        let bytes = || encode_state(&store.state().unwrap()).unwrap();
+        let sharing = |enabled: bool| call(SHARING_SET, json!({ "enabled": enabled }));
+
+        let before = bytes();
+        for _ in 0..2 {
+            assert_eq!(sharing(false).code, OK);
+            assert_eq!(bytes(), before, "a disable with nothing to end wrote");
+        }
+        assert_eq!(sharing(true).code, OK);
+        assert!(store.state().unwrap().reference.sharing_enabled);
+        let on = bytes();
+        let again = sharing(true);
+        assert_eq!((again.code, again.data), (INVALID, Value::Null));
+        assert_eq!(bytes(), on);
+
+        let port = free_port();
+        let configured = call(
+            LISTEN_CONFIGURE,
+            json!({"bindHost": LOOPBACK, "bindPort": port}),
+        );
+        assert_eq!(configured.code, OK);
+        let offer = call(OFFER_CREATE, json!({"ttlSeconds": 600}));
+        assert_eq!(offer.code, OK);
+        let offer_id: [u8; 16] = decode_fixed_hex(offer.data["offerId"].as_str().unwrap()).unwrap();
+        // A full record table: the disable cannot cancel the offer.
+        store
+            .transition(|state| {
+                let mut next = state.clone();
+                let used = next.offers.len()
+                    + next.pending.len()
+                    + next.grants.len()
+                    + next.terminal.len();
+                for n in 0..(256 - used) {
+                    let mut record_id = [0xee; 16];
+                    record_id[..8].copy_from_slice(&(n as u64).to_be_bytes());
+                    next.terminal.push(Terminal {
+                        record_id,
+                        kind: TerminalKind::Offer,
+                        auth_epoch: 0,
+                        terminal_at_ms: NOW_MS,
+                        cleanup_complete: true,
+                    });
+                }
+                Ok(next)
+            })
+            .unwrap();
+        assert_eq!(sharing(false).code, OK);
+        let state = store.state().unwrap().reference;
+        assert!(!state.sharing_enabled);
+        assert!(
+            state
+                .offers
+                .iter()
+                .any(|offer| offer.offer_id == offer_id && offer.state == OfferState::Active)
+        );
+        let gated = bytes();
+        let busy = sharing(true);
+        assert_eq!((busy.code, busy.data), (BUSY, Value::Null));
+        assert_eq!(bytes(), gated, "a gated enable wrote");
+        assert!(!store.state().unwrap().reference.sharing_enabled);
+
+        let scope = call(
+            SCOPE_APPROVE,
+            json!({"ownerInputsSha256": "0123456789abcdef".repeat(4)}),
+        );
+        assert_eq!(scope.code, INTERNAL);
+        assert_eq!(call(STATUS, json!({})).data["scopeApproved"], false);
+        drop(clock);
+    }
+
     /// SA-0G acceptance (d): `status` carries `scopeApproved`, `false`
     /// without a provider and the provider's answer with one. Each reply
     /// passed the frozen `verify_control_response` inside `call`.
@@ -762,7 +949,7 @@ mod disk {
                 Arc::new(|| {}),
                 Arc::new(|| {}),
                 Arc::new(ScanStatus::default),
-                Arc::new(move || approved),
+                Arc::new(move |_: &StateStore| approved),
             )
             .unwrap();
             let token = *store.state().unwrap().control_token.expose();
@@ -987,6 +1174,7 @@ mod disk {
             ControlError::PathTooLong,
             ControlError::UnsafeSocket,
             ControlError::Socket,
+            ControlError::NoReply,
             ControlError::Unavailable,
             ControlError::Command,
             ControlError::ServerProof,

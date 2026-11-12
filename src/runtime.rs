@@ -24,7 +24,7 @@ use std::{
 use crate::{
     cache::{CACHE_RETENTION_MILLIS, CacheKey, CacheRole},
     cache_store::{CacheStore, CachedBody},
-    control::{self, ControlError, ScanHook, ScanStatus},
+    control::{self, ControlError, ScanHook, ScanStatus, ScopeApproveHook, ScopeHook},
     listener::{Listener, bind_address},
     pairing::{Clock, RateLimiter, SystemClock},
     peer_store::{PeerRecord, PeerState, PeerStore, usable},
@@ -86,6 +86,13 @@ pub enum PullError {
     NoPeer,
     /// `report_peer::fetch` failed (`Unusable` included: nothing was sent).
     Fetch(FetchError),
+}
+
+/// The control hooks a runtime is started with besides its own.
+struct Scope {
+    scan: ScanHook,
+    scope: ScopeHook,
+    scope_approve: Option<ScopeApproveHook>,
 }
 
 /// The listener slot. One mutex guards both fields, so a `listenConfigure`
@@ -167,10 +174,29 @@ impl Runtime {
         scan: ScanHook,
         options: Options,
     ) -> Result<Self, RuntimeError> {
+        Self::start_with_scope(root, make_source, scan, Arc::new(|_| false), None, options)
+    }
+
+    /// [`start_with`](Self::start_with), plus the scope hooks of control
+    /// (`SA-2C2b`): `scope` supplies `scopeApproved` of `status`, and
+    /// `scope_approve` runs `scopeApprove` (`None`: that command is
+    /// `internal`). `Agent::start` passes both for its `EngineSource`.
+    pub fn start_with_scope(
+        root: SecureRoot,
+        make_source: impl FnOnce(Arc<SecureRoot>) -> Result<Arc<dyn ReportSource>, StorageError>,
+        scan: ScanHook,
+        scope: ScopeHook,
+        scope_approve: Option<ScopeApproveHook>,
+        options: Options,
+    ) -> Result<Self, RuntimeError> {
         Self::start_inner(
             root,
             make_source,
-            scan,
+            Scope {
+                scan,
+                scope,
+                scope_approve,
+            },
             options,
             #[cfg(test)]
             None,
@@ -180,7 +206,7 @@ impl Runtime {
     fn start_inner(
         root: SecureRoot,
         make_source: impl FnOnce(Arc<SecureRoot>) -> Result<Arc<dyn ReportSource>, StorageError>,
-        scan: ScanHook,
+        hooks: Scope,
         options: Options,
         #[cfg(test)] before_restart: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<Self, RuntimeError> {
@@ -212,13 +238,27 @@ impl Runtime {
             #[cfg(test)]
             before_restart,
         });
-        let (on_shutdown, on_listen) = (Arc::clone(&inner), Arc::clone(&inner));
-        let server = control::Server::start_with_hooks(
+        let (on_shutdown, on_listen, on_sharing) =
+            (Arc::clone(&inner), Arc::clone(&inner), Arc::clone(&inner));
+        let server = control::Server::start_with_all_hooks(
             store,
             Arc::clone(&inner.clock),
-            Arc::new(move || request_shutdown(&on_shutdown)),
-            Arc::new(move || restart_listener(&on_listen)),
-            scan,
+            control::Hooks {
+                on_shutdown: Arc::new(move || request_shutdown(&on_shutdown)),
+                on_listen_configured: Arc::new(move || restart_listener(&on_listen)),
+                scan: hooks.scan,
+                scope: hooks.scope,
+                // The same bodies as the two entry points, so the enable
+                // gate holds for the command too.
+                sharing: Some(Arc::new(move |enabled| {
+                    if enabled {
+                        enable_sharing(&on_sharing)
+                    } else {
+                        disable_sharing(&on_sharing)
+                    }
+                })),
+                scope_approve: hooks.scope_approve,
+            },
         )
         .map_err(RuntimeError::Control)?;
         let runtime = Self {
@@ -269,47 +309,7 @@ impl Runtime {
     /// count; [`enable_sharing`](Self::enable_sharing) refuses while such
     /// an offer can still be claimed.
     pub fn disable_sharing(&self) -> Result<(), StorageError> {
-        let record_id = random()?;
-        let os_now = self.inner.clock.os_now_seconds().ok();
-        let mut nothing_to_do = false;
-        let result = self.inner.store.transition(|state| {
-            // Already off with nothing left to end: write nothing. Every
-            // disable adds a terminal record, so a caller that disables on
-            // each launch would otherwise fill the record table.
-            if !state.sharing_enabled
-                && state
-                    .pending
-                    .iter()
-                    .all(|pending| pending.state != PendingState::AwaitingApproval)
-                && state
-                    .offers
-                    .iter()
-                    .all(|offer| offer.state != OfferState::Active)
-                && state
-                    .grants
-                    .iter()
-                    .all(|grant| grant.state != GrantState::Active)
-            {
-                nothing_to_do = true;
-                return Err(SecurityError::Conflict);
-            }
-            let at = record_ms(state, os_now)?;
-            let mut next = state.disable_commit(record_id, at)?;
-            let awaiting: Vec<_> = next
-                .pending
-                .iter()
-                .filter(|pending| pending.state == PendingState::AwaitingApproval)
-                .map(|pending| (pending.pending_id, pending.sas_generation))
-                .collect();
-            for (pending_id, generation) in awaiting {
-                next = next.reject_pending(pending_id, generation, at)?;
-            }
-            cancel_active_offers(next, at)
-        });
-        if nothing_to_do {
-            return Ok(());
-        }
-        result
+        disable_sharing(&self.inner)
     }
 
     /// The enable gate, one transition: when sharing is already on, the
@@ -324,48 +324,7 @@ impl Runtime {
     /// below the wall, so an offer that passes the gate can never be
     /// claimed, and only a reset lowers the wall, which removes every offer.
     pub fn enable_sharing(&self) -> Result<(), StorageError> {
-        let os_now = self.inner.clock.os_now_seconds().ok();
-        let mut gated = false;
-        let result = self.inner.store.transition(|state| {
-            // Already on: the frozen refusal, before anything below could
-            // touch a pending or an offer that is in use.
-            if state.sharing_enabled {
-                return state.enable_sharing();
-            }
-            let at = record_ms(state, os_now)?;
-            // Sharing is off, and a claim is refused while it is off, so a
-            // pending still awaiting here predates the last disable or
-            // uninstall (an uninstall rejects none). It must not become
-            // approvable again.
-            let mut next = state.clone();
-            let awaiting: Vec<_> = next
-                .pending
-                .iter()
-                .filter(|pending| pending.state == PendingState::AwaitingApproval)
-                .map(|pending| (pending.pending_id, pending.sas_generation))
-                .collect();
-            for (pending_id, generation) in awaiting {
-                next = next.reject_pending(pending_id, generation, at)?;
-            }
-            let next = cancel_active_offers(next, at)?;
-            let wall_ms = next
-                .last_accepted_wall_unix_seconds()
-                .checked_mul(1_000)
-                .ok_or(SecurityError::Bounds)?;
-            if next
-                .offers
-                .iter()
-                .any(|offer| offer.state == OfferState::Active && offer.expires_at_ms > wall_ms)
-            {
-                gated = true;
-                return Err(SecurityError::Conflict);
-            }
-            next.enable_sharing()
-        });
-        if gated {
-            return Err(StorageError::Busy);
-        }
-        result
+        enable_sharing(&self.inner)
     }
 
     /// Asks the producer `responder_static` for one report with
@@ -509,6 +468,99 @@ impl Drop for Runtime {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// The body of [`Runtime::disable_sharing`], shared with the control
+/// `sharingSet` hook (`SA-2C2b`).
+fn disable_sharing(inner: &Inner) -> Result<(), StorageError> {
+    let record_id = random()?;
+    let os_now = inner.clock.os_now_seconds().ok();
+    let mut nothing_to_do = false;
+    let result = inner.store.transition(|state| {
+        // Already off with nothing left to end: write nothing. Every
+        // disable adds a terminal record, so a caller that disables on
+        // each launch would otherwise fill the record table.
+        if !state.sharing_enabled
+            && state
+                .pending
+                .iter()
+                .all(|pending| pending.state != PendingState::AwaitingApproval)
+            && state
+                .offers
+                .iter()
+                .all(|offer| offer.state != OfferState::Active)
+            && state
+                .grants
+                .iter()
+                .all(|grant| grant.state != GrantState::Active)
+        {
+            nothing_to_do = true;
+            return Err(SecurityError::Conflict);
+        }
+        let at = record_ms(state, os_now)?;
+        let mut next = state.disable_commit(record_id, at)?;
+        let awaiting: Vec<_> = next
+            .pending
+            .iter()
+            .filter(|pending| pending.state == PendingState::AwaitingApproval)
+            .map(|pending| (pending.pending_id, pending.sas_generation))
+            .collect();
+        for (pending_id, generation) in awaiting {
+            next = next.reject_pending(pending_id, generation, at)?;
+        }
+        cancel_active_offers(next, at)
+    });
+    if nothing_to_do {
+        return Ok(());
+    }
+    result
+}
+
+/// The body of [`Runtime::enable_sharing`] (the enable gate), shared with
+/// the control `sharingSet` hook (`SA-2C2b`).
+fn enable_sharing(inner: &Inner) -> Result<(), StorageError> {
+    let os_now = inner.clock.os_now_seconds().ok();
+    let mut gated = false;
+    let result = inner.store.transition(|state| {
+        // Already on: the frozen refusal, before anything below could
+        // touch a pending or an offer that is in use.
+        if state.sharing_enabled {
+            return state.enable_sharing();
+        }
+        let at = record_ms(state, os_now)?;
+        // Sharing is off, and a claim is refused while it is off, so a
+        // pending still awaiting here predates the last disable or
+        // uninstall (an uninstall rejects none). It must not become
+        // approvable again.
+        let mut next = state.clone();
+        let awaiting: Vec<_> = next
+            .pending
+            .iter()
+            .filter(|pending| pending.state == PendingState::AwaitingApproval)
+            .map(|pending| (pending.pending_id, pending.sas_generation))
+            .collect();
+        for (pending_id, generation) in awaiting {
+            next = next.reject_pending(pending_id, generation, at)?;
+        }
+        let next = cancel_active_offers(next, at)?;
+        let wall_ms = next
+            .last_accepted_wall_unix_seconds()
+            .checked_mul(1_000)
+            .ok_or(SecurityError::Bounds)?;
+        if next
+            .offers
+            .iter()
+            .any(|offer| offer.state == OfferState::Active && offer.expires_at_ms > wall_ms)
+        {
+            gated = true;
+            return Err(SecurityError::Conflict);
+        }
+        next.enable_sharing()
+    });
+    if gated {
+        return Err(StorageError::Busy);
+    }
+    result
 }
 
 /// The control `shutdown` hook: a flag and a wake-up only. Stopping the
@@ -823,7 +875,11 @@ mod tests {
             Runtime::start_inner(
                 root,
                 |_| Ok(Arc::new(NoSource)),
-                Arc::new(ScanStatus::default),
+                Scope {
+                    scan: Arc::new(ScanStatus::default),
+                    scope: Arc::new(|_| false),
+                    scope_approve: None,
+                },
                 Options::default(),
                 Some(gate),
             )

@@ -4,7 +4,7 @@
 
 This document fixes the agent runtime: what `Runtime::start` assembles, the order `stop()` takes it down in, how the peer listener follows `listenConfigure`, what the control `shutdown` command does, the two sharing entry points (the F-7 disable composition and the enable gate), the receiver pull entry point and its cache (`SA-2B3b`), and the SEC-SPLIT-02 housekeeping schedule (clock checkpoint and expiry sweep). Implementation: `src/runtime.rs`; acceptance: `tests/runtime_lifecycle_v1.rs`, `tests/runtime_pull_v1.rs` and the unit tests in `src/runtime.rs`.
 
-Every state change is one `StateStore::transition` closure over frozen `ReferenceState` transitions (`src/security.rs`), `StateStore::checkpoint`, or a control command (`spec/control-v1.md`). The runtime adds no transition, no cryptography and no wire format. Not in this slice: real report sources (`SA-2B3cd`), the producer cache (not wired; `spec/cache-store-v1.md` keeps the role), install and the CLI (`SA-2C`), Windows.
+Every state change is one `StateStore::transition` closure over frozen `ReferenceState` transitions (`src/security.rs`), `StateStore::checkpoint`, or a control command (`spec/control-v1.md`). The runtime adds no transition, no cryptography and no wire format. Not in this slice: real report sources (`SA-2B3cd`), the producer cache (not wired; `spec/cache-store-v1.md` keeps the role), install (`SA-2C1`), Windows. The CLI is `spec/cli-v1.md`.
 
 macOS and Linux only. Elsewhere the control server fails closed (`Unsupported`), so `Runtime::start` fails with `Control(Unsupported)` before any thread runs.
 
@@ -12,11 +12,13 @@ macOS and Linux only. Elsewhere the control server fails closed (`Unsupported`),
 
 `Runtime::start(root, source, options)` is `Runtime::start_with(root, |_| Ok(source), <default scan fields>, options)`.
 
-`Runtime::start_with(root, make_source, scan, options)` (`SA-2C2a`): after step 1, `make_source` is called once with the state store's own root (`Arc<SecureRoot>`), so a source that checks the root's identity (`EngineSource::approve`) is built over the same one; its error is `RuntimeError::Store` and nothing runs yet. `scan` is passed to the control server for the scan fields of `status`.
+`Runtime::start_with(root, make_source, scan, options)` (`SA-2C2a`) is `Runtime::start_with_scope(root, make_source, scan, <scopeApproved always false>, None, options)`.
+
+`Runtime::start_with_scope(root, make_source, scan, scope, scope_approve, options)` (`SA-2C2b`): after step 1, `make_source` is called once with the state store's own root (`Arc<SecureRoot>`), so a source that checks the root's identity (`EngineSource::approve`) is built over the same one; its error is `RuntimeError::Store` and nothing runs yet. `scan` is passed to the control server for the scan fields of `status`, `scope` for `scopeApproved`, and `scope_approve` as the `scopeApprove` hook (`None`: that command is `internal`). `Agent::start` passes both scope hooks (`spec/agent-v1.md`).
 
 1. Reads the OS clock (`options.clock`), opens `StateStore` in `root` (a new state's install wall is that reading), and opens `PeerStore` in the same root, under the same owner lock.
 2. Creates one memory ledger, one pairing rate limiter and one `Reports` (with `source`) for the process; every listener the runtime starts shares them. Opens the receiver `CacheStore` (`spec/cache-store-v1.md`) in the same root on that ledger. If it does not open (`UnsafeState`, `Busy`, anything else), the runtime runs without a cache until the next start: `pull` still works, nothing is cached, `last_good` is `None`. It is not retried.
-3. Starts exactly one control server on that store, with two hooks: `shutdown` and `listenConfigure` (below). A second server on the same store would unlink the first one's socket, so the runtime never starts another.
+3. Starts exactly one control server on that store, with its own three hooks: `shutdown`, `listenConfigure` and `sharingSet` (below), plus the caller's scan and scope hooks. A second server on the same store would unlink the first one's socket, so the runtime never starts another.
 4. Starts the peer listener when the stored `bindHost` is set, passes `listener::bind_address` and binds. Unset, refused or unbindable: no listener, and the runtime runs on; `status` answers.
 5. Starts the housekeeping thread, whose first round runs at once.
 
@@ -51,7 +53,7 @@ It returns only after every thread has ended. Dropping the runtime calls `stop()
 
 ## Sharing entry points (F-7)
 
-No control command enables or disables sharing; the runtime's library entry points do. A terminal record's timestamp (`at` below) is the effective now in milliseconds, or the durable wall while the OS clock is unavailable or anomalous, as in `spec/control-v1.md` ("Commands"). Neither entry point fails on the clock.
+The runtime's library entry points enable and disable sharing. Control `sharingSet` (`SA-2C2b`) runs the same two bodies: `Runtime::enable_sharing` and `disable_sharing` call functions over the runtime's shared state, and the `sharingSet` hook calls those same functions (`enabled: true` the enable gate, `false` the disable) on the serving thread, never stopping the server. The control mapping of their errors is in `spec/control-v1.md`. A terminal record's timestamp (`at` below) is the effective now in milliseconds, or the durable wall while the OS clock is unavailable or anomalous, as in `spec/control-v1.md` ("Commands"). Neither entry point fails on the clock.
 
 **`disable_sharing()`**: one transition closure, in order:
 
@@ -113,6 +115,7 @@ Nothing depends on the sweep for authority: claim, approval, Pair and Grant stat
 | 9 | `stop_takes_a_final_checkpoint` |
 | 10 | `without_a_bindable_host_the_runtime_runs_control_without_a_listener` |
 | control filter | `status_and_pending_list_leave_out_what_has_expired` |
+| `SA-2C2b` `sharingSet` through the gate | `tests/runtime_control_v1.rs` `sharing_set_runs_the_runtime_gate_and_maps_its_errors` |
 
 `SA-2B3b` (`tests/runtime_pull_v1.rs` unless noted):
 
