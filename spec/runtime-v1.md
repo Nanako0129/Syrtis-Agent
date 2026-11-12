@@ -54,15 +54,16 @@ No control command enables or disables sharing; the runtime's library entry poin
 2. The frozen `reject_pending` for every `awaitingApproval` pending. It never fails on record count.
 3. The frozen `cancel_offer` for every `active` offer. A cancel refused with `Bounds` (the record table holds `MAX_RECORDS`) is skipped and the state before it kept; any other refusal fails the whole closure.
 
-So a disable never fails on record count; it never calls the bare `StateStore::disable()`.
+So a disable never fails on record count; it never calls the bare `StateStore::disable()`. When sharing is already off and no pending is awaiting, no offer is active and no grant is active, the call writes nothing: every disable adds a terminal record, so a caller that disables on each launch would otherwise fill the record table.
 
 **`enable_sharing()`**: one transition closure:
 
-1. `cancel_offer` again on every `active` offer, skipping `Bounds`.
-2. If any offer is still `active` with `expiresAt > lastAcceptedWall × 1000` (the wall of the state inside the closure): refuse with `StorageError::Busy`. Nothing is written, not even the cancels of step 1.
-3. Otherwise the frozen `enable_sharing` (which refuses `Conflict` if sharing is already on; again nothing is written).
+0. If sharing is already on: the frozen `enable_sharing` refusal (`Conflict`), before anything else, and nothing is written.
+1. The frozen `reject_pending` for every `awaitingApproval` pending. A claim is refused while sharing is off, so such a pending predates the last disable or uninstall; an uninstall rejects none itself. Then `cancel_offer` again on every `active` offer, skipping `Bounds`.
+2. If any offer is still `active` with `expiresAt > lastAcceptedWall × 1000` (the wall of the state inside the closure): refuse with `StorageError::Busy`. Nothing is written, not even the rejects and cancels of step 1.
+3. Otherwise the frozen `enable_sharing`.
 
-**Why this closes F-7 without comparing clocks.** While sharing is off no offer can be created (`create_offer` refuses). A claim's effective now is never below the wall, and the frozen `claim_offer` refuses at effective now ≥ `expiresAt`. The wall decreases only in a reset, which removes every offer. So once enable succeeds, no offer created before a disable (or an uninstall, which disables) can ever be claimed; and every pending was rejected at the disable. Cost: with a full record table, enable can be refused for up to an offer's lifetime (15 minutes), plus up to one housekeeping period (60 s) until a checkpoint moves the wall.
+**Why this closes F-7 without comparing clocks.** While sharing is off no offer can be created (`create_offer` refuses). A claim's effective now is never below the wall, and the frozen `claim_offer` refuses at effective now ≥ `expiresAt`. The wall decreases only in a reset, which removes every offer. So once enable succeeds, no offer created before a disable (or an uninstall, which disables) can ever be claimed, and no pending from before it can be approved: `disable_sharing` rejects them, and enable rejects any that an uninstall or the bare `StateStore::disable()` left awaiting. Cost: with a full record table, enable can be refused for up to an offer's lifetime (15 minutes), plus up to one housekeeping period (60 s) until a checkpoint moves the wall.
 
 The listener keeps running while sharing is off: Grant status must still answer `revoked`.
 

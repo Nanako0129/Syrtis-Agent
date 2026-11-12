@@ -624,6 +624,72 @@ mod disk {
         );
     }
 
+    /// An uninstall turns sharing off but rejects no pending. Enable must
+    /// reject what it left awaiting, or the old pending could be approved.
+    #[test]
+    fn enable_rejects_a_pending_that_an_uninstall_left_awaiting() {
+        let node = Node::new(Duration::from_secs(60));
+        node.configure(free_port());
+        node.runtime.enable_sharing().unwrap();
+        let (_, url) = node.offer(600);
+        let pending_id = node.claim_direct(&url, NOW_MS, 7).unwrap();
+        node.store().uninstall(NOW_MS).unwrap();
+        // Control: the uninstall itself left it awaiting.
+        assert_eq!(
+            node.pending_state(pending_id),
+            PendingState::AwaitingApproval
+        );
+        node.runtime.enable_sharing().unwrap();
+        assert_eq!(node.pending_state(pending_id), PendingState::Rejected);
+        let approve = node.call(
+            APPROVE,
+            json!({"pendingId": hex_encode(&pending_id), "sasGeneration": 1}),
+        );
+        assert_eq!(approve.code, UNAUTHORIZED);
+    }
+
+    /// Enable while sharing is on is the frozen refusal and touches
+    /// nothing: a pending that is awaiting stays awaiting.
+    #[test]
+    fn enable_while_on_is_refused_and_leaves_a_live_pending_alone() {
+        let node = Node::new(Duration::from_secs(60));
+        node.configure(free_port());
+        node.runtime.enable_sharing().unwrap();
+        let (_, url) = node.offer(600);
+        let pending_id = node.claim_direct(&url, NOW_MS, 8).unwrap();
+        let before = node.state_bytes();
+        assert_eq!(
+            node.runtime.enable_sharing(),
+            Err(StorageError::Refused(SecurityError::Conflict))
+        );
+        assert_eq!(node.state_bytes(), before);
+        assert_eq!(
+            node.pending_state(pending_id),
+            PendingState::AwaitingApproval
+        );
+    }
+
+    /// A disable with nothing to end writes nothing; one with something
+    /// to end still does.
+    #[test]
+    fn a_disable_with_nothing_to_end_writes_nothing() {
+        let node = Node::new(Duration::from_secs(60));
+        node.configure(free_port());
+        // Fresh state: sharing is off and nothing exists.
+        let before = node.state_bytes();
+        node.runtime.disable_sharing().unwrap();
+        node.runtime.disable_sharing().unwrap();
+        assert_eq!(node.state_bytes(), before);
+        // Control: with sharing on, a disable is recorded.
+        node.runtime.enable_sharing().unwrap();
+        let terminals = node.reference().terminal.len();
+        node.runtime.disable_sharing().unwrap();
+        assert_eq!(node.reference().terminal.len(), terminals + 1);
+        let after = node.state_bytes();
+        node.runtime.disable_sharing().unwrap();
+        assert_eq!(node.state_bytes(), after);
+    }
+
     /// Acceptance (5), the enable gate. The record table is full, so
     /// `disable_sharing` cannot cancel the offer (`Bounds`): it still
     /// succeeds, rejects the pending, and leaves the offer active. Enable
