@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod canonical;
+pub mod control;
 pub mod listener;
 pub mod noise;
 pub mod pairing;
