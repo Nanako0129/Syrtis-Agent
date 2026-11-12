@@ -2,6 +2,7 @@ pub mod cache;
 pub mod cache_store;
 pub mod canonical;
 pub mod control;
+pub mod install;
 pub mod listener;
 pub mod noise;
 pub mod pairing;
