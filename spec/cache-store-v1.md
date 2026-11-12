@@ -60,7 +60,7 @@ Every byte read into memory is reserved on the shared `MemoryLedger` first (`spe
 | `get` (b) | `report_peer::decode_reservation(body, endpoint)`, after the read | Until `get` returns |
 | `get` (c) | The body length, before `validate_entry` (which copies the body) | By the returned `CachedBody`, until it is dropped |
 
-A reservation that does not fit is `busy`, and the file is kept. A body the shape gate refuses, or whose decode cost exceeds `REMOTE_MEMORY_MAX` (it could never fit), is a failed validation: the file is deleted and `get` is `None`, not `busy`. So a `get` needs `(size + 1) + decode cost + body length` free at once; after a success the store holds only the body length.
+A reservation that does not fit is `busy`, and the file is kept. A body the shape gate refuses, or whose three reservations together exceed `REMOTE_MEMORY_MAX` (it could never fit, even on an idle ledger), is a failed validation: the file is deleted and `get` is `None`, not `busy`. So a `get` needs `(size + 1) + decode cost + body length` free at once; after a success the store holds only the body length.
 
 ## Failures
 

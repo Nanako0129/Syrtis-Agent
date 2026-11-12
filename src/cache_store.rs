@@ -246,10 +246,18 @@ impl CacheStore {
         let Ok(endpoint) = Endpoint::try_from(key.endpoint) else {
             return self.delete(&mut guard, &name);
         };
+        // The three reservations are held together, so it is their sum
+        // that has to fit the ledger.
+        let fits = |cost: usize| {
+            size.saturating_add(1)
+                .saturating_add(cost)
+                .saturating_add(body.len())
+                <= REMOTE_MEMORY_MAX
+        };
         let cost = match decode_reservation(body, endpoint) {
-            Ok(cost) if cost <= REMOTE_MEMORY_MAX => cost,
-            // Refused by the shape gate, or more than the whole ledger:
-            // no retry can ever decode it.
+            Ok(cost) if fits(cost) => cost,
+            // Refused by the shape gate, or more than the whole ledger
+            // even when it is idle: no retry can ever decode it.
             _ => return self.delete(&mut guard, &name),
         };
         let _decode = self.ledger.reserve(cost).ok_or(StorageError::Busy)?;

@@ -531,6 +531,26 @@ fn a_body_costing_more_than_the_whole_ledger_is_deleted_not_busy() {
     assert_eq!(ledger.used(), 0);
 }
 
+/// The three reservations of a `get` are held together: a body whose decode
+/// cost alone fits the ledger but whose three reservations do not is deleted
+/// too, since it would otherwise be `Busy` on every call.
+#[test]
+fn a_body_whose_three_reservations_exceed_the_ledger_is_deleted_not_busy() {
+    let home = TempHome::new();
+    let ledger = MemoryLedger::default();
+    let (producer, _receiver) = open_both(&home, &ledger);
+    let p = key(CacheRole::Producer, 1);
+    let bytes = body(&p, 66_000);
+    let cost = decode_reservation(&bytes, Endpoint::Graph).unwrap();
+    assert!(cost <= REMOTE_MEMORY_MAX, "{cost}");
+    producer.put(&p, &bytes, CREATED, EXPIRES).unwrap();
+    let size = std::fs::metadata(home.file(&p)).unwrap().len() as usize;
+    assert!(size + 1 + cost + bytes.len() > REMOTE_MEMORY_MAX, "{cost}");
+    assert!(producer.get(&p, NOW).unwrap().is_none());
+    assert!(!exists(&home.file(&p)));
+    assert_eq!(ledger.used(), 0);
+}
+
 /// Acceptance (7b): a file swapped after indexing (a symlink; a `0644`
 /// file) is `UnsafeState`, nothing is followed or deleted, and the store
 /// stays unknown until it is reopened.
