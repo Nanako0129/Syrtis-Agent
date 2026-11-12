@@ -125,7 +125,7 @@ mod unix {
         io::{self, Read, Write},
         os::{
             fd::{AsRawFd, FromRawFd},
-            unix::fs::MetadataExt,
+            unix::fs::{MetadataExt, OpenOptionsExt},
         },
         path::Path,
         sync::Arc,
@@ -155,15 +155,26 @@ mod unix {
         let home = trusted_home.to_str().ok_or(InstallError::Invalid)?;
         let objects = install_objects(PLATFORM, home).map_err(|_| InstallError::Invalid)?;
         let autostart = autostart_contents(&objects.binary)?;
-        // Every check on both objects runs before anything is written.
+        // Check-only pass: both chains as far as they exist, both existing
+        // targets and the source, before any directory is created.
+        for path in [&objects.binary, &objects.autostart_object] {
+            if let Some(target) = descend(home, path, false)? {
+                existing(&target)?;
+            }
+        }
+        let mut source = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(current_exe)
+            .map_err(|_| InstallError::Io)?;
+        if !source.metadata().map_err(|_| InstallError::Io)?.is_file() {
+            return Err(InstallError::Io);
+        }
+        // Create-and-write pass; every directory is checked again.
         let binary = descend(home, &objects.binary, true)?.ok_or(InstallError::Io)?;
         let launcher = descend(home, &objects.autostart_object, true)?.ok_or(InstallError::Io)?;
         existing(&binary)?;
         existing(&launcher)?;
-        let mut source = File::open(current_exe).map_err(|_| InstallError::Io)?;
-        if !source.metadata().map_err(|_| InstallError::Io)?.is_file() {
-            return Err(InstallError::Io);
-        }
         let mut bytes = Vec::new();
         source
             .read_to_end(&mut bytes)
@@ -183,26 +194,31 @@ mod unix {
         store
             .uninstall(terminal_at_ms)
             .map_err(InstallError::Storage)?;
-        let home = trusted_home.to_str().ok_or(InstallError::Invalid)?;
-        let objects = install_objects(PLATFORM, home).map_err(|_| InstallError::Invalid)?;
-        let expected = autostart_contents(&objects.binary).ok();
-        let launcher = find(home, &objects.autostart_object).map(|found| match found {
-            Found::Safe(target) if !matches(&target, expected.as_deref()) => Found::Foreign,
-            other => other,
-        });
-        let binary = find(home, &objects.binary);
-        // A parent that fails its checks means nothing is removed at all.
-        let parents_ok = launcher.is_ok() && binary.is_ok();
+        // Each object on its own: a chain that fails its checks marks only
+        // that object. Paths that cannot be derived mark both; the caches
+        // and the report still follow.
         let remove = |found: Result<Found, InstallError>| match found {
             Ok(Found::Absent) => Outcome::Absent,
-            Ok(Found::Safe(target)) if parents_ok => match unlink(&target) {
+            Ok(Found::Safe(target)) => match unlink(&target) {
                 Ok(()) => Outcome::Removed,
                 Err(_) => Outcome::ManualRepair,
             },
-            _ => Outcome::ManualRepair,
+            Ok(Found::Foreign) | Err(_) => Outcome::ManualRepair,
         };
-        let autostart = remove(launcher);
-        let binary = remove(binary);
+        let paths = trusted_home
+            .to_str()
+            .and_then(|home| Some((home, install_objects(PLATFORM, home).ok()?)));
+        let (autostart, binary) = match paths {
+            Some((home, objects)) => {
+                let expected = autostart_contents(&objects.binary).ok();
+                let launcher = find(home, &objects.autostart_object).map(|found| match found {
+                    Found::Safe(target) if !matches(&target, expected.as_deref()) => Found::Foreign,
+                    other => other,
+                });
+                (remove(launcher), remove(find(home, &objects.binary)))
+            }
+            None => (Outcome::ManualRepair, Outcome::ManualRepair),
+        };
         let root = store.root();
         let clear = |role| match CacheStore::open(Arc::clone(&root), role, MemoryLedger::default())
             .and_then(|cache| cache.clear())

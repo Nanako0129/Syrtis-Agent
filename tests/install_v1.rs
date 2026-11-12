@@ -546,9 +546,10 @@ fn uninstall_never_follows_a_symlinked_parent() {
 
     assert_eq!(report.binary, Outcome::ManualRepair);
     assert_eq!(std::fs::read(decoy.join("syrtis-agent")).unwrap(), b"decoy");
-    // A failed parent removes nothing at all, and blocks the purge.
-    assert_eq!(report.autostart, Outcome::ManualRepair);
-    assert!(home.autostart().is_file());
+    // Only this object is marked: the autostart chain is fine. The mark
+    // blocks the purge.
+    assert_eq!(report.autostart, Outcome::Removed);
+    assert!(!home.autostart().exists());
     assert!(!report.purged);
     assert!(home.root().join("state.json").is_file());
 }
@@ -565,8 +566,118 @@ fn uninstall_keeps_objects_under_a_group_writable_parent() {
 
     assert_eq!(report.binary, Outcome::ManualRepair);
     assert_eq!(std::fs::read(home.binary()).unwrap(), b"agent");
+    assert_eq!(report.autostart, Outcome::Removed);
+}
+
+/// Review fix 1: the autostart parent is unsafe and holds no agent file.
+/// Only the autostart object is marked; the binary, whose chain is fine,
+/// is removed; the mark blocks the purge.
+#[test]
+fn an_unsafe_empty_autostart_parent_marks_only_that_object() {
+    let home = TempHome::new();
+    install(&home.path, &home.source(b"agent")).unwrap();
+    std::fs::remove_file(home.autostart()).unwrap();
+    let parent = home.autostart().parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o775)).unwrap();
+
+    let report = uninstall(home.store(), &home.path, true, NOW_MS).unwrap();
+
+    assert_eq!(report.binary, Outcome::Removed);
+    assert!(!home.binary().exists());
     assert_eq!(report.autostart, Outcome::ManualRepair);
-    assert!(home.autostart().is_file());
+    assert!(!report.purged);
+    assert!(home.root().join("state.json").is_file());
+}
+
+/// Review fix 1: a missing directory on the way means the object cannot
+/// exist, so it is `Absent` and does not block the purge.
+#[test]
+fn a_missing_autostart_directory_is_absent_and_purge_proceeds() {
+    let home = TempHome::new();
+    install(&home.path, &home.source(b"agent")).unwrap();
+    let parent = home.autostart().parent().unwrap().to_path_buf();
+    std::fs::remove_file(home.autostart()).unwrap();
+    std::fs::remove_dir(&parent).unwrap();
+
+    let report = uninstall(home.store(), &home.path, true, NOW_MS).unwrap();
+
+    assert_eq!(
+        report,
+        UninstallReport {
+            autostart: Outcome::Absent,
+            purged: true,
+            ..CLEAN
+        }
+    );
+}
+
+/// Every entry below the home, directories included, never following a
+/// link.
+fn all_entries(home: &TempHome) -> BTreeSet<PathBuf> {
+    fn walk(dir: &Path, base: &Path, out: &mut BTreeSet<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            out.insert(path.strip_prefix(base).unwrap().to_path_buf());
+            if std::fs::symlink_metadata(&path).unwrap().is_dir() {
+                walk(&path, base, out);
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(&home.path, &home.path, &mut out);
+    out
+}
+
+/// Review fix 2: the binary chain is missing and the autostart parent is a
+/// symlink. The refusal comes before any directory is created.
+#[test]
+fn a_refused_install_creates_no_directory() {
+    let home = TempHome::new();
+    let decoy = home.path.join("decoy");
+    std::fs::create_dir(&decoy).unwrap();
+    let parent = home.autostart().parent().unwrap().to_path_buf();
+    mkdirs(parent.parent().unwrap());
+    symlink(&decoy, &parent).unwrap();
+    let source = home.source(b"agent");
+    // Control: the binary chain really is missing.
+    assert!(!home.binary().parent().unwrap().exists());
+    let before = all_entries(&home);
+
+    let result = install(&home.path, &source);
+
+    assert_eq!(result, Err(InstallError::UnsafeState));
+    assert_eq!(all_entries(&home), before);
+}
+
+/// Review fix 3: the install paths cannot be derived (a non-UTF-8 home)
+/// after the durable uninstall. The caches are still cleared, both objects
+/// are marked, the report is returned and the state is kept.
+#[test]
+fn an_underivable_home_still_clears_caches_and_reports() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+    let home = TempHome::new();
+    install(&home.path, &home.source(b"agent")).unwrap();
+    let store = home.store();
+    put_cache(&store.root(), CacheRole::Producer);
+    put_cache(&store.root(), CacheRole::Receiver);
+    assert_eq!(cache_files(&home).len(), 2);
+    let bad = Path::new(OsStr::from_bytes(b"/nonexistent/\xff"));
+    assert!(bad.to_str().is_none());
+
+    let report = uninstall(store, bad, true, NOW_MS).unwrap();
+
+    assert_eq!(
+        report,
+        UninstallReport {
+            autostart: Outcome::ManualRepair,
+            binary: Outcome::ManualRepair,
+            ..CLEAN
+        }
+    );
+    assert!(cache_files(&home).is_empty());
+    assert!(home.root().join("state.json").is_file());
+    assert!(home.binary().is_file() && home.autostart().is_file());
+    assert!(!home.store().state().unwrap().reference.sharing_enabled);
 }
 
 /// Acceptance 6: everything safe.

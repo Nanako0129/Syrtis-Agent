@@ -21,9 +21,9 @@ The home is opened by path (`O_DIRECTORY`); links above and at the home are trus
 
 `install(trusted_home, current_exe)`:
 
-1. Walk both parent chains and check both existing targets with `fstatat(AT_SYMLINK_NOFOLLOW)`: an existing target must be a regular file owned by the effective UID with one link, else `UnsafeState`. All checks finish before anything is written.
-2. Read `current_exe` (it must be a regular file).
-3. Binary, then autostart object, each: remove a leftover `.<name>.tmp` (`unlinkat`, never follows), create it with `O_CREAT | O_EXCL | O_NOFOLLOW`, write, `fchmod` the descriptor (`0755` binary, `0644` autostart), sync it, `renameat` over the target, sync the directory. A failure before the rename removes the temp file and leaves the old target as it was; after the rename the target is the new object.
+1. Check-only pass, creating nothing: walk both parent chains as far as they exist (stopping at the first missing directory), and check each existing target with `fstatat(AT_SYMLINK_NOFOLLOW)`: it must be a regular file owned by the effective UID with one link, else `UnsafeState`. Then open `current_exe` read-only with `O_NONBLOCK`; it must be a regular file, else `Io`. A refusal here leaves no new directory behind.
+2. Create-and-write pass: walk both chains again, creating missing directories and checking every directory again, and check both targets again.
+3. Read `current_exe`. Then binary, then autostart object, each: remove a leftover `.<name>.tmp` (`unlinkat`, never follows), create it with `O_CREAT | O_EXCL | O_NOFOLLOW`, write, `fchmod` the descriptor (`0755` binary, `0644` autostart), sync it, `renameat` over the target, sync the directory. A failure before the rename removes the temp file and leaves the old target as it was; after the rename the target is the new object.
 
 The same source installed twice gives the same bytes and modes. The binary path must be bytes from `[A-Za-z0-9/._-]` only; anything else (a space, `&`, `%`, non-ASCII) would need XML or systemd escaping and is `Invalid` rather than escaped.
 
@@ -36,13 +36,13 @@ The same source installed twice gives the same bytes and modes. The binary path 
 `uninstall(store, trusted_home, purge, terminal_at_ms) -> UninstallReport` takes the only `StateStore` handle by value; the caller has stopped the listener and control first. The store, and with it `owner.lock`, is released when the call returns.
 
 1. `StateStore::uninstall(terminal_at_ms)`: sharing off, every active grant revoked, deny floor raised. On failure the call returns `Storage(_)` and removes nothing.
-2. Walk both parent chains (no creation). If either chain fails its checks, neither object is removed and each present one is `ManualRepair`.
+2. Derive both paths from `trusted_home`. If that fails (a non-UTF-8 home, or one `install_objects` refuses), both objects are `ManualRepair` and the call goes on with step 5; it still returns the report. Otherwise walk each object's parent chain on its own (no creation). A missing directory on the way means the object cannot exist: `Absent`. A directory that fails its checks (or cannot be opened no-follow) means its presence cannot be established safely: that object is `ManualRepair` and left alone. One object's chain never affects the other object.
 3. Autostart object: removed (`unlinkat`, then a directory sync) only when `fstatat` shows a regular file owned by the effective UID with one link, and its bytes, read through an `O_NOFOLLOW | O_NONBLOCK` descriptor that passes the same checks, equal this version's rendered template. Otherwise `ManualRepair`.
 4. Binary: removed when it is a regular file owned by the effective UID with one link. Otherwise `ManualRepair`.
 5. Producer and receiver caches: `CacheStore::open` + `clear` on the store's root. Failure is `ManualRepair`.
 6. Only with `purge` and no `ManualRepair` anywhere: `SecureRoot::remove_file` of `peers.json`, then `state.json`. `owner.lock` is never removed: unlinking a held lock would let the next process lock a different inode.
 
-Nothing follows a link, nothing removes a directory, and nothing removes an object whose name or bytes do not match. A path error after step 1 (an invalid home) returns `Invalid` with the durable uninstall already committed.
+Nothing follows a link, nothing removes a directory, and nothing removes an object whose name or bytes do not match. Once step 1 has committed, the call always returns the report: every later failure is a `ManualRepair` or `purged: false`.
 
 ## Non-claims
 
@@ -59,9 +59,9 @@ All in `tests/install_v1.rs` unless noted; every test works under a temp home it
 |---|---|
 | 1 | `install_writes_both_frozen_objects_with_exact_modes_and_golden_contents` |
 | 2 | `reinstall_is_idempotent_and_an_upgrade_replaces_the_binary` |
-| 3 | `install_refuses_a_symlinked_target_and_leaves_the_decoy`, `install_refuses_a_hard_linked_target_and_leaves_the_decoy`, `install_refuses_a_symlinked_parent_and_leaves_the_decoy`, `install_refuses_an_other_writable_parent` |
+| 3 | `install_refuses_a_symlinked_target_and_leaves_the_decoy`, `install_refuses_a_hard_linked_target_and_leaves_the_decoy`, `install_refuses_a_symlinked_parent_and_leaves_the_decoy`, `install_refuses_an_other_writable_parent`, `a_refused_install_creates_no_directory` |
 | 4 | `uninstall_revokes_removes_both_objects_clears_caches_and_keeps_state` |
-| 5 | `uninstall_keeps_a_modified_autostart_object`, `uninstall_keeps_a_symlinked_binary_and_its_target`, `uninstall_never_follows_a_symlinked_parent`, `uninstall_keeps_objects_under_a_group_writable_parent`, `install_refuses_an_allow_acl_on_the_bin_directory` (macOS) |
+| 5 | `uninstall_keeps_a_modified_autostart_object`, `uninstall_keeps_a_symlinked_binary_and_its_target`, `uninstall_never_follows_a_symlinked_parent`, `uninstall_keeps_objects_under_a_group_writable_parent`, `an_unsafe_empty_autostart_parent_marks_only_that_object`, `a_missing_autostart_directory_is_absent_and_purge_proceeds`, `an_underivable_home_still_clears_caches_and_reports`, `install_refuses_an_allow_acl_on_the_bin_directory` (macOS) |
 | 6 | `purge_removes_state_and_peers_but_keeps_the_owner_lock`, `purge_keeps_state_when_anything_needs_manual_repair` |
 | 7 | `install::unix::tests::a_failed_durable_uninstall_removes_nothing` (unit test, `src/install.rs`) |
 | 8 | `only_the_two_frozen_objects_ever_appear` |
