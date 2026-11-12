@@ -154,8 +154,10 @@ fn accept_loop(listener: TcpListener, shared: &Arc<Shared>, stop: &AtomicBool) {
                 }
             }
             Err(error) if error.kind() == ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
-            // A failed accept (e.g. the peer reset first) ends nothing.
-            Err(_) => {}
+            // A failed accept (e.g. the peer reset first) ends nothing. It
+            // waits like an idle poll: an error that persists (no file
+            // descriptor left) must not spin this thread.
+            Err(_) => thread::sleep(ACCEPT_POLL),
         }
     }
     drop(listener);

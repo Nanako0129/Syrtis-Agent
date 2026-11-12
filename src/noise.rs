@@ -173,6 +173,10 @@ pub fn connect(
     local: &StaticKey,
     remote_static: &[u8; 32],
 ) -> Result<Session, NoiseError> {
+    // The pinned static is known before anything is sent. With a low-order
+    // one, message 1 would encrypt this side's static under a key an
+    // observer can compute, so refuse before connecting.
+    refuse_low_order(local, remote_static)?;
     let addresses: Vec<SocketAddr> = (host, port)
         .to_socket_addrs()
         .map_err(|_| NoiseError::Io)?
@@ -629,6 +633,26 @@ mod tests {
     /// SA-2B2a3 acceptance (8): low-order remote statics are refused, a
     /// normal key passes. The first assertion is the reason the check
     /// exists: snow's own X25519 returns the all-zero output without error.
+    /// The initiator refuses a low-order pinned static before it connects:
+    /// the error is the crypto one, not the refused connection.
+    #[test]
+    fn connect_refuses_a_low_order_pin_before_connecting() {
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let local = StaticKey::generate().unwrap();
+        assert_eq!(
+            connect("127.0.0.1", port, &local, &[0; 32]).err(),
+            Some(NoiseError::Crypto)
+        );
+        // Control: a normal pin reaches the connect and is refused there.
+        let other = StaticKey::generate().unwrap();
+        assert_eq!(
+            connect("127.0.0.1", port, &local, &other.public).err(),
+            Some(NoiseError::Io)
+        );
+    }
+
     #[test]
     fn a_low_order_remote_static_is_refused() {
         let local = StaticKey::generate().unwrap();

@@ -38,7 +38,7 @@
 # identity, stop), and the low-order remote static non-claim became a
 # rule: both handshake sides refuse an all-zero X25519 with the remote
 # static.
-bee8e79862328e1606a59b2ef908032990114f253d32c566530832beaeeb2c7f  spec/pairing-v1.md
+4744e8ea3728d8ac967f70b268fce09d380c259aab72b0f18d506e79a414ca1b  spec/pairing-v1.md
 1d982b186a00e4ddaaa8b47f6569cd3c68bcc170b17a74044ed3ed515ea5b83f  spec/peer-store-v1.md
 79d1c0363e4576d67827ebfa029fad7e3a5981474f4aafba3bd71e54f1a98172  spec/report-cache-v1.md
 3e0b75e33fd362eab1040254de8f656e3a1bf855e0f3c008915b33e3ec2ee523  spec/security-v1.md
