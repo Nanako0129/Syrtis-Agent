@@ -12,4 +12,5 @@ pub mod report_peer;
 pub mod runtime;
 pub mod secure_fs;
 pub mod security;
+pub mod source;
 pub mod state_store;

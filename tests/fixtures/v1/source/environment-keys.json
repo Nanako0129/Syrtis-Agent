@@ -1,0 +1,126 @@
+{
+  "engineSha": "e156d67caa9708458fd2030f379d3c2a77ff05bf",
+  "keys": [
+    {
+      "key": "HOME",
+      "source": "src/paths.rs:25"
+    },
+    {
+      "key": "XDG_DATA_HOME",
+      "source": "src/clients.rs:72"
+    },
+    {
+      "key": "XDG_CONFIG_HOME",
+      "source": "src/clients.rs:89"
+    },
+    {
+      "key": "XDG_CACHE_HOME",
+      "source": "dirs crate (dirs::cache_dir, src/paths.rs:105)"
+    },
+    {
+      "key": "XDG_RUNTIME_DIR",
+      "source": "src/message_cache.rs:105"
+    },
+    {
+      "key": "XDG_STATE_HOME",
+      "source": null
+    },
+    {
+      "key": "TOKSCALE_CONFIG_DIR",
+      "source": "src/paths.rs:55"
+    },
+    {
+      "key": "TOKSCALE_EXTRA_DIRS",
+      "source": "src/source_context.rs:194"
+    },
+    {
+      "key": "TOKSCALE_HEADLESS_DIR",
+      "source": "src/source_context.rs:189"
+    },
+    {
+      "key": "TOKSCALE_PRICING_CACHE_ONLY",
+      "source": "src/source_context.rs:198"
+    },
+    {
+      "key": "COPILOT_OTEL_FILE_EXPORTER_PATH",
+      "source": "src/scanner.rs:20"
+    },
+    {
+      "key": "LOCALAPPDATA",
+      "source": "src/scanner.rs:21"
+    },
+    {
+      "key": "APPDATA",
+      "source": "src/scanner.rs:22"
+    },
+    {
+      "key": "KIMI_CODE_HOME",
+      "source": "src/scanner.rs:23"
+    },
+    {
+      "key": "GOOSE_PATH_ROOT",
+      "source": "src/scanner.rs:25"
+    },
+    {
+      "key": "CODEX_HOME",
+      "source": "src/clients.rs:278"
+    },
+    {
+      "key": "GEMINI_CLI_HOME",
+      "source": "src/clients.rs:299"
+    },
+    {
+      "key": "HERMES_HOME",
+      "source": "src/clients.rs:410"
+    },
+    {
+      "key": "CODEBUFF_DATA_DIR",
+      "source": "src/clients.rs:440"
+    },
+    {
+      "key": "JCODE_HOME",
+      "source": "src/clients.rs:530"
+    },
+    {
+      "key": "GJC_CODING_AGENT_DIR",
+      "source": "src/clients.rs:561"
+    },
+    {
+      "key": "GROK_HOME",
+      "source": "src/clients.rs:579"
+    },
+    {
+      "key": "HINDSIGHT_HOME",
+      "source": "src/clients.rs:639"
+    },
+    {
+      "key": "KIMCHI_CODING_AGENT_DIR",
+      "source": "src/clients.rs:681"
+    },
+    {
+      "key": "SENPI_CODING_AGENT_DIR",
+      "source": "src/clients.rs:697"
+    },
+    {
+      "key": "REASONIX_STATE_HOME",
+      "source": "src/clients.rs:16"
+    },
+    {
+      "key": "REASONIX_HOME",
+      "source": "src/clients.rs:17"
+    },
+    {
+      "key": "USER",
+      "source": "src/message_cache.rs:120"
+    },
+    {
+      "key": "USERNAME",
+      "source": "src/message_cache.rs:119"
+    },
+    {
+      "key": "TMPDIR",
+      "source": "std::env::temp_dir, src/message_cache.rs:114"
+    }
+  ],
+  "note": "Every environment key the engine names at the pinned SHA, plus XDG_STATE_HOME (the frozen ignoredEnvironment fixture) and TMPDIR (std::env::temp_dir). DIRECT_SOURCE_ENV_KEYS is src/scanner.rs:18-26; the client env roots come from CLIENTS. XDG_STATE_HOME is not named by the engine (source null)."
+}

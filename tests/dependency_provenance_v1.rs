@@ -2,11 +2,18 @@
 //!
 //! The candidate-digest manifest used to freeze `Cargo.toml` and `Cargo.lock`
 //! byte for byte. Runtime slices must edit both, so that guard moved here:
-//! every package in the `793f3d9` lock is snapshotted in
+//! every package in the lock is snapshotted in
 //! `fixtures/v1/runtime/storage/cargo-lock-baseline.json` (itself frozen by the
 //! manifest), and the checkers below reject any changed, removed or
 //! unlisted package and any unpinned dependency, with their own assertions
 //! rather than a cargo parse error.
+//!
+//! SA-2B3cd added the engine, `tokscale-core`, and the packages it brings:
+//! each one is in the baseline with all four fields (name, version, source,
+//! checksum), so a later `rev` change fails as a changed baseline package.
+//! `tokscale-core` is the one dependency allowed as a git dependency, and
+//! only as `{ git = ENGINE_GIT, rev = "<40 lowercase hex>" }`; its lock
+//! source must name the same SHA (`check_engine_lock`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,8 +25,14 @@ const BASELINE: &str = include_str!("fixtures/v1/runtime/storage/cargo-lock-base
 const PROVENANCE: &str = include_str!("fixtures/v1/security/provenance.json");
 
 /// Packages this slice may add beyond the baseline. Empty: `libc 0.2.189` was
-/// already in the `793f3d9` lock as a transitive dependency.
+/// already in the `793f3d9` lock as a transitive dependency, and every
+/// package `tokscale-core` brings is in the baseline itself (an allowlist
+/// compares names only).
 const NEW_PACKAGE_ALLOWLIST: &[&str] = &[];
+
+/// The only dependency that may come from git, and the only URL it may use.
+const ENGINE: &str = "tokscale-core";
+const ENGINE_GIT: &str = "https://github.com/Nanako0129/tokscale-core";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Package {
@@ -222,9 +235,77 @@ fn exact_pin(version: &str) -> bool {
     })
 }
 
+/// Exactly 40 lowercase hex digits.
+fn full_sha(rev: &str) -> bool {
+    rev.len() == 40
+        && rev
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The engine's inline table: exactly `git` (the fork) and `rev` (a full
+/// SHA), nothing else. Returns the SHA.
+fn engine_rev(spec: &str) -> Result<String, String> {
+    let items = inline_table(spec).ok_or_else(|| format!("{ENGINE}: unparsed inline table"))?;
+    let mut git = None;
+    let mut rev = None;
+    for (key, value) in &items {
+        let slot = match key.as_str() {
+            "git" => &mut git,
+            "rev" => &mut rev,
+            _ => return Err(format!("{ENGINE}: forbidden key {key}")),
+        };
+        if slot.replace(value.as_str()).is_some() {
+            return Err(format!("{ENGINE}: duplicate key {key}"));
+        }
+    }
+    fn unquote(value: Option<&str>) -> Option<&str> {
+        value?.strip_prefix('"')?.strip_suffix('"')
+    }
+    if unquote(git) != Some(ENGINE_GIT) {
+        return Err(format!("{ENGINE}: git is not {ENGINE_GIT}"));
+    }
+    match unquote(rev) {
+        Some(rev) if full_sha(rev) => Ok(rev.to_owned()),
+        _ => Err(format!("{ENGINE}: rev is not a full 40-hex SHA")),
+    }
+}
+
+/// The engine's SHA as the manifest declares it, from its only declaration.
+fn manifest_engine_rev(manifest: &str) -> Result<String, String> {
+    let specs: Vec<&str> = manifest
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(ENGINE)?.strip_prefix(" = "))
+        .collect();
+    match specs.as_slice() {
+        [spec] => engine_rev(spec),
+        _ => Err(format!("{ENGINE} declared {} times", specs.len())),
+    }
+}
+
+/// The lock has exactly one `tokscale-core`, and its source names the
+/// manifest's SHA as both the requested and the resolved revision.
+fn check_engine_lock(manifest: &str, lock_text: &str) -> Result<(), String> {
+    let rev = manifest_engine_rev(manifest)?;
+    let lock = parse_lock(lock_text)?;
+    let engines: Vec<&Package> = lock.iter().filter(|p| p.name == ENGINE).collect();
+    let [engine] = engines.as_slice() else {
+        return Err(format!("{ENGINE} locked {} times", engines.len()));
+    };
+    let expected = format!("git+{ENGINE_GIT}?rev={rev}#{rev}");
+    if engine.source.as_deref() == Some(expected.as_str()) && engine.checksum.is_none() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{ENGINE}: lock source does not match the manifest rev"
+        ))
+    }
+}
+
 /// Only the allowlisted tables and `[package]` keys, `[package]` first; every
-/// dependency `=`-pinned and from the registry; `snow` exactly once, with
-/// default features off and exactly the frozen feature set.
+/// dependency `=`-pinned and from the registry, except `tokscale-core`
+/// (`engine_rev`); `snow` exactly once, with default features off and
+/// exactly the frozen feature set.
 fn check_manifest(manifest: &str) -> Result<(), String> {
     let provenance: Value = serde_json::from_str(PROVENANCE).unwrap();
     let snow_version = format!("={}", provenance["snow"]["version"].as_str().unwrap());
@@ -279,6 +360,10 @@ fn check_manifest(manifest: &str) -> Result<(), String> {
         }
         if spec.starts_with('{') != spec.ends_with('}') {
             return Err(format!("multi-line dependency: {name}"));
+        }
+        if name == ENGINE {
+            engine_rev(spec)?;
+            continue;
         }
         let items = if spec.starts_with('{') {
             let items =
@@ -351,10 +436,98 @@ fn the_lock_keeps_every_baseline_package_and_adds_none_unlisted() {
     let baseline = baseline();
     assert_eq!(
         baseline.len(),
-        50,
-        "baseline must cover the whole 793f3d9 lock"
+        259,
+        "baseline must cover the whole lock: the 50 packages of 793f3d9 and the 209 tokscale-core brings"
     );
     check_lock(LOCK, &baseline, NEW_PACKAGE_ALLOWLIST).unwrap();
+}
+
+#[test]
+fn the_engine_is_the_only_git_dependency_and_its_lock_names_the_same_sha() {
+    check_manifest(MANIFEST).unwrap();
+    check_engine_lock(MANIFEST, LOCK).unwrap();
+    let rev = manifest_engine_rev(MANIFEST).unwrap();
+    let declared = format!("rev = \"{rev}\"");
+    assert_eq!(MANIFEST.matches(&declared).count(), 1);
+    let git = format!("git = \"{ENGINE_GIT}\"");
+    assert_eq!(MANIFEST.matches(&git).count(), 1);
+
+    // Negative controls, each on an in-test copy and each with its own
+    // message, so the checker's assertion rejects them, not cargo.
+    let cases = [
+        (
+            MANIFEST.replace(&declared, "branch = \"main\""),
+            "tokscale-core: forbidden key branch".to_owned(),
+        ),
+        (
+            MANIFEST.replace(&declared, &format!("rev = \"{}\"", &rev[..7])),
+            "tokscale-core: rev is not a full 40-hex SHA".to_owned(),
+        ),
+        (
+            MANIFEST.replace(&declared, &format!("rev = \"{}\"", rev.to_uppercase())),
+            "tokscale-core: rev is not a full 40-hex SHA".to_owned(),
+        ),
+        (
+            MANIFEST.replace(&git, "git = \"https://github.com/junhoyeo/tokscale\""),
+            format!("tokscale-core: git is not {ENGINE_GIT}"),
+        ),
+        (
+            MANIFEST.replace(&declared, &format!("{declared}, version = \"=3.0.0\"")),
+            "tokscale-core: forbidden key version".to_owned(),
+        ),
+        (
+            MANIFEST.replace(&declared, &format!("{declared}, tag = \"v3\"")),
+            "tokscale-core: forbidden key tag".to_owned(),
+        ),
+        (
+            MANIFEST.replace(
+                "libc = { version = \"=0.2.189\", default-features = false }",
+                &format!("libc = {{ git = \"{ENGINE_GIT}\", rev = \"{rev}\" }}"),
+            ),
+            "libc: forbidden key git".to_owned(),
+        ),
+    ];
+    for (tampered, expected) in cases {
+        assert_ne!(tampered, MANIFEST, "mutation did not apply: {expected}");
+        assert_eq!(check_manifest(&tampered), Err(expected));
+    }
+
+    // The lock names a different SHA than the manifest.
+    let other = "0".repeat(40);
+    let lock_source = format!("git+{ENGINE_GIT}?rev={rev}#{rev}");
+    assert_eq!(LOCK.matches(&lock_source).count(), 1);
+    for tampered in [
+        LOCK.replace(
+            &lock_source,
+            &format!("git+{ENGINE_GIT}?rev={other}#{other}"),
+        ),
+        LOCK.replace(&lock_source, &format!("git+{ENGINE_GIT}?rev={rev}#{other}")),
+        LOCK.replace(&lock_source, &format!("git+{ENGINE_GIT}?branch=main#{rev}")),
+    ] {
+        assert_ne!(tampered, LOCK);
+        assert_eq!(
+            check_engine_lock(MANIFEST, &tampered),
+            Err("tokscale-core: lock source does not match the manifest rev".into())
+        );
+    }
+    // A rev change in the manifest alone fails the same check.
+    assert_eq!(
+        check_engine_lock(&MANIFEST.replace(&rev, &other), LOCK),
+        Err("tokscale-core: lock source does not match the manifest rev".into())
+    );
+    // And the baseline catches the changed source as well.
+    assert_eq!(
+        check_lock(
+            &LOCK.replace(
+                &lock_source,
+                &format!("git+{ENGINE_GIT}?rev={other}#{other}")
+            ),
+            &baseline(),
+            NEW_PACKAGE_ALLOWLIST
+        )
+        .unwrap_err(),
+        r#"baseline package changed: ("tokscale-core", "3.0.0")"#
+    );
 }
 
 #[test]

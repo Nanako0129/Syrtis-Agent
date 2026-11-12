@@ -1,0 +1,605 @@
+{
+  "bases": {
+    "codexRoot": "home/.codex (CODEX_HOME fallback)",
+    "configDir": "the owner's config dir",
+    "dataDir": "the owner's data dir (XDG_DATA_HOME substitute)",
+    "grokRoot": "home/.grok (GROK_HOME fallback)",
+    "hermesRoot": "home/.hermes (HERMES_HOME fallback)",
+    "home": "the owner's home"
+  },
+  "clients": [
+    {
+      "fallbackRelative": null,
+      "id": "opencode",
+      "relative": "opencode/storage/message",
+      "root": "XdgData",
+      "source": "src/clients.rs:260",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "claude",
+      "relative": ".claude/projects",
+      "root": "Home",
+      "source": "src/clients.rs:269",
+      "var": null
+    },
+    {
+      "fallbackRelative": ".codex",
+      "id": "codex",
+      "relative": "sessions",
+      "root": "EnvVar",
+      "source": "src/clients.rs:281",
+      "var": "CODEX_HOME"
+    },
+    {
+      "fallbackRelative": null,
+      "id": "cursor",
+      "relative": ".config/tokscale/cursor-cache",
+      "root": "Home",
+      "source": "src/clients.rs:290",
+      "var": null
+    },
+    {
+      "fallbackRelative": ".gemini",
+      "id": "gemini",
+      "relative": "tmp",
+      "root": "EnvVar",
+      "source": "src/clients.rs:302",
+      "var": "GEMINI_CLI_HOME"
+    },
+    {
+      "fallbackRelative": null,
+      "id": "amp",
+      "relative": "amp/threads",
+      "root": "XdgData",
+      "source": "src/clients.rs:311",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "droid",
+      "relative": ".factory/sessions",
+      "root": "Home",
+      "source": "src/clients.rs:320",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "openclaw",
+      "relative": ".openclaw/agents",
+      "root": "Home",
+      "source": "src/clients.rs:329",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "pi",
+      "relative": ".pi/agent/sessions",
+      "root": "Home",
+      "source": "src/clients.rs:338",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "kimi",
+      "relative": ".kimi/sessions",
+      "root": "Home",
+      "source": "src/clients.rs:347",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "qwen",
+      "relative": ".qwen/projects",
+      "root": "Home",
+      "source": "src/clients.rs:356",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "roocode",
+      "relative": ".config/Code/User/globalStorage/rooveterinaryinc.roo-cline/tasks",
+      "root": "Home",
+      "source": "src/clients.rs:365",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "kilocode",
+      "relative": ".config/Code/User/globalStorage/kilocode.kilo-code/tasks",
+      "root": "Home",
+      "source": "src/clients.rs:374",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "mux",
+      "relative": ".mux/sessions",
+      "root": "Home",
+      "source": "src/clients.rs:383",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "kilo",
+      "relative": "kilo/kilo.db",
+      "root": "XdgData",
+      "source": "src/clients.rs:392",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "crush",
+      "relative": "crush/projects.json",
+      "root": "XdgData",
+      "source": "src/clients.rs:401",
+      "var": null
+    },
+    {
+      "fallbackRelative": ".hermes",
+      "id": "hermes",
+      "relative": "state.db",
+      "root": "EnvVar",
+      "source": "src/clients.rs:413",
+      "var": "HERMES_HOME"
+    },
+    {
+      "fallbackRelative": null,
+      "id": "copilot",
+      "relative": ".copilot/otel",
+      "root": "Home",
+      "source": "src/clients.rs:422",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "goose",
+      "relative": "goose/sessions/sessions.db",
+      "root": "XdgData",
+      "source": "src/clients.rs:431",
+      "var": null
+    },
+    {
+      "fallbackRelative": ".config/manicode",
+      "id": "codebuff",
+      "relative": "projects",
+      "root": "EnvVar",
+      "source": "src/clients.rs:443",
+      "var": "CODEBUFF_DATA_DIR"
+    },
+    {
+      "fallbackRelative": null,
+      "id": "antigravity",
+      "relative": "antigravity-cache/sessions",
+      "root": "Config",
+      "source": "src/clients.rs:452",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "zed",
+      "relative": "zed/threads/threads.db",
+      "root": "XdgData",
+      "source": "src/clients.rs:461",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "kiro",
+      "relative": ".kiro/sessions/cli",
+      "root": "Home",
+      "source": "src/clients.rs:470",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "trae",
+      "relative": "trae-cache/sessions",
+      "root": "Config",
+      "source": "src/clients.rs:479",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "warp",
+      "relative": "warp-cache",
+      "root": "Config",
+      "source": "src/clients.rs:488",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "cline",
+      "relative": ".config/Code/User/globalStorage/saoudrizwan.claude-dev/tasks",
+      "root": "Home",
+      "source": "src/clients.rs:497",
+      "var": null
+    },
+    {
+      "fallbackRelative": ".gemini",
+      "id": "antigravity-cli",
+      "relative": "antigravity-cli/conversations",
+      "root": "EnvVar",
+      "source": "src/clients.rs:515",
+      "var": "GEMINI_CLI_HOME"
+    },
+    {
+      "fallbackRelative": ".jcode",
+      "id": "jcode",
+      "relative": "sessions",
+      "root": "EnvVar",
+      "source": "src/clients.rs:533",
+      "var": "JCODE_HOME"
+    },
+    {
+      "fallbackRelative": null,
+      "id": "micode",
+      "relative": "mimocode",
+      "root": "XdgData",
+      "source": "src/clients.rs:548",
+      "var": null
+    },
+    {
+      "fallbackRelative": ".gjc/agent",
+      "id": "gjc",
+      "relative": "sessions",
+      "root": "EnvVar",
+      "source": "src/clients.rs:564",
+      "var": "GJC_CODING_AGENT_DIR"
+    },
+    {
+      "fallbackRelative": ".grok",
+      "id": "grok",
+      "relative": "sessions",
+      "root": "EnvVar",
+      "source": "src/clients.rs:582",
+      "var": "GROK_HOME"
+    },
+    {
+      "fallbackRelative": null,
+      "id": "junie",
+      "relative": ".junie/sessions",
+      "root": "Home",
+      "source": "src/clients.rs:591",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "opencodereview",
+      "relative": ".opencodereview/sessions",
+      "root": "Home",
+      "source": "src/clients.rs:600",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "zcode",
+      "relative": ".zcode/cli/db/db.sqlite",
+      "root": "Home",
+      "source": "src/clients.rs:613",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "augment",
+      "relative": ".augment/sessions",
+      "root": "Home",
+      "source": "src/clients.rs:626",
+      "var": null
+    },
+    {
+      "fallbackRelative": ".hindsight",
+      "id": "hindsight",
+      "relative": "usage",
+      "root": "EnvVar",
+      "source": "src/clients.rs:642",
+      "var": "HINDSIGHT_HOME"
+    },
+    {
+      "fallbackRelative": null,
+      "id": "muse",
+      "relative": "muse/sessions",
+      "root": "XdgData",
+      "source": "src/clients.rs:656",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "reasonix",
+      "relative": "stats",
+      "root": "ReasonixHome",
+      "source": "src/clients.rs:669",
+      "var": null
+    },
+    {
+      "fallbackRelative": ".config/kimchi/harness",
+      "id": "kimchi",
+      "relative": "sessions",
+      "root": "EnvVar",
+      "source": "src/clients.rs:684",
+      "var": "KIMCHI_CODING_AGENT_DIR"
+    },
+    {
+      "fallbackRelative": ".senpi/agent",
+      "id": "senpi",
+      "relative": "sessions",
+      "root": "EnvVar",
+      "source": "src/clients.rs:700",
+      "var": "SENPI_CODING_AGENT_DIR"
+    },
+    {
+      "fallbackRelative": null,
+      "id": "omp",
+      "relative": ".omp/agent/sessions",
+      "root": "Home",
+      "source": "src/clients.rs:714",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "dsh",
+      "relative": ".dsh/sessions",
+      "root": "Home",
+      "source": "src/clients.rs:728",
+      "var": null
+    },
+    {
+      "fallbackRelative": null,
+      "id": "antigravity-extension",
+      "relative": ".gemini/antigravity/conversations",
+      "root": "Home",
+      "source": "src/clients.rs:745",
+      "var": null
+    }
+  ],
+  "derivedFrom": "tokscale-core CLIENTS (src/clients.rs) and the hard-coded extra roots of scan_all_clients_resolved_inner (src/scanner.rs:1401-1794) and its helpers; remote contexts resolve env-var roots to home/<fallbackRelative> (src/source_context.rs:1133)",
+  "engineSha": "e156d67caa9708458fd2030f379d3c2a77ff05bf",
+  "extraRoots": [
+    {
+      "base": "home",
+      "client": "kimi",
+      "relative": ".kimi-code/sessions",
+      "source": "src/scanner.rs:1471,1475"
+    },
+    {
+      "base": "home",
+      "client": "kimi",
+      "note": "macOS; suffix src/scanner.rs:904",
+      "relative": "Library/Application Support/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions",
+      "source": "src/scanner.rs:938"
+    },
+    {
+      "base": "grokRoot",
+      "client": "grok",
+      "note": "also derived from each found sessions/ ancestor, src/scanner.rs:1049",
+      "relative": "logs/unified.jsonl",
+      "source": "src/scanner.rs:1036"
+    },
+    {
+      "base": "home",
+      "client": "kiro",
+      "note": "macOS",
+      "relative": "Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent",
+      "source": "src/scanner.rs:1494"
+    },
+    {
+      "base": "home",
+      "client": "kiro",
+      "note": "macOS",
+      "relative": "Library/Application Support/kiro/User/globalStorage/kiro.kiroagent",
+      "source": "src/scanner.rs:1495"
+    },
+    {
+      "base": "home",
+      "client": "kiro",
+      "relative": ".kiro/sessions",
+      "source": "src/scanner.rs:1503"
+    },
+    {
+      "base": "home",
+      "client": "claude",
+      "relative": ".claude/transcripts",
+      "source": "src/scanner.rs:1518"
+    },
+    {
+      "base": "home",
+      "client": "claude",
+      "note": "variant configDir is file content; admitted only below an approved root (admits_scan_root)",
+      "relative": ".cc-mirror",
+      "source": "src/cc_mirror.rs:23"
+    },
+    {
+      "base": "home",
+      "client": "claude",
+      "relative": "Library/Application Support/Claude/local-agent-mode-sessions",
+      "source": "src/scanner.rs:732"
+    },
+    {
+      "base": "dataDir",
+      "client": "opencode",
+      "note": "database discovery; bypasses admits_scan_root",
+      "relative": "opencode",
+      "source": "src/scanner.rs:1542"
+    },
+    {
+      "base": "codexRoot",
+      "client": "codex",
+      "relative": "sessions",
+      "source": "src/scanner.rs:1561"
+    },
+    {
+      "base": "home",
+      "client": "codex",
+      "relative": ".codex/archived_sessions",
+      "source": "src/source_context.rs:519"
+    },
+    {
+      "base": "home",
+      "client": "codex",
+      "note": "headless root; codex/ below it, src/scanner.rs:1572",
+      "relative": ".config/tokscale/headless",
+      "source": "src/scanner.rs:1365"
+    },
+    {
+      "base": "home",
+      "client": "codex",
+      "note": "headless root; codex/ below it, src/scanner.rs:1572",
+      "relative": "Library/Application Support/tokscale/headless",
+      "source": "src/scanner.rs:1366"
+    },
+    {
+      "base": "home",
+      "client": "openclaw",
+      "relative": ".clawdbot/agents",
+      "source": "src/scanner.rs:1581"
+    },
+    {
+      "base": "home",
+      "client": "openclaw",
+      "relative": ".moltbot/agents",
+      "source": "src/scanner.rs:1582"
+    },
+    {
+      "base": "home",
+      "client": "openclaw",
+      "relative": ".moldbot/agents",
+      "source": "src/scanner.rs:1583"
+    },
+    {
+      "base": "dataDir",
+      "client": "synthetic",
+      "note": "bypasses admits_scan_root",
+      "relative": "octofriend/sqlite.db",
+      "source": "src/scanner.rs:1589"
+    },
+    {
+      "base": "home",
+      "client": "vscode-tasks",
+      "note": "roocode, kilocode, cline; extensions src/scanner.rs:961-963",
+      "relative": "Library/Application Support/Code/User/globalStorage/<extension>/tasks",
+      "source": "src/scanner.rs:980"
+    },
+    {
+      "base": "home",
+      "client": "vscode-tasks",
+      "relative": "AppData/Roaming/Code/User/globalStorage/<extension>/tasks",
+      "source": "src/scanner.rs:983"
+    },
+    {
+      "base": "home",
+      "client": "vscode-tasks",
+      "relative": ".vscode-server/data/User/globalStorage/<extension>/tasks",
+      "source": "src/scanner.rs:984"
+    },
+    {
+      "base": "hermesRoot",
+      "client": "hermes",
+      "note": "bypasses admits_scan_root",
+      "relative": "state.db",
+      "source": "src/scanner.rs:1628"
+    },
+    {
+      "base": "hermesRoot",
+      "client": "hermes",
+      "note": "bypasses admits_scan_root",
+      "relative": "profiles/<profile>/state.db",
+      "source": "src/scanner.rs:666"
+    },
+    {
+      "base": "home",
+      "client": "hermes",
+      "note": "bypasses admits_scan_root",
+      "relative": "AppData/Local/hermes",
+      "source": "src/scanner.rs:1624"
+    },
+    {
+      "base": "home",
+      "client": "goose",
+      "note": "bypasses admits_scan_root",
+      "relative": "Library/Application Support/goose/sessions/sessions.db",
+      "source": "src/scanner.rs:1664"
+    },
+    {
+      "base": "home",
+      "client": "goose",
+      "note": "bypasses admits_scan_root",
+      "relative": "Library/Application Support/Block/goose/sessions/sessions.db",
+      "source": "src/scanner.rs:1665"
+    },
+    {
+      "base": "home",
+      "client": "goose",
+      "note": "bypasses admits_scan_root",
+      "relative": ".local/share/Block/goose/sessions/sessions.db",
+      "source": "src/scanner.rs:1666"
+    },
+    {
+      "base": "home",
+      "client": "goose",
+      "note": "bypasses admits_scan_root",
+      "relative": "AppData/Roaming/Block/goose/data/sessions/sessions.db",
+      "source": "src/scanner.rs:1013"
+    },
+    {
+      "base": "home",
+      "client": "zed",
+      "note": "macOS; bypasses admits_scan_root",
+      "relative": "Library/Application Support/Zed/threads/threads.db",
+      "source": "src/scanner.rs:1676"
+    },
+    {
+      "base": "home",
+      "client": "zed",
+      "note": "bypasses admits_scan_root",
+      "relative": "AppData/Local/Zed/threads/threads.db",
+      "source": "src/scanner.rs:1678"
+    },
+    {
+      "base": "dataDir",
+      "client": "crush",
+      "note": "entry data_dir is file content; admitted only below an approved root, src/scanner.rs:1696",
+      "relative": "crush/projects.json",
+      "source": "src/scanner.rs:1692"
+    },
+    {
+      "base": "home",
+      "client": "kiro",
+      "note": "bypasses admits_scan_root",
+      "relative": ".local/share/kiro-cli/data.sqlite3",
+      "source": "src/scanner.rs:1704"
+    },
+    {
+      "base": "home",
+      "client": "kiro",
+      "note": "bypasses admits_scan_root",
+      "relative": "Library/Application Support/kiro-cli/data.sqlite3",
+      "source": "src/scanner.rs:1705"
+    },
+    {
+      "base": "home",
+      "client": "codebuff",
+      "relative": ".config/manicode/projects",
+      "source": "src/scanner.rs:1729"
+    },
+    {
+      "base": "home",
+      "client": "codebuff",
+      "relative": ".config/manicode-dev/projects",
+      "source": "src/scanner.rs:1729"
+    },
+    {
+      "base": "home",
+      "client": "codebuff",
+      "relative": ".config/manicode-staging/projects",
+      "source": "src/scanner.rs:1729"
+    },
+    {
+      "base": "home",
+      "client": "copilot",
+      "note": "bypasses admits_scan_root",
+      "relative": ".copilot/data.db",
+      "source": "src/scanner.rs:1771"
+    }
+  ]
+}

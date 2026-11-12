@@ -93,6 +93,19 @@
 # frozen install_objects paths, the descriptor-relative directory walk,
 # the autostart templates, the uninstall order and the purge rule). No
 # existing line changed.
+#
+# SA-2B3cd adds spec/source-v1.md, the report source contract (engine pin
+# and provenance exception, secure-root layout, owner inputs and the
+# approved-scope record, report steps, D1 containment, non-claims), and
+# the D1 fixtures tests/fixtures/v1/source/default-roots.json and
+# environment-keys.json, and codex-duration-timing.jsonl (the engine's own
+# Codex timing fixture, copied at the pin). tests/dependency_provenance_v1.rs changed on
+# purpose: tokscale-core is the one git dependency allowed, pinned to a
+# full SHA that the lock must repeat. The lock baseline fixture changed on
+# purpose: it adds the 209 packages tokscale-core brings, four fields each.
+# Review fix: spec/source-v1.md now fixes the ownerInputsSha256 encoding in
+# this crate (an engine pin cannot move it) and points at the state-store
+# spec's own statement of the tokscale-core exception.
 4eb5d2ca0aa2906676095dd4d2450d142f15fd6e8cdfbff774ee9d7cbf2e9373  spec/cache-store-v1.md
 055a5c81aade6aec75c8f43bccb8128ab22ca1691b15b690ca833d0005176a2f  spec/install-v1.md
 cb6f2e04a7968c74612fac18fcb9ed0e9e5b1a6d6ce746830463165e77f64e40  spec/control-v1.md
@@ -102,13 +115,14 @@ f1fc58f85411a7c99b20ca164837823cc236b0123cfdf2b706b9efa86e939755  spec/runtime-v
 3cce5944bf106ca5e5503505f3b4150f192eead0db3f9b1a3fdaf3617ae1c59b  spec/peer-store-v1.md
 79d1c0363e4576d67827ebfa029fad7e3a5981474f4aafba3bd71e54f1a98172  spec/report-cache-v1.md
 4234cdfdf319cf41907cbd34273067a3895473d84c4ab85d430bc2cbbe8791c0  spec/security-v1.md
-e4bacecf31da7a8dc58a40b6e2c2360661edfc8a2e199283cce051946803d9ff  spec/state-store-v1.md
+1b125846c4aa9f5d70bd7c4ab4f07f99decd5087a20f4a9f3e7e900c524202f5  spec/state-store-v1.md
 c550bcafe14707a45ad0b661ce1afc7ba383153cbbdede4ff0e839175fa89726  spec/v1.md
+664be76e61819794682d69c8ecccfbb126f2559a65bff06aa111c0fcb7bee1a1  spec/source-v1.md
 ff21cbcfdd6aedfb68ac1b3cfda056663203f2c7f08fd05a856dc5dbe5e4c25a  src/cache.rs
 8b0add8d4fde2253edebdddd448d381559d63ff630f0e9d2f9faad8d9625567f  src/canonical.rs
 e3f35e33b4b26bab06e243d14eb087b5b2405a3b093a6a744cc84a5a36573ab0  src/report.rs
 3960f1c52ce6edb2409aa4b370649b4d2f8ed4b74396a028ac1798b1e9eb6434  src/security.rs
-80b495608d9c3add30cae81454f32bb66459f652d2a039c5d5c9d99dac10955d  tests/dependency_provenance_v1.rs
+c8b01baf8a687f066d8d361963b262d903e7776949ccf971130200759c86a167  tests/dependency_provenance_v1.rs
 e01e9d55a26fb4f807ff0baea4a9681b0cbbb86b61f6b00fe5c49d919a2ebb10  tests/fixtures/v1/cache/body.sha256
 edb92226baac009e4c7779cb2c7a7369049e0ea97615945f8e64378322785b19  tests/fixtures/v1/cache/filename.txt
 417b8bac17da40d1de4fee3e71f3a13770427d98ac764313f3d1074e4cb64002  tests/fixtures/v1/cache/key.json
@@ -117,7 +131,7 @@ e3437af54f3292180d1510ca274cc445d243d777188f1e441dec50a9d1450ffc  tests/fixtures
 e222989ac752a128717fc37b48e8f5c625d5883c0be98d761c3ac19d298a2b72  tests/fixtures/v1/report/graph.json
 c02dccddf2ffbb5c86f0a0230db59e59276efece0970aad85252d78af6d31d05  tests/fixtures/v1/report/hourly.json
 60c2996518decd1ec26e810df8b92a32298530947e3df5eb59db1aaa4294d07c  tests/fixtures/v1/report/models.json
-070b5d28018b353eae1d53658f43a8c45d0f50205c86050e45cb6ad4d212f09c  tests/fixtures/v1/runtime/storage/cargo-lock-baseline.json
+6f4b4b0a76a50ea2ca666007e29847b17db82d95860573f6d9f93e424a1ee7e3  tests/fixtures/v1/runtime/storage/cargo-lock-baseline.json
 f8326f22b3df9d37df1ec1eea8dd6b4a160de6022b3a226a35bb618c4345f4e0  tests/fixtures/v1/runtime/storage/state-golden.json
 df32654d66d2771e741700d81590d4be410ec999faac30bfdc4774a9b3636070  tests/fixtures/v1/security/consent.json
 a58bdd593173195fa9042f6c0e4065a11d553fcc88d4ae79bfc1a5e31f16692e  tests/fixtures/v1/security/control_mac.hex
@@ -130,5 +144,8 @@ e9f5d447789c312512b032924249478407a916ddd6bf6ef99679f28f2550dc7a  tests/fixtures
 cd289e2421e745c59b5798ffc29fcecb02836444f77e816794d62e6f4a2a688e  tests/fixtures/v1/security/sas.txt
 94653acee749d3612203b35dc400df8d7c4a93272af47f2cdeb10d2f6e14cb00  tests/fixtures/v1/security/state_transitions.json
 cbd942c4fd168b5d78fbfc469acd06cb62f77c026fcbc256285c6c7d9680fdd1  tests/fixtures/v1/security/uninstall.json
+212a6d74e16ee8b4a5f92414d0894fb9334eb40041ed9cc0b78c5962391cbf77  tests/fixtures/v1/source/codex-duration-timing.jsonl
+38d0e47b6ae5cd875d8962896e3d1fd51a1ccf66a25b5a9c97757d6784bda9ca  tests/fixtures/v1/source/default-roots.json
+6f0060490f34a9b82231d9f0bb85a4a7ef1394f7722879a0dabaeffdcb09b020  tests/fixtures/v1/source/environment-keys.json
 39c2823d68bf6de7854574899b606167897c21292037b8ed359b19fe2e08062c  tests/report_cache_v1.rs
 b5d5ed7cab7e0046e7ec82e1c4825f1ddac075b3b6bd18aab69f323e69e45c89  tests/security_contract_v1.rs
