@@ -9,6 +9,7 @@
 #![cfg(unix)]
 
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
     time::Instant,
@@ -54,17 +55,72 @@ struct ApprovedScope {
     schema: u64,
 }
 
-/// What the consent binds to: only inputs the owner controls. The engine's
-/// own fingerprint also hashes its client table and resolver version, so it
-/// changes with every pin and is not used here (D1).
+/// What the consent binds to: only inputs the owner controls, in an
+/// encoding this crate fixes (field names here, paths as UTF-8 strings,
+/// every list sorted and deduplicated, maps ordered by key). Neither the
+/// engine's fingerprint (it hashes the engine's client table and resolver
+/// version) nor the engine's serde form of `ScannerSettings` (a new engine
+/// field would serialize as a default) is used, so an engine pin alone
+/// never changes the digest (D1).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct OwnerInputs<'a> {
-    config_dir: &'a Path,
-    data_dir: &'a Path,
-    home: &'a Path,
-    scanner_settings: &'a ScannerSettings,
-    source_cache_dir: &'a Path,
+struct OwnerInputs {
+    config_dir: String,
+    data_dir: String,
+    excluded_scan_paths: BTreeMap<String, Vec<String>>,
+    extra_scan_paths: BTreeMap<String, Vec<String>>,
+    home: String,
+    opencode_db_paths: Vec<String>,
+    source_cache_dir: String,
+}
+
+/// `ownerInputsSha256` for these inputs: SHA-256 of the CanonicalJsonV1
+/// encoding of [`OwnerInputs`], lowercase hex. `None` when a path is not
+/// UTF-8 or a string is not NFC.
+pub fn owner_inputs_sha256(
+    home: &Path,
+    config_dir: &Path,
+    data_dir: &Path,
+    source_cache_dir: &Path,
+    settings: &ScannerSettings,
+) -> Option<String> {
+    // Exhaustive on purpose, no `..`: an engine pin that adds a settings
+    // field stops compiling here, and the field must be either hashed (a
+    // consent change) or stated as not an owner input.
+    let ScannerSettings {
+        opencode_db_paths,
+        extra_scan_paths,
+        excluded_scan_paths,
+    } = settings;
+    fn text(path: &Path) -> Option<String> {
+        path.to_str().map(str::to_owned)
+    }
+    fn list(paths: &[PathBuf]) -> Option<Vec<String>> {
+        let mut texts = paths
+            .iter()
+            .map(|path| text(path))
+            .collect::<Option<Vec<_>>>()?;
+        texts.sort_unstable();
+        texts.dedup();
+        Some(texts)
+    }
+    fn map(paths: &BTreeMap<String, Vec<PathBuf>>) -> Option<BTreeMap<String, Vec<String>>> {
+        paths
+            .iter()
+            .map(|(client, paths)| Some((client.clone(), list(paths)?)))
+            .collect()
+    }
+    let inputs = OwnerInputs {
+        config_dir: text(config_dir)?,
+        data_dir: text(data_dir)?,
+        excluded_scan_paths: map(excluded_scan_paths)?,
+        extra_scan_paths: map(extra_scan_paths)?,
+        home: text(home)?,
+        opencode_db_paths: list(opencode_db_paths)?,
+        source_cache_dir: text(source_cache_dir)?,
+    };
+    let bytes = CanonicalJsonV1::encode(&inputs).ok()?;
+    Some(hex_encode(&Sha256::digest(&bytes)))
 }
 
 /// The engine-backed [`ReportSource`].
@@ -116,14 +172,9 @@ impl EngineSource {
             &settings,
         )
         .map_err(|_| invalid)?;
-        let inputs = CanonicalJsonV1::encode(&OwnerInputs {
-            config_dir: &config_dir,
-            data_dir: &data_dir,
-            home: &home,
-            scanner_settings: &settings,
-            source_cache_dir: &source_cache_dir,
-        })
-        .map_err(|_| invalid)?;
+        let owner_inputs_sha256 =
+            owner_inputs_sha256(&home, &config_dir, &data_dir, &source_cache_dir, &settings)
+                .ok_or(invalid)?;
         Ok(Self {
             root,
             home,
@@ -132,7 +183,7 @@ impl EngineSource {
             source_cache_dir,
             pricing_dir,
             settings,
-            owner_inputs_sha256: hex_encode(&Sha256::digest(&inputs)),
+            owner_inputs_sha256,
             approving: Mutex::new(()),
         })
     }

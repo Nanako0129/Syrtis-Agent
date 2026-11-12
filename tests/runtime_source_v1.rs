@@ -163,7 +163,7 @@ mod engine {
             AGGREGATION_REVISION, PEER_PROTOCOL_VERSION, REPORT_SCHEMA_VERSION, SecurityError,
             TZDB_REVISION,
         },
-        source::{EngineSource, PRICING_DIR, SCOPE_FILE, SOURCE_CACHE_DIR},
+        source::{EngineSource, PRICING_DIR, SCOPE_FILE, SOURCE_CACHE_DIR, owner_inputs_sha256},
         state_store::StateStore,
     };
     use tokscale_core::{
@@ -537,7 +537,11 @@ mod engine {
         with_exclusion
             .excluded_scan_paths
             .insert("claude".into(), vec![home.path.join("excluded")]);
-        for settings in [with_root, with_exclusion] {
+        let mut with_db = ScannerSettings::default();
+        with_db
+            .opencode_db_paths
+            .push(home.path.join("custom/opencode.db"));
+        for settings in [with_root, with_exclusion, with_db] {
             let changed = source(&store, &home.path, settings);
             assert!(denied(&changed, generation(&store)));
             store
@@ -548,7 +552,94 @@ mod engine {
             report(&changed, Endpoint::Graph, now);
             assert!(denied(&original, now));
         }
-        assert_eq!(generation(&store), first + 2);
+        assert_eq!(generation(&store), first + 3);
+    }
+
+    /// D1 golden: the owner-inputs digest of one fixed input set. The
+    /// encoding is this crate's (`spec/source-v1.md`), so an engine pin
+    /// cannot move it; a change here is a consent change and shows in review.
+    #[test]
+    fn the_owner_inputs_digest_is_fixed_by_this_crate() {
+        let path = |p: &str| PathBuf::from(p);
+        let mut settings = ScannerSettings {
+            opencode_db_paths: vec![path("/h/b.db"), path("/h/a.db"), path("/h/a.db")],
+            ..Default::default()
+        };
+        settings
+            .extra_scan_paths
+            .insert("codex".into(), vec![path("/x/2"), path("/x/1")]);
+        settings
+            .extra_scan_paths
+            .insert("claude".into(), vec![path("/x/3")]);
+        settings
+            .excluded_scan_paths
+            .insert("claude".into(), vec![path("/h/skip")]);
+        let digest = |home: &str, config: &str, data: &str, cache: &str, s: &ScannerSettings| {
+            owner_inputs_sha256(&path(home), &path(config), &path(data), &path(cache), s).unwrap()
+        };
+        let golden = digest(
+            "/h",
+            "/h/.config",
+            "/h/.local/share",
+            "/h/agent/source-cache",
+            &settings,
+        );
+        assert_eq!(
+            golden,
+            "9f07223adde208853b7fcd904707f1183188dd3237c08ed40b0aa7af287bfbe2"
+        );
+
+        // List order and duplicates are not owner choices.
+        let mut reordered = settings.clone();
+        reordered.opencode_db_paths = vec![path("/h/a.db"), path("/h/b.db")];
+        reordered
+            .extra_scan_paths
+            .insert("codex".into(), vec![path("/x/1"), path("/x/2")]);
+        assert_eq!(
+            digest(
+                "/h",
+                "/h/.config",
+                "/h/.local/share",
+                "/h/agent/source-cache",
+                &reordered
+            ),
+            golden
+        );
+
+        // Every owner field moves the digest.
+        let mut changed = Vec::new();
+        for (home, config, data, cache) in [
+            (
+                "/g",
+                "/h/.config",
+                "/h/.local/share",
+                "/h/agent/source-cache",
+            ),
+            ("/h", "/h/cfg", "/h/.local/share", "/h/agent/source-cache"),
+            ("/h", "/h/.config", "/h/data", "/h/agent/source-cache"),
+            ("/h", "/h/.config", "/h/.local/share", "/h/other-cache"),
+        ] {
+            changed.push(digest(home, config, data, cache, &settings));
+        }
+        let mut without_db = settings.clone();
+        without_db
+            .opencode_db_paths
+            .retain(|p| p != &path("/h/b.db"));
+        let mut without_extra = settings.clone();
+        without_extra.extra_scan_paths.remove("claude");
+        let mut without_excluded = settings.clone();
+        without_excluded.excluded_scan_paths.clear();
+        for s in [without_db, without_extra, without_excluded] {
+            changed.push(digest(
+                "/h",
+                "/h/.config",
+                "/h/.local/share",
+                "/h/agent/source-cache",
+                &s,
+            ));
+        }
+        let distinct: BTreeSet<&String> = changed.iter().chain([&golden]).collect();
+        assert_eq!(distinct.len(), changed.len() + 1, "{changed:?}");
     }
 
     /// Acceptance (2): approving changed inputs without the generation
