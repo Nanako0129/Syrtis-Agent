@@ -6,7 +6,7 @@ This document fixes how the producer and receiver report caches are stored on di
 
 > A cache entry grants nothing. This module reads no state and decides no grant; whether a request may be served from the producer cache, and whether a receiver entry may be shown, is the caller's decision (`SA-2B3b`). Every cache error, including `unsafeState` and `unknown`, is at most a miss, never an authorization.
 
-Not in this slice: calling the store from `serve`, `fetch`, housekeeping or revoke (`SA-2B3b`), the engine (`SA-2B3c`, `SA-2B3d`), clearing on uninstall (`SA-2B3e`), Windows (no secure root can be opened there, so no store either).
+Callers: the runtime writes and reads the receiver namespace (`Runtime::pull`, `Runtime::last_good`, housekeeping; `spec/runtime-v1.md`). Nothing calls the producer namespace: the report service does not cache. Clearing on uninstall is the install adapter's. Not here: Windows (no secure root can be opened there, so no store either).
 
 ## Root and namespaces
 
