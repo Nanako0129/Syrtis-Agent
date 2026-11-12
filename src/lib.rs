@@ -2,6 +2,7 @@ pub mod cache;
 pub mod canonical;
 pub mod noise;
 pub mod pairing;
+pub mod peer_store;
 pub mod report;
 pub mod secure_fs;
 pub mod security;

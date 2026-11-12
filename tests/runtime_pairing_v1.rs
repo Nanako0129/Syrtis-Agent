@@ -31,7 +31,7 @@ use syrtis_agent::{
     secure_fs::StorageError,
     security::{
         FRAME_CIPHERTEXT_MAX, Frame, FrameKind, MemoryLedger, PairOffer, REMOTE_MEMORY_MAX,
-        hex_encode, offer_secret_hash, pair_sas,
+        hex_encode, offer_secret_hash, pair_sas, pair_url,
     },
 };
 
@@ -306,6 +306,8 @@ fn the_pending_and_grant_ids_follow_the_specified_formulas() {
 // ------------------------------------------------------- shared harness
 
 const NOW: i64 = 1_700_000_000;
+/// The effective now every claim here is parsed at.
+const NOW_MS: i64 = NOW * 1_000;
 const LONG: Duration = Duration::from_secs(15);
 
 type Hook<'a> = Box<dyn FnMut(Duration) + Send + 'a>;
@@ -448,7 +450,7 @@ fn claimed_for(key: &StaticKey, port: u16, pending_id: [u8; 16]) -> Claimed {
 
 fn fake_offer(key: &StaticKey, port: u16) -> PairOffer {
     PairOffer {
-        expires_at: 0,
+        expires_at: NOW_MS + 600_000,
         host: "127.0.0.1".into(),
         offer_id: hex_encode(&offer_id(1)),
         port,
@@ -456,6 +458,20 @@ fn fake_offer(key: &StaticKey, port: u16) -> PairOffer {
         secret: hex_encode(&secret(1)),
         version: 1,
     }
+}
+
+/// The Pair URL of [`fake_offer`], valid at [`NOW_MS`].
+fn fake_url(key: &StaticKey, port: u16) -> String {
+    pair_url(&fake_offer(key, port)).unwrap()
+}
+
+/// A Pair URL for any offer, including one `pair_url` would refuse to
+/// build: the frozen prefix and the hex of the offer's CanonicalJsonV1.
+fn raw_url(offer: &PairOffer) -> String {
+    format!(
+        "syrtis://pair?offer={}",
+        hex_encode(&CanonicalJsonV1::encode(offer).unwrap())
+    )
 }
 
 // ------------------------------------------------- tests on every OS
@@ -482,7 +498,7 @@ fn refused_connects_take_no_attempt_record() {
         clock: &clock,
     };
     let mut attempts = ClaimAttempts::default();
-    let result = client.claim(&fake_offer(&fake_key, refused_port()), &mut attempts);
+    let result = client.claim(&fake_url(&fake_key, refused_port()), NOW_MS, &mut attempts);
     assert_eq!(result, Err(ClientError::Transport(NoiseError::Io)));
     assert_eq!(attempts.used(&offer_id(1)), 0);
     // Four waits between five connects, all on the injected clock.
@@ -502,17 +518,19 @@ fn refused_connects_take_no_attempt_record() {
                 })),
             ))
         },
-        |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
+        |port| client.claim(&fake_url(&fake_key, port), NOW_MS, &mut attempts),
     );
     assert_eq!(count, 1);
     assert_eq!(result.map(|claimed| claimed.offer_id), Ok(offer_id(1)));
     assert_eq!(attempts.used(&offer_id(1)), 1);
 }
 
-/// B7: an offer with another `version` or a port below 1024 is refused
-/// before any connection.
+/// B7, SA-2B2a2 acceptance (8): a Pair URL the frozen `parse_pair_url`
+/// refuses (another `version`, a port below 1024, a malformed or
+/// non-canonical encoding, an expired or not-yet-valid lifetime) is
+/// `InvalidOffer` before any connection, and takes no record.
 #[test]
-fn an_offer_with_a_bad_version_or_port_is_refused_without_connecting() {
+fn a_bad_or_expired_pair_url_is_refused_without_connecting() {
     let fake_key = StaticKey::generate().unwrap();
     let receiver = StaticKey::generate().unwrap();
     let time = Mutex::new(Duration::ZERO);
@@ -530,40 +548,57 @@ fn an_offer_with_a_bad_version_or_port_is_refused_without_connecting() {
         |_, request, _| Some(unauthorized(request)),
         |port| {
             let mut attempts = ClaimAttempts::default();
-            let version = PairOffer {
-                version: 2,
-                ..fake_offer(&fake_key, port)
-            };
-            let low_port = PairOffer {
-                port: 1023,
-                ..fake_offer(&fake_key, port)
-            };
-            [
-                client.claim(&version, &mut attempts),
-                client.claim(&low_port, &mut attempts),
-            ]
+            let good = fake_url(&fake_key, port);
+            let urls = [
+                raw_url(&PairOffer {
+                    version: 2,
+                    ..fake_offer(&fake_key, port)
+                }),
+                raw_url(&PairOffer {
+                    port: 1023,
+                    ..fake_offer(&fake_key, port)
+                }),
+                "syrtis://pair?offer=zz".to_owned(),
+                good.to_ascii_uppercase(),
+                format!("{good} "),
+                String::new(),
+            ];
+            let mut results: Vec<_> = urls
+                .iter()
+                .map(|url| client.claim(url, NOW_MS, &mut attempts))
+                .collect();
+            // Expired (at or past `expiresAt`) and further off than an
+            // offer's longest lifetime.
+            for now in [NOW_MS + 600_000, NOW_MS + 700_000, NOW_MS - 400_000] {
+                results.push(client.claim(&good, now, &mut attempts));
+            }
+            (results, attempts.used(&offer_id(1)))
         },
     );
-    assert_eq!(
-        results,
-        [
-            Err(ClientError::InvalidOffer),
-            Err(ClientError::InvalidOffer)
-        ]
-    );
-    assert_eq!(count, 0, "no connection was made");
+    let (results, used) = results;
+    assert_eq!(results.len(), 9);
+    for (index, result) in results.into_iter().enumerate() {
+        assert_eq!(result, Err(ClientError::InvalidOffer), "url {index}");
+    }
+    assert_eq!((count, used), (0, 0), "no connection was made");
     // Control: the same offer with version 1 and its real port connects.
     let (result, count) = fake(
         &fake_key,
         |_, request, _| Some(unauthorized(request)),
-        |port| client.claim(&fake_offer(&fake_key, port), &mut ClaimAttempts::default()),
+        |port| {
+            client.claim(
+                &fake_url(&fake_key, port),
+                NOW_MS,
+                &mut ClaimAttempts::default(),
+            )
+        },
     );
     assert_eq!((result, count), (Err(ClientError::OfferUnusable), 1));
 }
 
 /// B10: `unauthorized`, `invalid` and `incompatible` stop both the claim
-/// and the poll on the first answer. The claim keeps that connection's
-/// attempt record: none of these answers removes one.
+/// and the poll on the first answer. Each is sent before any commit, so the
+/// claim removes the record that connection created (SA-2B2a2).
 #[test]
 fn a_refusing_answer_stops_claim_and_poll_at_once() {
     let fake_key = StaticKey::generate().unwrap();
@@ -599,13 +634,13 @@ fn a_refusing_answer_stops_claim_and_poll_at_once() {
         let (result, count) = fake(
             &fake_key,
             |_, request, _| Some(answer(request)),
-            |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
+            |port| client.claim(&fake_url(&fake_key, port), NOW_MS, &mut attempts),
         );
         assert_eq!((result, count), (Err(claim_error), 1), "claim {code}");
         assert_eq!(
             attempts.used(&offer_id(1)),
-            1,
-            "claim {code} keeps its record"
+            0,
+            "claim {code} removes its record"
         );
         let (result, count) = fake(
             &fake_key,
@@ -652,18 +687,17 @@ fn sas_for(responder: &StaticKey, receiver: &StaticKey, h_final: &[u8; 32]) -> S
     )
 }
 
-/// Acceptance (14) and the record rule: a transport failure after the
-/// handshake keeps its record (the request reached the producer and may
-/// have been committed) and the call retries. Each failure here is a lost
-/// reply: the receiver's ledger cannot hold it.
-///
-/// Four replies are lost and the fifth names the pending ID the first try
-/// derived: it is matched, and only the fifth connection's own record is
-/// removed (rule (b)). Then five lost replies use all five records, and
-/// the next try ends as a lost attempt without connecting. (A `busy`
-/// answer drops its record, so it cannot fill them.)
+/// Acceptance (14) and SA-2B2a2 acceptance (7), transport branch: a
+/// transport failure after the handshake (here a lost reply: the
+/// receiver's ledger cannot hold it) keeps its record, because the request
+/// may have reached the producer and been committed, and ends the call
+/// after that one connection. A later call answered with the first
+/// connection's pending ID shows the first SAS and keeps that one record.
+/// The scripted producer frees the ledger from its second connection on,
+/// so a client that retried within the call would succeed in the first
+/// call and fail the assertion instead of looping.
 #[test]
-fn transport_failures_after_the_handshake_keep_their_records_up_to_five() {
+fn a_transport_failure_after_the_handshake_keeps_its_record_and_ends_the_call() {
     let fake_key = StaticKey::generate().unwrap();
     let receiver = StaticKey::generate().unwrap();
     let time = Mutex::new(Duration::ZERO);
@@ -675,25 +709,37 @@ fn transport_failures_after_the_handshake_keep_their_records_up_to_five() {
         clock: &clock,
     };
     let secret_hash = offer_secret_hash(&offer_id(1), &secret(1), fake_key.public());
-
     let fill = Mutex::new(Some(ledger.reserve(REMOTE_MEMORY_MAX).unwrap()));
-    let mut first: Option<[u8; 32]> = None;
+    let first = Mutex::new(None);
+    let script = |n: usize, request: &Frame, h_final: &[u8; 32]| {
+        let first = *first.lock().unwrap().get_or_insert(*h_final);
+        if n == 0 {
+            return Some(claim_reply(request, &secret_hash, h_final));
+        }
+        // Released before the reply is written, so the client can read it.
+        fill.lock().unwrap().take();
+        Some(claim_reply(request, &secret_hash, &first))
+    };
     let mut attempts = ClaimAttempts::default();
+    let (result, count) = fake(&fake_key, script, |port| {
+        client.claim(&fake_url(&fake_key, port), NOW_MS, &mut attempts)
+    });
+    assert_eq!(
+        (result, count),
+        (Err(ClientError::Transport(NoiseError::Memory)), 1)
+    );
+    assert_eq!(attempts.used(&offer_id(1)), 1, "the record stays");
+    assert_eq!(*time.lock().unwrap(), Duration::ZERO, "no retry wait");
+    fill.lock().unwrap().take();
+    assert_eq!(ledger.used(), 0);
+
+    let h_first = first.lock().unwrap().unwrap();
     let (result, count) = fake(
         &fake_key,
-        |n, request, h_final| {
-            let first = *first.get_or_insert(*h_final);
-            if n < 4 {
-                return Some(claim_reply(request, &secret_hash, h_final));
-            }
-            // Released before the reply is written, so the client can read it.
-            fill.lock().unwrap().take();
-            Some(claim_reply(request, &secret_hash, &first))
-        },
-        |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
+        |_, request, _| Some(claim_reply(request, &secret_hash, &h_first)),
+        |port| client.claim(&fake_url(&fake_key, port), NOW_MS, &mut attempts),
     );
-    assert_eq!(count, 5);
-    let h_first = first.unwrap();
+    assert_eq!(count, 1);
     assert_eq!(
         result.map(|claimed| (claimed.pending_id, claimed.sas)),
         Ok((
@@ -701,26 +747,7 @@ fn transport_failures_after_the_handshake_keep_their_records_up_to_five() {
             sas_for(&fake_key, &receiver, &h_first)
         ))
     );
-    assert_eq!(attempts.used(&offer_id(1)), 4);
-    assert_eq!(ledger.used(), 0);
-
-    // Every reply would match its own attempt, but none can be read.
-    let fill = ledger.reserve(REMOTE_MEMORY_MAX).unwrap();
-    let mut attempts = ClaimAttempts::default();
-    let (result, count) = fake(
-        &fake_key,
-        |_, request, h_final| Some(claim_reply(request, &secret_hash, h_final)),
-        |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
-    );
-    assert_eq!((result, count), (Err(ClientError::LostAttempt), 5));
-    assert_eq!(attempts.used(&offer_id(1)), 5);
-    let (result, count) = fake(
-        &fake_key,
-        |_, request, h_final| Some(claim_reply(request, &secret_hash, h_final)),
-        |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
-    );
-    assert_eq!((result, count), (Err(ClientError::LostAttempt), 0));
-    drop(fill);
+    assert_eq!(attempts.used(&offer_id(1)), 1);
     assert_eq!(ledger.used(), 0);
 }
 
@@ -755,10 +782,10 @@ fn busy_claims_keep_no_record() {
             })
         },
         |port| {
-            let offer = fake_offer(&fake_key, port);
+            let url = fake_url(&fake_key, port);
             (0..3)
                 .map(|_| {
-                    let result = client.claim(&offer, &mut attempts);
+                    let result = client.claim(&url, NOW_MS, &mut attempts);
                     (result, attempts.used(&offer_id(1)), *time.lock().unwrap())
                 })
                 .collect::<Vec<_>>()
@@ -812,17 +839,20 @@ fn an_internal_answer_ends_the_call_and_keeps_its_record() {
     let first = Mutex::new(None);
     let mut attempts = ClaimAttempts::default();
     for call in 1..=4 {
+        // Only a call's first connection is answered `internal`; a client
+        // that went on within the call would get a success and fail the
+        // assertion rather than loop.
         let (result, count) = fake(
             &fake_key,
-            |_, request, h_final| {
+            |n, request, h_final| {
                 first.lock().unwrap().get_or_insert(*h_final);
-                Some(frame(
-                    FrameKind::Error,
-                    request.request_id,
-                    error_payload(8),
-                ))
+                Some(if n == 0 {
+                    frame(FrameKind::Error, request.request_id, error_payload(8))
+                } else {
+                    claim_reply(request, &secret_hash, h_final)
+                })
             },
-            |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
+            |port| client.claim(&fake_url(&fake_key, port), NOW_MS, &mut attempts),
         );
         assert_eq!(
             (result, count),
@@ -836,7 +866,7 @@ fn an_internal_answer_ends_the_call_and_keeps_its_record() {
     let (result, count) = fake(
         &fake_key,
         |_, request, _| Some(claim_reply(request, &secret_hash, &h_first)),
-        |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
+        |port| client.claim(&fake_url(&fake_key, port), NOW_MS, &mut attempts),
     );
     assert_eq!(count, 1);
     assert_eq!(
@@ -876,10 +906,10 @@ fn reclaiming_a_claimed_offer_keeps_one_record() {
             Some(claim_reply(request, &secret_hash, &first))
         },
         |port| {
-            let offer = fake_offer(&fake_key, port);
+            let url = fake_url(&fake_key, port);
             (0..7)
                 .map(|_| {
-                    let result = client.claim(&offer, &mut attempts);
+                    let result = client.claim(&url, NOW_MS, &mut attempts);
                     (
                         result.map(|claimed| (claimed.pending_id, claimed.sas)),
                         attempts.used(&offer_id(1)),
@@ -899,11 +929,11 @@ fn reclaiming_a_claimed_offer_keeps_one_record() {
     }
 }
 
-/// D4: within one call, a lost reply (record kept), then `busy` (that
-/// connection's record removed), then a success naming the first
-/// connection's pending ID. The client shows the first connection's SAS
-/// and keeps exactly that one record. Removing anything but the last
-/// record on `busy` (the whole list, or the first) loses the first
+/// D4: a lost reply ends the first call with its record kept; in the
+/// next call `busy` removes that connection's record and the retry, named
+/// with the first connection's pending ID, shows the first SAS and keeps
+/// exactly that one record. Removing anything but the record `busy`'s own
+/// connection created (the whole list, or the first) loses the first
 /// connection's record, and the success matches nothing.
 #[test]
 fn busy_removes_only_its_own_record() {
@@ -911,12 +941,8 @@ fn busy_removes_only_its_own_record() {
     let receiver = StaticKey::generate().unwrap();
     let time = Mutex::new(Duration::ZERO);
     let ledger = MemoryLedger::default();
-    let fill = Mutex::new(Some(ledger.reserve(REMOTE_MEMORY_MAX).unwrap()));
+    let fill = ledger.reserve(REMOTE_MEMORY_MAX).unwrap();
     let clock = FakeClock::new(&time);
-    // The first retry wait frees the ledger, so only the first reply is lost.
-    *clock.hook.lock().unwrap() = Box::new(|_| {
-        fill.lock().unwrap().take();
-    });
     let client = PairingClient {
         identity: &receiver,
         ledger: &ledger,
@@ -925,7 +951,7 @@ fn busy_removes_only_its_own_record() {
     let secret_hash = offer_secret_hash(&offer_id(1), &secret(1), fake_key.public());
     let first = Mutex::new(None);
     let mut attempts = ClaimAttempts::default();
-    let (result, count) = fake(
+    let (results, count) = fake(
         &fake_key,
         |n, request, h_final| {
             let first = *first.lock().unwrap().get_or_insert(*h_final);
@@ -935,9 +961,20 @@ fn busy_removes_only_its_own_record() {
                 _ => claim_reply(request, &secret_hash, &first),
             })
         },
-        |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
+        |port| {
+            let url = fake_url(&fake_key, port);
+            let lost = client.claim(&url, NOW_MS, &mut attempts);
+            let used = attempts.used(&offer_id(1));
+            drop(fill);
+            (lost, used, client.claim(&url, NOW_MS, &mut attempts))
+        },
     );
     assert_eq!(count, 3);
+    let (lost, used, result) = results;
+    assert_eq!(
+        (lost, used),
+        (Err(ClientError::Transport(NoiseError::Memory)), 1)
+    );
     let h_first = first.into_inner().unwrap().unwrap();
     assert_eq!(
         result.map(|claimed| (claimed.pending_id, claimed.sas)),
@@ -948,6 +985,364 @@ fn busy_removes_only_its_own_record() {
     );
     assert_eq!(attempts.used(&offer_id(1)), 1);
     assert_eq!(ledger.used(), 0);
+}
+
+// ------------------------------------- SA-2B2a2 record policy (all OSes)
+
+/// Fills offer 1's five records with five calls answered `internal`, each
+/// one connection; returns each connection's `hFinal` in order.
+fn fill_five(
+    client: &PairingClient<'_>,
+    key: &StaticKey,
+    attempts: &mut ClaimAttempts,
+) -> Vec<[u8; 32]> {
+    let h_finals = Mutex::new(Vec::new());
+    for call in 0..5 {
+        let (result, count) = fake(
+            key,
+            |_, request, h_final| {
+                h_finals.lock().unwrap().push(*h_final);
+                Some(frame(
+                    FrameKind::Error,
+                    request.request_id,
+                    error_payload(8),
+                ))
+            },
+            |port| client.claim(&fake_url(key, port), NOW_MS, attempts),
+        );
+        assert_eq!(
+            (result, count),
+            (Err(ClientError::Code(PeerCode::Internal)), 1),
+            "fill {call}"
+        );
+    }
+    assert_eq!(attempts.used(&offer_id(1)), 5);
+    h_finals.into_inner().unwrap()
+}
+
+/// The verified refusals sent before any commit, with what `claim` returns
+/// for one.
+fn refusals() -> [(u16, ClientError); 4] {
+    [
+        (5, ClientError::Code(PeerCode::Busy)),
+        (2, ClientError::OfferUnusable),
+        (1, ClientError::Code(PeerCode::Invalid)),
+        (6, ClientError::Code(PeerCode::Incompatible)),
+    ]
+}
+
+/// Acceptance (7), refusal branch: each of `busy`, `unauthorized`,
+/// `invalid` and `incompatible` removes the record its own connection
+/// created, and only that one. A first call answered `internal` keeps a
+/// record; the refusal comes next (a `busy` call retries, and the retry is
+/// answered with the first pending ID); a last call answered with the
+/// first pending ID must still find the first record and show its SAS.
+#[test]
+fn each_verified_refusal_removes_only_its_own_record() {
+    let fake_key = StaticKey::generate().unwrap();
+    let receiver = StaticKey::generate().unwrap();
+    let time = Mutex::new(Duration::ZERO);
+    let clock = FakeClock::new(&time);
+    let ledger = MemoryLedger::default();
+    let client = PairingClient {
+        identity: &receiver,
+        ledger: &ledger,
+        clock: &clock,
+    };
+    let secret_hash = offer_secret_hash(&offer_id(1), &secret(1), fake_key.public());
+    for (code, refused) in refusals() {
+        let first = Mutex::new(None);
+        let mut attempts = ClaimAttempts::default();
+        let (outcomes, count) = fake(
+            &fake_key,
+            |n, request, h_final| {
+                let first = *first.lock().unwrap().get_or_insert(*h_final);
+                Some(match n {
+                    0 => frame(FrameKind::Error, request.request_id, error_payload(8)),
+                    1 => frame(FrameKind::Error, request.request_id, error_payload(code)),
+                    _ => claim_reply(request, &secret_hash, &first),
+                })
+            },
+            |port| {
+                let url = fake_url(&fake_key, port);
+                (0..3)
+                    .map(|_| {
+                        let result = client.claim(&url, NOW_MS, &mut attempts);
+                        (
+                            result.map(|claimed| (claimed.pending_id, claimed.sas)),
+                            attempts.used(&offer_id(1)),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            },
+        );
+        let h_first = first.into_inner().unwrap().unwrap();
+        let expected = Ok((
+            derive_pending_id(&secret_hash, &h_first),
+            sas_for(&fake_key, &receiver, &h_first),
+        ));
+        assert_eq!(
+            outcomes[0],
+            (Err(ClientError::Code(PeerCode::Internal)), 1),
+            "{code}"
+        );
+        if code == 5 {
+            // The `busy` call retried; its retry named the first ID.
+            assert_eq!(outcomes[1], (expected.clone(), 1), "{code}");
+            assert_eq!(count, 4, "{code}");
+        } else {
+            assert_eq!(outcomes[1], (Err(refused), 1), "{code}");
+            assert_eq!(count, 3, "{code}");
+        }
+        assert_eq!(outcomes[2], (expected, 1), "{code}");
+    }
+}
+
+/// Acceptance (7), full branch: with five records a claim still connects
+/// (one connection each) and creates no record. A success naming an
+/// existing record shows that record's SAS; one naming this connection's
+/// own ID shows its own SAS; one naming neither is a lost attempt. None of
+/// them changes the five records.
+#[test]
+fn with_five_records_a_claim_still_connects_and_answers_by_its_reply() {
+    let fake_key = StaticKey::generate().unwrap();
+    let receiver = StaticKey::generate().unwrap();
+    let time = Mutex::new(Duration::ZERO);
+    let clock = FakeClock::new(&time);
+    let ledger = MemoryLedger::default();
+    let client = PairingClient {
+        identity: &receiver,
+        ledger: &ledger,
+        clock: &clock,
+    };
+    let secret_hash = offer_secret_hash(&offer_id(1), &secret(1), fake_key.public());
+    let mut attempts = ClaimAttempts::default();
+    let h = fill_five(&client, &fake_key, &mut attempts);
+    let shown = |h_final: &[u8; 32]| {
+        Ok((
+            derive_pending_id(&secret_hash, h_final),
+            sas_for(&fake_key, &receiver, h_final),
+        ))
+    };
+
+    // A reply naming the third record.
+    let (result, count) = fake(
+        &fake_key,
+        |_, request, _| Some(claim_reply(request, &secret_hash, &h[2])),
+        |port| client.claim(&fake_url(&fake_key, port), NOW_MS, &mut attempts),
+    );
+    assert_eq!(count, 1);
+    assert_eq!(
+        result.map(|claimed| (claimed.pending_id, claimed.sas)),
+        shown(&h[2])
+    );
+    assert_eq!(attempts.used(&offer_id(1)), 5);
+
+    // A reply naming this connection's own ID, which has no record.
+    let own = Mutex::new(None);
+    let (result, count) = fake(
+        &fake_key,
+        |_, request, h_final| {
+            own.lock().unwrap().replace(*h_final);
+            Some(claim_reply(request, &secret_hash, h_final))
+        },
+        |port| client.claim(&fake_url(&fake_key, port), NOW_MS, &mut attempts),
+    );
+    let own = own.into_inner().unwrap().unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(
+        result.map(|claimed| (claimed.pending_id, claimed.sas)),
+        shown(&own)
+    );
+    assert_eq!(attempts.used(&offer_id(1)), 5);
+
+    // A reply naming neither.
+    let (result, count) = fake(
+        &fake_key,
+        |_, request, _| Some(claim_reply(request, &secret_hash, &[0x77; 32])),
+        |port| client.claim(&fake_url(&fake_key, port), NOW_MS, &mut attempts),
+    );
+    assert_eq!((result, count), (Err(ClientError::LostAttempt), 1));
+    assert_eq!(attempts.used(&offer_id(1)), 5);
+
+    // Every earlier record is still there: the last one still answers.
+    let (result, _) = fake(
+        &fake_key,
+        |_, request, _| Some(claim_reply(request, &secret_hash, &h[4])),
+        |port| client.claim(&fake_url(&fake_key, port), NOW_MS, &mut attempts),
+    );
+    assert_eq!(
+        result.map(|claimed| (claimed.pending_id, claimed.sas)),
+        shown(&h[4])
+    );
+}
+
+/// Acceptance (7), full-and-refused branch: with five records, a refusal
+/// (`busy` five times in one call, `unauthorized`, `invalid`,
+/// `incompatible`) removes nothing, because its connection created no
+/// record. The five stay, and the next call still matches the last one,
+/// the one an unconditional removal would take.
+#[test]
+fn with_five_records_a_refusal_removes_nothing() {
+    let fake_key = StaticKey::generate().unwrap();
+    let receiver = StaticKey::generate().unwrap();
+    let time = Mutex::new(Duration::ZERO);
+    let clock = FakeClock::new(&time);
+    let ledger = MemoryLedger::default();
+    let client = PairingClient {
+        identity: &receiver,
+        ledger: &ledger,
+        clock: &clock,
+    };
+    let secret_hash = offer_secret_hash(&offer_id(1), &secret(1), fake_key.public());
+    for (code, refused) in refusals() {
+        let mut attempts = ClaimAttempts::default();
+        let h = fill_five(&client, &fake_key, &mut attempts);
+        let (result, count) = fake(
+            &fake_key,
+            |_, request, _| {
+                Some(frame(
+                    FrameKind::Error,
+                    request.request_id,
+                    error_payload(code),
+                ))
+            },
+            |port| client.claim(&fake_url(&fake_key, port), NOW_MS, &mut attempts),
+        );
+        let connections = if code == 5 { 5 } else { 1 };
+        assert_eq!((result, count), (Err(refused), connections), "{code}");
+        assert_eq!(attempts.used(&offer_id(1)), 5, "{code}");
+        let (result, _) = fake(
+            &fake_key,
+            |_, request, _| Some(claim_reply(request, &secret_hash, &h[4])),
+            |port| client.claim(&fake_url(&fake_key, port), NOW_MS, &mut attempts),
+        );
+        assert_eq!(
+            result.map(|claimed| (claimed.pending_id, claimed.sas)),
+            Ok((
+                derive_pending_id(&secret_hash, &h[4]),
+                sas_for(&fake_key, &receiver, &h[4])
+            )),
+            "{code}"
+        );
+        assert_eq!(attempts.used(&offer_id(1)), 5, "{code}");
+    }
+}
+
+/// Acceptance (8): neither the Pair URL, nor its secret as hex, nor the
+/// secret's raw bytes appear in the `Debug` output of anything `claim`
+/// returns or touches (`Claimed`, every `ClientError` it can end with,
+/// `ClaimAttempts`, `PairingClient`). Controls: the URL does carry the
+/// secret, and the frozen `PairOffer` prints it.
+#[test]
+fn claim_results_and_errors_never_show_the_url_or_the_secret() {
+    let fake_key = StaticKey::generate().unwrap();
+    let receiver = StaticKey::generate().unwrap();
+    let time = Mutex::new(Duration::ZERO);
+    let clock = FakeClock::new(&time);
+    let ledger = MemoryLedger::default();
+    let client = PairingClient {
+        identity: &receiver,
+        ledger: &ledger,
+        clock: &clock,
+    };
+    let secret_hash = offer_secret_hash(&offer_id(1), &secret(1), fake_key.public());
+    let hex = hex_encode(&secret(1));
+    let raw = format!("{:?}", secret(1));
+    let raw = raw.trim_matches(['[', ']']).to_owned();
+    let mut urls = Vec::new();
+    let mut shown = Vec::new();
+    let mut attempts = ClaimAttempts::default();
+    type Script<'a> = Box<dyn Fn(&Frame, &[u8; 32]) -> Frame + Send + Sync + 'a>;
+    let scripted: Vec<(&str, Script<'_>)> = vec![
+        (
+            "success",
+            Box::new(|request: &Frame, h_final: &[u8; 32]| {
+                claim_reply(request, &secret_hash, h_final)
+            }),
+        ),
+        (
+            "unauthorized",
+            Box::new(|request: &Frame, _: &[u8; 32]| {
+                frame(FrameKind::Error, request.request_id, error_payload(2))
+            }),
+        ),
+        (
+            "invalid",
+            Box::new(|request: &Frame, _: &[u8; 32]| {
+                frame(FrameKind::Error, request.request_id, error_payload(1))
+            }),
+        ),
+        (
+            "internal",
+            Box::new(|request: &Frame, _: &[u8; 32]| {
+                frame(FrameKind::Error, request.request_id, error_payload(8))
+            }),
+        ),
+        (
+            "lost attempt",
+            Box::new(|request: &Frame, _: &[u8; 32]| {
+                claim_reply(request, &secret_hash, &[0x77; 32])
+            }),
+        ),
+        (
+            "aborted",
+            Box::new(|request: &Frame, _: &[u8; 32]| {
+                frame(FrameKind::Error, request.request_id, error_payload(7))
+            }),
+        ),
+    ];
+    for (label, reply) in &scripted {
+        let (result, _) = fake(
+            &fake_key,
+            |_, request, h_final| Some(reply(request, h_final)),
+            |port| {
+                let url = fake_url(&fake_key, port);
+                urls.push(url.clone());
+                client.claim(&url, NOW_MS, &mut attempts)
+            },
+        );
+        if *label == "success" {
+            assert!(result.is_ok(), "control: {result:?}");
+        } else {
+            assert!(result.is_err(), "{label}: {result:?}");
+        }
+        shown.push(format!("{result:?}"));
+    }
+    let refused = fake_url(&fake_key, refused_port());
+    let expired = client.claim(&refused, NOW_MS + 600_000, &mut attempts);
+    assert_eq!(expired, Err(ClientError::InvalidOffer));
+    let transport = client.claim(&refused, NOW_MS, &mut attempts);
+    assert!(matches!(transport, Err(ClientError::Transport(_))));
+    let itself = PairingClient {
+        identity: &fake_key,
+        ..client
+    };
+    let self_pairing = itself.claim(&refused, NOW_MS, &mut attempts);
+    assert_eq!(self_pairing, Err(ClientError::SelfPairing));
+    urls.push(refused);
+    shown.extend([
+        format!("{expired:?}"),
+        format!("{transport:?}"),
+        format!("{self_pairing:?}"),
+        format!("{attempts:?}"),
+        format!("{client:?}"),
+        format!("{itself:?}"),
+    ]);
+    // Controls: each sentinel is really in the URL or the frozen offer.
+    let offer_debug = format!("{:?}", fake_offer(&fake_key, 1024));
+    assert!(
+        offer_debug.contains(&hex),
+        "control: PairOffer prints the secret"
+    );
+    for url in &urls {
+        assert!(url.contains(&hex_encode(hex.as_bytes())), "control");
+    }
+    for text in &shown {
+        for sentinel in urls.iter().chain([&hex, &raw]) {
+            assert!(!text.contains(sentinel.as_str()), "{text}");
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1068,7 +1463,9 @@ mod disk {
                 .unwrap();
         }
 
-        fn pair_offer(&self, n: u8, port: u16) -> PairOffer {
+        /// The Pair URL of offer `n`, for a claim at `NOW_MS` (every offer
+        /// claimed through it is created at `NOW`).
+        fn pair_url(&self, n: u8, port: u16) -> String {
             let state = self.store.state().unwrap();
             let offer = state
                 .reference
@@ -1076,7 +1473,7 @@ mod disk {
                 .iter()
                 .find(|offer| offer.offer_id == offer_id(n))
                 .unwrap();
-            PairOffer {
+            let offer = PairOffer {
                 expires_at: offer.expires_at_ms,
                 host: "127.0.0.1".into(),
                 offer_id: hex_encode(&offer_id(n)),
@@ -1084,7 +1481,8 @@ mod disk {
                 responder_static: hex_encode(self.key.public()),
                 secret: hex_encode(&secret(n)),
                 version: 1,
-            }
+            };
+            pair_url(&offer).unwrap()
         }
 
         fn state_file(&self) -> Vec<u8> {
@@ -1324,7 +1722,7 @@ mod disk {
             let ((claimed, confirmed), accepted) = serve(&producer, |port| {
                 let mut attempts = ClaimAttempts::default();
                 let claimed = client
-                    .claim(&node.pair_offer(1, port), &mut attempts)
+                    .claim(&node.pair_url(1, port), NOW_MS, &mut attempts)
                     .unwrap();
                 (claimed.clone(), client.poll(&claimed))
             });
@@ -1446,9 +1844,11 @@ mod disk {
     }
 
     /// Acceptance (4): the claim response is lost (the receiver's ledger
-    /// cannot hold it), the client retries on a new connection, the frozen
-    /// claim returns the first pending ID, and the client shows the SAS of
-    /// that first attempt, which the owner can approve as generation 1.
+    /// cannot hold it), which ends that claim call with its record kept
+    /// (SA-2B2a2). A second call a second later, on a new connection, gets
+    /// the first pending ID from the frozen claim, and the client shows the
+    /// SAS of that first attempt, which the owner can approve as
+    /// generation 1.
     #[test]
     fn a_lost_claim_response_is_recovered_with_the_first_sas() {
         let node = Node::new();
@@ -1467,9 +1867,14 @@ mod disk {
             clock: &receiver_clock,
         };
         let mut attempts = ClaimAttempts::default();
-        let (claimed, accepted) = serve(&node.producer(&producer_clock), |port| {
-            client.claim(&node.pair_offer(1, port), &mut attempts)
+        let ((lost, claimed), accepted) = serve(&node.producer(&producer_clock), |port| {
+            let url = node.pair_url(1, port);
+            let lost = client.claim(&url, NOW_MS, &mut attempts);
+            // The person waits a second (which frees the ledger) and retries.
+            receiver_clock.sleep(RATE_INTERVAL);
+            (lost, client.claim(&url, NOW_MS, &mut attempts))
         });
+        assert_eq!(lost, Err(ClientError::Transport(NoiseError::Memory)));
         let claimed = claimed.unwrap();
         assert_eq!(accepted.len(), 2, "first response lost, one retry");
         // The retry's own record goes: the first attempt consumed the offer.
@@ -1954,7 +2359,7 @@ mod disk {
             let tap = tap(port);
             let mut attempts = ClaimAttempts::default();
             let claimed = client
-                .claim(&node.pair_offer(1, tap.port), &mut attempts)
+                .claim(&node.pair_url(1, tap.port), NOW_MS, &mut attempts)
                 .unwrap();
             let (up, down) = (
                 tap.up.lock().unwrap().clone(),
@@ -2117,7 +2522,7 @@ mod disk {
         let responder = *node.key.public();
         let ((client, producer), accepted) = serve(&node.producer(&clock), |port| {
             let mut attempts = ClaimAttempts::default();
-            let client = itself.claim(&node.pair_offer(1, port), &mut attempts);
+            let client = itself.claim(&node.pair_url(1, port), NOW_MS, &mut attempts);
             let producer = raw(port, &node.key, &responder, claim_json(1, &secret(1)));
             (client, producer)
         });
@@ -2287,7 +2692,7 @@ mod disk {
             let (result, count) = fake(
                 &fake_key,
                 |_, request, _| Some(reply(request)),
-                |port| client.claim(&fake_offer(&fake_key, port), &mut attempts),
+                |port| client.claim(&fake_url(&fake_key, port), NOW_MS, &mut attempts),
             );
             assert_eq!((result, count), (Err(*expected), 1), "{label}");
             assert_eq!(attempts.used(&offer_id(1)), 1, "{label} keeps its record");
