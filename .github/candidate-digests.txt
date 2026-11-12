@@ -18,15 +18,22 @@
 # SA-2B2a1 adds spec/pairing-v1.md, the pairing wire contract (Noise
 # framing, pairing ID derivations, producer order, receiver client). No
 # existing line changed.
+#
+# SA-0E amended the SA-0 contract on purpose: it registers the receiver
+# peer store surfaces (peers.json) in spec/v1.md, adds `host`, `peers` and
+# `port` to LOCAL_ONLY_FIELDS, and makes the registry test compare its
+# field sets with the spec table rows. spec/v1.md, src/security.rs, the
+# consent fixture, tests/security_contract_v1.rs and spec/security-v1.md
+# (which pins that test module's hash) carry new digests.
 97ec5c2337388c6661e749f5ac9751a4b115216a44b07d94362b870c20914e73  spec/pairing-v1.md
 79d1c0363e4576d67827ebfa029fad7e3a5981474f4aafba3bd71e54f1a98172  spec/report-cache-v1.md
-976e37c0082c128f4067282506c4606013fa95b7387d5c937c627b9b0117ea4d  spec/security-v1.md
+3e0b75e33fd362eab1040254de8f656e3a1bf855e0f3c008915b33e3ec2ee523  spec/security-v1.md
 ea302173340ae0dfb6f2a421326e7e178d2454bcab45ac28d74b144c1f17890e  spec/state-store-v1.md
-2b4c33311401070014f8cc12fbcabbf1e6cad00be3e218135cd05fa05d0fa3eb  spec/v1.md
+f5b4d69266081285fe32b1eccb754715ebe89446f5af902c99b6bbada3309510  spec/v1.md
 ff21cbcfdd6aedfb68ac1b3cfda056663203f2c7f08fd05a856dc5dbe5e4c25a  src/cache.rs
 8b0add8d4fde2253edebdddd448d381559d63ff630f0e9d2f9faad8d9625567f  src/canonical.rs
 e3f35e33b4b26bab06e243d14eb087b5b2405a3b093a6a744cc84a5a36573ab0  src/report.rs
-43ad96a2aff040f1e211cfe59e698375d8adba0aa403889dbb904abf0c7cf7d1  src/security.rs
+5a93a71c1728ad9f6562e89a8187da08d34a09721d7f814e4d564670747de74e  src/security.rs
 80b495608d9c3add30cae81454f32bb66459f652d2a039c5d5c9d99dac10955d  tests/dependency_provenance_v1.rs
 e01e9d55a26fb4f807ff0baea4a9681b0cbbb86b61f6b00fe5c49d919a2ebb10  tests/fixtures/v1/cache/body.sha256
 edb92226baac009e4c7779cb2c7a7369049e0ea97615945f8e64378322785b19  tests/fixtures/v1/cache/filename.txt
@@ -38,7 +45,7 @@ c02dccddf2ffbb5c86f0a0230db59e59276efece0970aad85252d78af6d31d05  tests/fixtures
 60c2996518decd1ec26e810df8b92a32298530947e3df5eb59db1aaa4294d07c  tests/fixtures/v1/report/models.json
 070b5d28018b353eae1d53658f43a8c45d0f50205c86050e45cb6ad4d212f09c  tests/fixtures/v1/runtime/storage/cargo-lock-baseline.json
 f8326f22b3df9d37df1ec1eea8dd6b4a160de6022b3a226a35bb618c4345f4e0  tests/fixtures/v1/runtime/storage/state-golden.json
-dccc2482f3325a03f0e8fa22cd99fcba4382007fec6d629de28d620d186e67bc  tests/fixtures/v1/security/consent.json
+df32654d66d2771e741700d81590d4be410ec999faac30bfdc4774a9b3636070  tests/fixtures/v1/security/consent.json
 a58bdd593173195fa9042f6c0e4065a11d553fcc88d4ae79bfc1a5e31f16692e  tests/fixtures/v1/security/control_mac.hex
 ad73bef2423761d5f2d473cab2561133560498054009e01e52c2a845a643dfd1  tests/fixtures/v1/security/linux_roots.json
 c5947513e177225ac089cef1980abe2814e3e8e2aa2ccf6cd609eb55dd4c272c  tests/fixtures/v1/security/memory_budget.json
@@ -50,4 +57,4 @@ cd289e2421e745c59b5798ffc29fcecb02836444f77e816794d62e6f4a2a688e  tests/fixtures
 94653acee749d3612203b35dc400df8d7c4a93272af47f2cdeb10d2f6e14cb00  tests/fixtures/v1/security/state_transitions.json
 cbd942c4fd168b5d78fbfc469acd06cb62f77c026fcbc256285c6c7d9680fdd1  tests/fixtures/v1/security/uninstall.json
 39c2823d68bf6de7854574899b606167897c21292037b8ed359b19fe2e08062c  tests/report_cache_v1.rs
-ebd252b480cbe30406708823f175be036929903282101ab044bc95cfdaa7347d  tests/security_contract_v1.rs
+b6cc125da6f193188e02b44046eade512787ccbdd978addce5fbd8eacb07a7fa  tests/security_contract_v1.rs

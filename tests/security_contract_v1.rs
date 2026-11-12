@@ -1856,77 +1856,137 @@ fn consent_surface_and_privacy_registry() {
                 .all(|window| window[0].as_bytes() < window[1].as_bytes())
         );
     }
-    let shared_surfaces: &[&[&str]] = &[
-        &[
-            "cacheReadTokens",
-            "cacheWriteTokens",
-            "client",
-            "costNanoUsd",
-            "date",
-            "inputTokens",
-            "messageCount",
-            "model",
-            "outputTokens",
-            "provider",
-            "reasoningTokens",
-            "totalTokens",
-            "turnCount",
-        ],
-        &[
-            "cacheReadTokens",
-            "cacheWriteTokens",
-            "client",
-            "costNanoUsd",
-            "durationMillis",
-            "inputTokens",
-            "messageCount",
-            "model",
-            "outputTokens",
-            "provider",
-            "reasoningTokens",
-            "sampleCount",
-            "timedTokens",
-            "totalTokens",
-            "turnCount",
-        ],
-        &[
-            "bucketStartUnixMs",
-            "cacheReadTokens",
-            "cacheWriteTokens",
-            "client",
-            "costNanoUsd",
-            "inputTokens",
-            "messageCount",
-            "model",
-            "outputTokens",
-            "provider",
-            "reasoningTokens",
-            "totalTokens",
-            "turnCount",
-            "utcOffsetSeconds",
-        ],
-        &[
-            "agent",
-            "cacheReadTokens",
-            "cacheWriteTokens",
-            "client",
-            "costNanoUsd",
-            "inputTokens",
-            "messageCount",
-            "model",
-            "outputTokens",
-            "provider",
-            "reasoningTokens",
-            "totalTokens",
-            "turnCount",
-        ],
+    // Every list below is named after its spec/v1.md "Surface field registry"
+    // row and asserted equal to that row, so the test and the table cannot
+    // drift apart without this test failing.
+    const SPEC_V1: &str = include_str!("../spec/v1.md");
+    // Surface name -> (exact-fields cell, membership cell), for every row of
+    // the "Surface field registry" table.
+    fn spec_rows() -> std::collections::BTreeMap<&'static str, (&'static str, &'static str)> {
+        let mut rows = std::collections::BTreeMap::new();
+        for line in SPEC_V1
+            .lines()
+            .skip_while(|line| *line != "| Surface | Exact fields | Membership |")
+            .skip(2)
+            .take_while(|line| line.starts_with("| "))
+        {
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            assert_eq!(cells.len(), 5, "malformed surface row {line}");
+            assert!(
+                rows.insert(cells[1], (cells[2], cells[3])).is_none(),
+                "duplicate surface row {}",
+                cells[1]
+            );
+        }
+        assert!(!rows.is_empty(), "spec/v1.md surface table not found");
+        rows
+    }
+    fn cell_fields(cell: &str) -> BTreeSet<&str> {
+        cell.trim_matches('`').split(',').collect()
+    }
+    let rows = spec_rows();
+    let mut checked = BTreeSet::new();
+    let mut check_row =
+        |name: &'static str, membership: &str, fields: BTreeSet<&str>, expected: BTreeSet<&str>| {
+            let (_, spec_membership) = rows
+                .get(name)
+                .unwrap_or_else(|| panic!("spec/v1.md has no surface row {name}"));
+            assert_eq!(*spec_membership, membership, "{name} membership");
+            assert_eq!(fields, expected, "{name} differs from its spec/v1.md row");
+            checked.insert(name);
+        };
+
+    let named_shared_surfaces: &[(&str, &[&str])] = &[
+        (
+            "Graph record",
+            &[
+                "cacheReadTokens",
+                "cacheWriteTokens",
+                "client",
+                "costNanoUsd",
+                "date",
+                "inputTokens",
+                "messageCount",
+                "model",
+                "outputTokens",
+                "provider",
+                "reasoningTokens",
+                "totalTokens",
+                "turnCount",
+            ],
+        ),
+        (
+            "Models record",
+            &[
+                "cacheReadTokens",
+                "cacheWriteTokens",
+                "client",
+                "costNanoUsd",
+                "durationMillis",
+                "inputTokens",
+                "messageCount",
+                "model",
+                "outputTokens",
+                "provider",
+                "reasoningTokens",
+                "sampleCount",
+                "timedTokens",
+                "totalTokens",
+                "turnCount",
+            ],
+        ),
+        (
+            "Hourly record",
+            &[
+                "bucketStartUnixMs",
+                "cacheReadTokens",
+                "cacheWriteTokens",
+                "client",
+                "costNanoUsd",
+                "inputTokens",
+                "messageCount",
+                "model",
+                "outputTokens",
+                "provider",
+                "reasoningTokens",
+                "totalTokens",
+                "turnCount",
+                "utcOffsetSeconds",
+            ],
+        ),
+        (
+            "Agents record",
+            &[
+                "agent",
+                "cacheReadTokens",
+                "cacheWriteTokens",
+                "client",
+                "costNanoUsd",
+                "inputTokens",
+                "messageCount",
+                "model",
+                "outputTokens",
+                "provider",
+                "reasoningTokens",
+                "totalTokens",
+                "turnCount",
+            ],
+        ),
     ];
-    // Named after the spec/v1.md surface rows (`Control bodies` is the union
-    // of the control command bodies) so the checks below select surfaces by
-    // name, never by position.
-    let named_protocol_surfaces: &[(&str, &[&str])] = &[
+    // Who sees a protocolFields surface. `Peer` surfaces cross the peer wire
+    // (the Pair URL object reaches the receiver out of band, so it counts);
+    // `Control` surfaces stay on the local control channel; `Local` is the
+    // cache-key subset, which is never sent at all.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Facing {
+        Peer,
+        Control,
+        Local,
+    }
+    let named_protocol_surfaces: &[(&str, Facing, &[&str])] = &[
         (
             "Pair URL object",
+            Facing::Peer,
             &[
                 "expiresAt",
                 "host",
@@ -1939,6 +1999,7 @@ fn consent_surface_and_privacy_registry() {
         ),
         (
             "Peer request",
+            Facing::Peer,
             &[
                 "aggregationRevision",
                 "authEpoch",
@@ -1957,6 +2018,7 @@ fn consent_surface_and_privacy_registry() {
         ),
         (
             "Peer response envelope",
+            Facing::Peer,
             &[
                 "aggregationRevision",
                 "authEpoch",
@@ -1975,15 +2037,29 @@ fn consent_surface_and_privacy_registry() {
                 "tzdbRevision",
             ],
         ),
-        ("Pair claim request", &["offerId", "protocol", "secret"]),
+        (
+            "Pair claim request",
+            Facing::Peer,
+            &["offerId", "protocol", "secret"],
+        ),
         (
             "Pair claim response",
+            Facing::Peer,
             &["expiresAt", "pendingId", "protocol"],
         ),
-        ("Pair status request", &["pendingId", "protocol"]),
-        ("Pair status response (pending)", &["protocol", "state"]),
+        (
+            "Pair status request",
+            Facing::Peer,
+            &["pendingId", "protocol"],
+        ),
+        (
+            "Pair status response (pending)",
+            Facing::Peer,
+            &["protocol", "state"],
+        ),
         (
             "Pair status response (approved)",
+            Facing::Peer,
             &[
                 "authEpoch",
                 "expiresAt",
@@ -1993,9 +2069,14 @@ fn consent_surface_and_privacy_registry() {
                 "state",
             ],
         ),
-        ("Grant status request", &["grantId", "protocol"]),
+        (
+            "Grant status request",
+            Facing::Peer,
+            &["grantId", "protocol"],
+        ),
         (
             "Grant status response",
+            Facing::Peer,
             &[
                 "authEpoch",
                 "expiresAt",
@@ -2005,13 +2086,15 @@ fn consent_surface_and_privacy_registry() {
                 "state",
             ],
         ),
-        ("Peer error payload", &["code", "protocol"]),
+        ("Peer error payload", Facing::Peer, &["code", "protocol"]),
         (
             "Control command envelope",
+            Facing::Control,
             &["body", "commandId", "controlVersion", "requestId"],
         ),
         (
             "Control bodies",
+            Facing::Control,
             &[
                 "bindHost",
                 "bindPort",
@@ -2024,10 +2107,12 @@ fn consent_surface_and_privacy_registry() {
         ),
         (
             "Control response envelope",
+            Facing::Control,
             &["code", "controlVersion", "data", "requestId"],
         ),
         (
             "Status success data",
+            Facing::Control,
             &[
                 "activeGrantCount",
                 "activeOfferCount",
@@ -2043,18 +2128,206 @@ fn consent_surface_and_privacy_registry() {
         ),
         (
             "Offer-create success data",
+            Facing::Control,
             &["expiresAt", "offerId", "pairUrl"],
         ),
-        ("Pending-list item", &["expiresAt", "pendingId", "sasCode"]),
+        (
+            "Pending-list item",
+            Facing::Control,
+            &["expiresAt", "pendingId", "sasCode"],
+        ),
+        (
+            "Cache-key protocol fields",
+            Facing::Local,
+            &[
+                "aggregationRevision",
+                "authEpoch",
+                "clients",
+                "endDateExclusive",
+                "endpoint",
+                "grantId",
+                "reportSchema",
+                "sourceScopeGeneration",
+                "startDate",
+                "timezone",
+                "tzdbRevision",
+            ],
+        ),
     ];
-    let protocol_surfaces: &[&[&str]] = &named_protocol_surfaces
-        .iter()
-        .map(|(_, fields)| *fields)
-        .collect::<Vec<_>>();
-    fn surface<'a>(surfaces: &[(&str, &[&'a str])], name: &str) -> BTreeSet<&'a str> {
-        let (_, fields) = surfaces
+    let named_local_surfaces: &[(&str, &[&str])] = &[
+        (
+            "State top level",
+            &[
+                "config",
+                "controlToken",
+                "counters",
+                "grants",
+                "identityPrivate",
+                "offers",
+                "pending",
+                "schema",
+                "terminal",
+            ],
+        ),
+        (
+            "State config",
+            &["bindHost", "bindPort", "nodeLabel", "sharingEnabled"],
+        ),
+        (
+            "State counters",
+            &[
+                "denyFloor",
+                "lastAcceptedWallUnixSeconds",
+                "nextAuthEpoch",
+                "sourceScopeGeneration",
+            ],
+        ),
+        (
+            "Offer state record",
+            &["createdAt", "expiresAt", "offerId", "secretHash", "state"],
+        ),
+        (
+            "Pending state record",
+            &[
+                "createdAt",
+                "expiresAt",
+                "initiatorStatic",
+                "offerId",
+                "pendingId",
+                "sasCode",
+                "sasGeneration",
+                "state",
+            ],
+        ),
+        (
+            "Grant state record",
+            &[
+                "authEpoch",
+                "createdAt",
+                "endpoints",
+                "expiresAt",
+                "grantId",
+                "initiatorStatic",
+                "responderStatic",
+                "scope",
+                "sourceScopeGeneration",
+                "state",
+            ],
+        ),
+        (
+            "Terminal state record",
+            &[
+                "authEpoch",
+                "cleanupComplete",
+                "kind",
+                "recordId",
+                "terminalAt",
+            ],
+        ),
+        ("Receiver peer store top level", &["peers", "schema"]),
+        (
+            "Receiver peer record",
+            &[
+                "authEpoch",
+                "createdAt",
+                "expiresAt",
+                "grantId",
+                "host",
+                "initiatorStatic",
+                "nodeLabel",
+                "pendingId",
+                "port",
+                "responderStatic",
+                "sourceScopeGeneration",
+                "state",
+            ],
+        ),
+        ("Cache-key local fields", &["peerStatic", "role"]),
+        (
+            "Cache metadata",
+            &[
+                "bodySha256",
+                "cacheKey",
+                "createdAtUnixMs",
+                "expiresAtUnixMs",
+            ],
+        ),
+    ];
+
+    for (name, fields) in named_shared_surfaces {
+        let expected = cell_fields(rows.get(name).map_or("", |row| row.0));
+        check_row(
+            name,
+            "`sharedFields`",
+            fields.iter().copied().collect(),
+            expected,
+        );
+    }
+    for (name, _, fields) in named_protocol_surfaces {
+        let fields: BTreeSet<&str> = fields.iter().copied().collect();
+        match *name {
+            // The spec row is prose, not a field list: the envelope is the Peer
+            // request row plus the fields named after "plus".
+            "Peer response envelope" => {
+                let cell = rows.get(name).map_or("", |row| row.0);
+                let extra = cell
+                    .strip_prefix("All peer request fields plus ")
+                    .unwrap_or_else(|| panic!("{name} row changed shape: {cell}"));
+                let mut expected = cell_fields(rows["Peer request"].0);
+                expected.extend(cell_fields(extra));
+                check_row(name, "`protocolFields`", fields, expected);
+            }
+            // Not a spec row: the union of the bodies in "Control bodies and
+            // results", kept so PROTOCOL_FIELDS is fully accounted for.
+            "Control bodies" => {}
+            _ => {
+                let expected = cell_fields(rows.get(name).map_or("", |row| row.0));
+                check_row(name, "`protocolFields`", fields, expected);
+            }
+        }
+    }
+    for (name, fields) in named_local_surfaces {
+        let expected = cell_fields(rows.get(name).map_or("", |row| row.0));
+        check_row(
+            name,
+            "`localOnlyFields`",
+            fields.iter().copied().collect(),
+            expected,
+        );
+    }
+    check_row(
+        "Public log",
+        "`logFields`",
+        LOG_FIELDS.iter().copied().collect(),
+        cell_fields(rows.get("Public log").map_or("", |row| row.0)),
+    );
+    check_row(
+        "UI",
+        "`uiFields`",
+        UI_FIELDS.iter().copied().collect(),
+        cell_fields(rows.get("UI").map_or("", |row| row.0)),
+    );
+    // Every spec row is compared above; a row added to the spec alone fails.
+    assert_eq!(
+        checked,
+        rows.keys().copied().collect::<BTreeSet<_>>(),
+        "spec/v1.md surface rows not compared by this test"
+    );
+
+    // A surface carries `protocol` exactly when it is peer-facing. The Pair
+    // URL object is the one peer-facing surface without it. Re-tagging a peer
+    // surface as control would otherwise drop it from the check below.
+    for (name, facing, fields) in named_protocol_surfaces {
+        assert_eq!(
+            fields.contains(&"protocol") || *name == "Pair URL object",
+            *facing == Facing::Peer,
+            "{name}: carries protocol <=> peer-facing"
+        );
+    }
+    fn surface<'a>(surfaces: &[(&str, Facing, &[&'a str])], name: &str) -> BTreeSet<&'a str> {
+        let (_, _, fields) = surfaces
             .iter()
-            .find(|(surface, _)| *surface == name)
+            .find(|(surface, _, _)| *surface == name)
             .unwrap_or_else(|| panic!("no protocol surface named {name}"));
         fields.iter().copied().collect()
     }
@@ -2076,80 +2349,18 @@ fn consent_surface_and_privacy_registry() {
         }
     }
     // These are legal on control surfaces and must never reach a peer.
-    for name in [
-        "Peer request",
-        "Peer response envelope",
-        "Pair claim request",
-        "Pair status request",
-        "Grant status request",
-        "Pair claim response",
-        "Pair status response (pending)",
-        "Pair status response (approved)",
-        "Grant status response",
-        "Peer error payload",
-    ] {
-        let fields = surface(named_protocol_surfaces, name);
+    for (name, facing, fields) in named_protocol_surfaces {
+        if *facing != Facing::Peer {
+            continue;
+        }
         for local in ["initiatorStatic", "sasCode", "sasGeneration", "secretHash"] {
-            assert!(!fields.contains(local), "{name} carries {local}");
+            assert!(!fields.contains(&local), "{name} carries {local}");
         }
     }
-    let local_surfaces: &[&[&str]] = &[
-        &[
-            "config",
-            "controlToken",
-            "counters",
-            "grants",
-            "identityPrivate",
-            "offers",
-            "pending",
-            "schema",
-            "terminal",
-        ],
-        &["bindHost", "bindPort", "nodeLabel", "sharingEnabled"],
-        &[
-            "denyFloor",
-            "lastAcceptedWallUnixSeconds",
-            "nextAuthEpoch",
-            "sourceScopeGeneration",
-        ],
-        &["createdAt", "expiresAt", "offerId", "secretHash", "state"],
-        &[
-            "createdAt",
-            "expiresAt",
-            "initiatorStatic",
-            "offerId",
-            "pendingId",
-            "sasCode",
-            "sasGeneration",
-            "state",
-        ],
-        &[
-            "authEpoch",
-            "createdAt",
-            "endpoints",
-            "expiresAt",
-            "grantId",
-            "initiatorStatic",
-            "responderStatic",
-            "scope",
-            "sourceScopeGeneration",
-            "state",
-        ],
-        &[
-            "authEpoch",
-            "cleanupComplete",
-            "kind",
-            "recordId",
-            "terminalAt",
-        ],
-        &["peerStatic", "role"],
-        &[
-            "bodySha256",
-            "cacheKey",
-            "createdAtUnixMs",
-            "expiresAtUnixMs",
-        ],
-    ];
+
+    let shared_surfaces: Vec<&[&str]> = named_shared_surfaces.iter().map(|s| s.1).collect();
+    let protocol_surfaces: Vec<&[&str]> = named_protocol_surfaces.iter().map(|s| s.2).collect();
+    let local_surfaces: Vec<&[&str]> = named_local_surfaces.iter().map(|s| s.1).collect();
     fn union<'a>(surfaces: &[&[&'a str]]) -> BTreeSet<&'a str> {
         surfaces
             .iter()
@@ -2157,28 +2368,28 @@ fn consent_surface_and_privacy_registry() {
             .collect::<BTreeSet<_>>()
     }
     assert_eq!(
-        union(shared_surfaces),
+        union(&shared_surfaces),
         SHARED_FIELDS.iter().copied().collect()
     );
     assert_eq!(
-        union(protocol_surfaces),
+        union(&protocol_surfaces),
         PROTOCOL_FIELDS.iter().copied().collect()
     );
     assert_eq!(
-        union(local_surfaces),
+        union(&local_surfaces),
         LOCAL_ONLY_FIELDS.iter().copied().collect()
     );
 
     let forbidden: BTreeSet<&str> = FORBIDDEN_FIELDS.iter().copied().collect();
     for fields in shared_surfaces
         .iter()
-        .chain(protocol_surfaces)
-        .chain(local_surfaces)
+        .chain(&protocol_surfaces)
+        .chain(&local_surfaces)
         .chain([LOG_FIELDS, UI_FIELDS].iter())
     {
         assert!(fields.iter().all(|field| !forbidden.contains(field)));
     }
-    for (name, fields) in named_protocol_surfaces {
+    for (name, _, fields) in named_protocol_surfaces {
         assert_eq!(
             fields.contains(&"secret"),
             ["Pair URL object", "Pair claim request"].contains(name),
