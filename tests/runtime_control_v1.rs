@@ -652,6 +652,31 @@ mod disk {
         }
     }
 
+    /// SA-2C2b review: once the whole command was written, a missing reply
+    /// is `NoReply` (the command may have run), not `Socket`; a server that
+    /// is not there at all is `Socket` (nothing sent).
+    #[test]
+    fn a_reply_missing_after_the_command_was_sent_is_no_reply() {
+        let home = TempHome::new();
+        let token = [0x45; 32];
+        let command = Command {
+            id: REVOKE,
+            body: json!({ "grantId": hex_encode(&[1; 16]) }),
+        };
+        let path = home.0.join("gone.sock");
+        let received = rogue(path.clone(), Some(token), Some(|_, _, _, _| Vec::new()));
+        let result = Client::new(Secret32::new(token), path).call(&command);
+        let count = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(count > 0, "the command did not reach the endpoint");
+        assert_eq!(result, Err(ControlError::NoReply));
+
+        let absent = home.0.join("absent.sock");
+        assert_eq!(
+            Client::new(Secret32::new(token), absent).call(&command),
+            Err(ControlError::Socket)
+        );
+    }
+
     /// Acceptance (3): the client bytes of a complete exchange, replayed on
     /// a new connection, fail the command MAC (fresh server nonce): no
     /// response, state unchanged.
@@ -1149,6 +1174,7 @@ mod disk {
             ControlError::PathTooLong,
             ControlError::UnsafeSocket,
             ControlError::Socket,
+            ControlError::NoReply,
             ControlError::Unavailable,
             ControlError::Command,
             ControlError::ServerProof,

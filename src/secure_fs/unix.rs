@@ -613,28 +613,52 @@ impl SecureRoot {
 
 impl ReadOnlyRoot {
     /// [`SecureRoot::read_file`] on this root: no-follow, regular, owned by
-    /// the effective UID, `0600`, one link, no ACL (macOS), at most `max`
-    /// bytes. `Ok(None)` when absent.
-    // ponytail: the body repeats `SecureRoot::read_file` because SA-2C2b
-    // may only add to secure_fs; fold both into one helper when that file
-    // is next open for change.
+    /// the effective UID, `0600`, no ACL (macOS), at most `max` bytes.
+    /// `Ok(None)` when absent. One difference: a link count of 0 is
+    /// accepted as well as 1. Without the lock the resident may `rename` a
+    /// new file over this one between the open and the check; the opened
+    /// inode is then unlinked (0 links), still whole and still owner-only.
+    /// Two or more links are refused.
     pub fn read_file(&self, name: &str, max: usize) -> Result<Option<Vec<u8>>, StorageError> {
+        match self.open_file(name)? {
+            Some(file) => read_opened(&file, max).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn open_file(&self, name: &str) -> Result<Option<File>, StorageError> {
         let name = file_name(name)?;
         let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK | nofollow();
         let fd = unsafe { libc::openat(self.dir.as_raw_fd(), name.as_ptr(), flags) };
         if fd < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
             return Ok(None);
         }
-        let file = file_from(fd)?;
-        check_private_file(&file)?;
-        let mut bytes = Vec::new();
-        (&file)
-            .take(u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1))
-            .read_to_end(&mut bytes)
-            .map_err(|_| StorageError::UnsafeState)?;
-        guard(bytes.len() <= max, BYTE_CAP, StorageError::Corrupt)?;
-        Ok(Some(bytes))
+        file_from(fd).map(Some)
     }
+}
+
+/// The checks and the bounded read of [`ReadOnlyRoot::read_file`] on an
+/// already opened file.
+// ponytail: repeats `check_private_file` except the link count, because
+// SA-2C2b may only add to secure_fs; fold them when the file is next open.
+fn read_opened(file: &File, max: usize) -> Result<Vec<u8>, StorageError> {
+    let meta = metadata(file)?;
+    guard(meta.is_file(), 0, StorageError::UnsafeState)?;
+    check_owner(&meta, Object::File)?;
+    guard(
+        meta.mode() & 0o7777 == 0o600,
+        MODE,
+        StorageError::UnsafeState,
+    )?;
+    guard(meta.nlink() <= 1, NLINK, StorageError::UnsafeState)?;
+    #[cfg(target_os = "macos")]
+    guard(acl::none(file), ACL, StorageError::UnsafeState)?;
+    let mut bytes = Vec::new();
+    file.take(u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| StorageError::UnsafeState)?;
+    guard(bytes.len() <= max, BYTE_CAP, StorageError::Corrupt)?;
+    Ok(bytes)
 }
 
 #[derive(Clone, Copy)]
@@ -2414,5 +2438,38 @@ mod tests {
         };
         assert_eq!(usize::try_from(len).ok(), Some(BACKUP_EXCLUDE_VALUE.len()));
         assert_eq!(value[..BACKUP_EXCLUDE_VALUE.len()], BACKUP_EXCLUDE_VALUE);
+    }
+
+    /// SA-2C2b review: the resident replaces `state.json` by `rename`
+    /// between the menu's open and its check. The opened, now unlinked
+    /// file (0 links) is read whole with the old bytes; the locked
+    /// `read_file` still refuses it. A file with 2 links is refused.
+    #[test]
+    fn a_read_only_read_accepts_a_file_replaced_after_its_open() {
+        let home = TempHome::new();
+        let root = open(&home).unwrap();
+        write_state(&root, b"old");
+        let read_only = SecureRoot::open_read_only(&home.path, SUFFIX)
+            .unwrap()
+            .unwrap();
+        let opened = read_only.open_file("state.json").unwrap().unwrap();
+        write_state(&root, b"new");
+        assert_eq!(opened.metadata().unwrap().nlink(), 0);
+        assert_eq!(read_opened(&opened, 16).unwrap(), b"old");
+        assert_eq!(
+            check_private_file(&opened).err(),
+            Some(StorageError::UnsafeState),
+            "control: the locked check refuses 0 links"
+        );
+        assert_eq!(
+            read_only.read_file("state.json", 16).unwrap().unwrap(),
+            b"new"
+        );
+
+        std::fs::hard_link(home.root().join("state.json"), home.root().join("second")).unwrap();
+        assert_eq!(
+            read_only.read_file("state.json", 16).err(),
+            Some(StorageError::UnsafeState)
+        );
     }
 }

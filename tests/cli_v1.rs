@@ -32,12 +32,16 @@ fn a_line_over_the_limit_is_refused_and_the_next_one_is_read() {
 mod disk {
     use std::{
         fs,
-        io::Cursor,
-        net::TcpListener,
+        io::{BufRead, Cursor, Read, Write},
+        net::{TcpListener, TcpStream},
         os::unix::fs::{MetadataExt, PermissionsExt, symlink},
+        os::unix::net::UnixListener,
         path::{Path, PathBuf},
         process::{Child, Command as Process, Output, Stdio},
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
@@ -46,13 +50,16 @@ mod disk {
     use syrtis_agent::{
         agent::{Agent, AgentConfig, AgentError, ScannerSettings},
         cli::{
-            ALREADY_RUNNING, DEBUG_HOME_VAR, LINE_MAX, LINE_TOO_LONG, Menu, NOT_RUNNING,
-            STOP_FIRST, USAGE, default_dirs, menu,
+            ALREADY_RUNNING, DEBUG_HOME_VAR, LINE_MAX, LINE_TOO_LONG, Menu, NO_STATE, NOT_RUNNING,
+            OUTCOME_UNKNOWN, STOP_FIRST, USAGE, default_dirs, menu,
         },
-        control::{Client, Command, OK, SHUTDOWN, SOCKET_NAME, STATUS},
+        control::{Client, Command, LISTEN_CONFIGURE, OK, SHUTDOWN, SOCKET_NAME, STATUS},
         runtime::RuntimeError,
         secure_fs::{STATE_SUFFIX, SecureRoot, StorageError},
-        security::{GrantState, OfferClaim, decode_fixed_hex, hex_encode, parse_pair_url},
+        security::{
+            GrantState, OfferClaim, control_key, control_server_mac, decode_fixed_hex, hex_encode,
+            parse_pair_url,
+        },
         state_store::{STATE_FILE, STATE_FILE_MAX_BYTES, Secret32, StateStore, decode_state},
     };
 
@@ -463,6 +470,9 @@ mod disk {
             &format!("2\n3\n4\napprove\n5\n{LOOPBACK}\n4000\n6\n\n7\n9\n1\n0\n"),
         );
         assert_eq!(out.matches(NOT_RUNNING).count(), 8, "{out}");
+        // Review fix 6a: no disclosure or prompt without a resident.
+        assert!(!out.contains("Inputs digest"), "{out}");
+        assert!(!out.contains("to approve this scope"), "{out}");
         assert_eq!(fs::read(&state).unwrap(), before);
         assert_eq!(tree(&home.0), tree_before);
     }
@@ -476,6 +486,235 @@ mod disk {
         let out = drive(&home.menu(), &input);
         assert!(out.contains(LINE_TOO_LONG), "{out}");
         assert!(tree(&home.0).is_empty());
+    }
+
+    // ------------------------------------------------------- review fixes
+
+    /// Review fix 1: a command that went out in full and got no reply is
+    /// reported as "outcome unknown", not "not running". The endpoint is a
+    /// stand-in on the agent's `control.sock` that proves the token, reads
+    /// the whole command and closes. ("Could not connect" is
+    /// `with_the_agent_stopped_control_items_write_nothing`.)
+    #[test]
+    fn a_command_sent_without_a_reply_is_reported_as_unknown() {
+        let home = TempHome::new();
+        drop(start(&home));
+        let bytes = fs::read(home.root().join(STATE_FILE)).unwrap();
+        let token = *decode_state(&bytes).unwrap().control_token.expose();
+        let socket = home.root().join(SOCKET_NAME);
+        let _ = fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let endpoint = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut hello = [0; 34];
+            stream.read_exact(&mut hello).unwrap();
+            let client_nonce: [u8; 32] = hello[2..].try_into().unwrap();
+            let server_nonce = [9; 32];
+            let mac = control_server_mac(&control_key(&token), 1, &client_nonce, &server_nonce);
+            stream.write_all(&server_nonce).unwrap();
+            stream.write_all(&mac).unwrap();
+            let mut header = [0; 22];
+            stream.read_exact(&mut header).unwrap();
+            let len = u32::from_be_bytes(header[18..].try_into().unwrap()) as usize;
+            let mut rest = vec![0; len + 32];
+            stream.read_exact(&mut rest).unwrap();
+            // The whole command arrived; close without a reply.
+            u16::from_be_bytes([header[16], header[17]])
+        });
+        let out = drive(&home.menu(), "3\n0\n");
+        assert_eq!(endpoint.join().unwrap(), 10, "sharingSet did not arrive");
+        assert!(out.contains(OUTCOME_UNKNOWN), "{out}");
+        assert!(!out.contains(NOT_RUNNING), "{out}");
+    }
+
+    /// Review fix 3: after an uninstall with purge, listing grants does not
+    /// create a new state (identity, token).
+    #[test]
+    fn listing_grants_after_a_purge_creates_no_state() {
+        let home = TempHome::new();
+        drop(start(&home));
+        let out = drive(&home.menu(), "11\npurge\nuninstall\n0\n");
+        assert!(out.contains("Identity and pairing state: deleted"), "{out}");
+        let state = home.root().join(STATE_FILE);
+        assert!(!state.exists());
+        let out = drive(&home.menu(), "8\n0\n");
+        assert!(out.contains(NO_STATE), "{out}");
+        assert!(!state.exists(), "listing grants created a state");
+    }
+
+    /// A reader that, when the menu waits for the line at `at`, tries to
+    /// take the owner lock as a resident starting then would.
+    struct Probe {
+        input: Cursor<Vec<u8>>,
+        at: u64,
+        home: PathBuf,
+        result: Option<Result<(), StorageError>>,
+    }
+
+    impl Read for Probe {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+
+    impl BufRead for Probe {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            if self.input.position() == self.at && self.result.is_none() {
+                // Only `Busy` is retried: a forked child of another test
+                // can hold a released lock for a moment (`secure_fs`).
+                let mut result = Err(StorageError::Busy);
+                for _ in 0..50 {
+                    result = SecureRoot::open_under(&self.home, SUFFIX).map(drop);
+                    if result != Err(StorageError::Busy) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                self.result = Some(result);
+            }
+            self.input.fill_buf()
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.input.consume(amount)
+        }
+    }
+
+    /// Review fix 4: while the stopped-agent grant list waits at the revoke
+    /// prompt, the owner lock is free (a resident could start); the revoke
+    /// then takes it again and succeeds.
+    #[test]
+    fn the_offline_revoke_prompt_does_not_hold_the_lock() {
+        let home = TempHome::new();
+        let agent = start(&home);
+        let menu_of = home.menu();
+        drive(&menu_of, &format!("5\n{LOOPBACK}\n{}\n2\n0\n", free_port()));
+        claim(&agent, &pair_url(&drive(&menu_of, "6\n\n0\n")), 0x0d);
+        drive(&menu_of, "7\n1\napprove\n0\n");
+        let grant_id = agent.runtime().store().state().unwrap().reference.grants[0].grant_id;
+        drop(agent);
+
+        let input = format!("8\n{}\n0\n", hex_encode(&grant_id));
+        let mut probe = Probe {
+            input: Cursor::new(input.into_bytes()),
+            at: 2,
+            home: home.0.clone(),
+            result: None,
+        };
+        let mut out = Vec::new();
+        menu(&menu_of, &mut probe, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("Active grants: 1"), "{out}");
+        assert_eq!(
+            probe.result,
+            Some(Ok(())),
+            "the lock was held during the prompt"
+        );
+        assert!(out.contains("Revoked."), "{out}");
+        let store = StateStore::open(
+            SecureRoot::open_under(&home.0, SUFFIX).unwrap(),
+            now_seconds(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.state().unwrap().reference.grants[0].state,
+            GrantState::Revoked
+        );
+    }
+
+    /// Review fix 5: uninstall from the menu with sharing on and a listen
+    /// address stored starts no runtime: the control socket file is the
+    /// one the stopped agent left (a runtime would replace it), and a probe
+    /// connecting to the stored port all through the call never connects.
+    #[test]
+    fn menu_uninstall_starts_no_runtime_and_binds_no_port() {
+        let home = TempHome::new();
+        let port = free_port();
+        {
+            let agent = start(&home);
+            drive(&home.menu(), &format!("5\n{LOOPBACK}\n{port}\n2\n0\n"));
+            assert!(agent.runtime().listener_addr().is_some());
+        }
+        let socket = home.root().join(SOCKET_NAME);
+        let inode = fs::symlink_metadata(&socket).unwrap().ino();
+        let (stop, connected) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let probe = {
+            let (stop, connected) = (Arc::clone(&stop), Arc::clone(&connected));
+            thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    if TcpStream::connect((LOOPBACK, port)).is_ok() {
+                        connected.store(true, Ordering::SeqCst);
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        let out = drive(&home.menu(), "11\n\nuninstall\n0\n");
+        stop.store(true, Ordering::SeqCst);
+        probe.join().unwrap();
+        assert!(out.contains("Identity and pairing state: kept"), "{out}");
+        assert!(
+            !connected.load(Ordering::SeqCst),
+            "the stored port listened"
+        );
+        assert_eq!(fs::symlink_metadata(&socket).unwrap().ino(), inode);
+        let store = StateStore::open(
+            SecureRoot::open_under(&home.0, SUFFIX).unwrap(),
+            now_seconds(),
+        )
+        .unwrap();
+        assert!(!store.state().unwrap().reference.sharing_enabled);
+    }
+
+    /// Review fix 5: a stored listen address that cannot be bound (an
+    /// address of no local interface) does not stop the uninstall.
+    #[test]
+    fn menu_uninstall_works_with_an_unbindable_listen_address() {
+        let home = TempHome::new();
+        {
+            let agent = start(&home);
+            agent
+                .runtime()
+                .store()
+                .set_listen_config(Some("192.0.2.1".into()), 40_000, None)
+                .unwrap();
+        }
+        let out = drive(&home.menu(), "11\npurge\nuninstall\n0\n");
+        assert!(out.contains("Identity and pairing state: deleted"), "{out}");
+        assert!(!home.root().join(STATE_FILE).exists());
+    }
+
+    /// Review fix 7: Status shows an IPv6 listen host in brackets.
+    #[test]
+    fn status_brackets_an_ipv6_listen_host() {
+        let home = TempHome::new();
+        let agent = start(&home);
+        let token = *agent
+            .runtime()
+            .store()
+            .state()
+            .unwrap()
+            .control_token
+            .expose();
+        let reply = Client::new(
+            Secret32::new(token),
+            agent.runtime().socket_path().to_path_buf(),
+        )
+        .call(&Command {
+            id: LISTEN_CONFIGURE,
+            body: json!({"bindHost": "::1", "bindPort": 40_001}),
+        })
+        .unwrap();
+        assert_eq!(reply.code, OK);
+        let out = drive(&home.menu(), "1\n0\n");
+        assert!(out.contains("Listen address: [::1]:40001"), "{out}");
+        drop(agent);
     }
 
     // ------------------------------------------------ the binary (5), (6)

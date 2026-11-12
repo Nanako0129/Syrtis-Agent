@@ -84,7 +84,7 @@ Error `data` is always `null`. `revoked` (4) and `incompatible` (6) are not sent
 
 ## Client
 
-`control::Client::new(token, socketPath)` holds the token as `Secret32`. `call(command)` opens one connection and runs steps 1–7; it sends no command byte before the server proof verifies, and returns a response only after the MAC and the frozen validator pass. A connection closed before the proof (all slots busy, a wrong version) is a `Socket` error; the caller may retry. `revoke` while four same-UID connections stall in their hello completes once their 2 s hello deadline frees a slot (measured below 5 s).
+`control::Client::new(token, socketPath)` holds the token as `Secret32`. `call(command)` opens one connection and runs steps 1–7; it sends no command byte before the server proof verifies, and returns a response only after the MAC and the frozen validator pass. A failure before the whole command is written (connect, the hello, the proof read, a partial command write; all slots busy, a wrong version) is a `Socket` error: the command did not run, and the caller may retry. Once the whole command is written, a reply that does not arrive (deadline, early close, read error) is `NoReply` and a reply that fails its MAC, bound or validator is `Response`: in both the command may have run, and the caller has to read the state (`status`) before acting again (`SA-2C2b` review). `revoke` while four same-UID connections stall in their hello completes once their 2 s hello deadline frees a slot (measured below 5 s).
 
 ## Secret confinement
 

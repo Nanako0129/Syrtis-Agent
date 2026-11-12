@@ -132,7 +132,7 @@ mod imp {
         control::{ScanHook, ScanStatus, ScopeApproveHook, ScopeHook},
         install::{self, Outcome},
         merge::{Combined, FailureClass, PeerData, PeerPart, Report, classify, combine},
-        pairing::Clock,
+        pairing::{Clock, SystemClock},
         peer_store::{PeerRecord, usable},
         report::{
             AgentsRecord, Endpoint, GraphRecord, HourlyRecord, ModelsRecord, ReportRecord,
@@ -380,22 +380,58 @@ mod imp {
                 trusted_home,
                 ..
             } = self;
-            drop(source);
+            drop((source, root));
             let store = runtime.into_store().map_err(AgentError::Storage)?;
-            let terminal_at_ms = terminal_ms(&store, &*clock).map_err(AgentError::Storage)?;
-            let report = install::uninstall(store, &trusted_home, purge, terminal_at_ms)
-                .map_err(AgentError::Install)?;
-            let source_cache = match root.clear_private_subdir(SOURCE_CACHE_DIR) {
-                Ok(()) => Outcome::Removed,
-                Err(_) => Outcome::ManualRepair,
-            };
-            let scope_removed = report.purged && root.remove_file(SCOPE_FILE).is_ok();
-            Ok(AgentUninstallReport {
-                install: report,
-                source_cache,
-                scope_removed,
-            })
+            uninstall_store(store, &trusted_home, purge, &*clock)
         }
+
+        /// [`uninstall`](Self::uninstall) without a running agent (the
+        /// standalone menu, `SA-2C2b` review): takes the owner lock
+        /// (`SecureRoot::open_under`; another holder is `Storage(Busy)`,
+        /// nothing removed), opens the state store, then the same steps as
+        /// `uninstall` after `into_store`. No runtime, control server,
+        /// listener, housekeeping or engine source is started. A root
+        /// without `state.json` gets a fresh one from `StateStore::open`
+        /// first (as at any start), which the durable uninstall then
+        /// disables, and a purge removes.
+        pub fn uninstall_stopped(
+            trusted_home: &Path,
+            state_suffix: &[&str],
+            purge: bool,
+        ) -> Result<AgentUninstallReport, AgentError> {
+            let root =
+                SecureRoot::open_under(trusted_home, state_suffix).map_err(AgentError::Storage)?;
+            let clock = SystemClock;
+            let os_now = clock.os_now_seconds().map_err(AgentError::Storage)?;
+            let store = StateStore::open(root, os_now).map_err(AgentError::Storage)?;
+            uninstall_store(store, trusted_home, purge, &clock)
+        }
+    }
+
+    /// The steps of an uninstall once `store` is the only handle: the
+    /// terminal timestamp, `install::uninstall` (durable uninstall first),
+    /// then the engine's source cache, then, after a purge removed the
+    /// state, `source-scope.json`.
+    fn uninstall_store(
+        store: StateStore,
+        trusted_home: &Path,
+        purge: bool,
+        clock: &dyn Clock,
+    ) -> Result<AgentUninstallReport, AgentError> {
+        let root = store.root();
+        let terminal_at_ms = terminal_ms(&store, clock).map_err(AgentError::Storage)?;
+        let report = install::uninstall(store, trusted_home, purge, terminal_at_ms)
+            .map_err(AgentError::Install)?;
+        let source_cache = match root.clear_private_subdir(SOURCE_CACHE_DIR) {
+            Ok(()) => Outcome::Removed,
+            Err(_) => Outcome::ManualRepair,
+        };
+        let scope_removed = report.purged && root.remove_file(SCOPE_FILE).is_ok();
+        Ok(AgentUninstallReport {
+            install: report,
+            source_cache,
+            scope_removed,
+        })
     }
 
     /// The body of [`Agent::scope_approved`], shared with the control

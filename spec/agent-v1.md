@@ -92,6 +92,8 @@ Not classified with certainty:
 4. `SecureRoot::clear_private_subdir("source-cache")` empties the engine's source cache (session IDs and paths). A failure here marks `source_cache` as `ManualRepair`; it neither stops the uninstall nor returns an error.
 5. If step 3 purged the state, `source-scope.json` is removed; `scope_removed` says whether that succeeded.
 
+`Agent::uninstall_stopped(trusted_home, state_suffix, purge)` (`SA-2C2b` review) is the same uninstall without a running agent, for the standalone menu: `SecureRoot::open_under` (another holder: `Storage(Busy)`, nothing removed), `StateStore::open` at the OS clock (a root without `state.json` gets a fresh one first, as at any start, which the durable uninstall then disables and a purge removes), then steps 2–5 above, with the system clock for step 2. It starts no runtime, control server, listener, housekeeping or engine source. `Agent::uninstall` runs the same steps 2–5 through one shared function after step 1.
+
 `AgentUninstallReport::manual_repair()` is true when step 3 marked anything, step 4 failed, or the state was purged and the scope record was not removed. The secure root's owner lock is held until the function returns.
 
 ## Acceptance map (`tests/agent_v1.rs` unless noted)

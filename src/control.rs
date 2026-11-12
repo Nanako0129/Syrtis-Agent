@@ -73,8 +73,14 @@ pub enum ControlError {
     /// `control.sock` is something other than this UID's socket, or the
     /// bound socket failed its post-bind check. Left in place.
     UnsafeSocket,
-    /// Bind, connect, a read or write, a deadline, or an early close.
+    /// Bind, connect, a read or write, a deadline, or an early close,
+    /// before the whole command was written. For a client call: the
+    /// command did not run.
     Socket,
+    /// The whole command was written, then the reply did not arrive (a
+    /// deadline, an early close, a read error). The command may have run
+    /// (`SA-2C2b` review).
+    NoReply,
     /// The CSPRNG is unavailable.
     Unavailable,
     /// The command could not be encoded, or is over [`COMMAND_JSON_MAX`].
@@ -197,7 +203,10 @@ impl Client {
     /// frozen `verify_control_response` (request ID, code, and the success
     /// data shape for `command.id`) pass. A call refused before the server
     /// proof (for example, all [`PRE_AUTH_CONNECTIONS`] busy) is
-    /// [`ControlError::Socket`]; the caller may retry.
+    /// [`ControlError::Socket`]; the caller may retry. Once the whole
+    /// command is written, a missing reply is [`ControlError::NoReply`] and
+    /// a reply that fails its checks is [`ControlError::Response`]: the
+    /// command may have run.
     pub fn call(&self, command: &Command) -> Result<Response, ControlError> {
         imp::call(self, command)
     }
@@ -1085,7 +1094,10 @@ mod imp {
         write_by(&mut stream, &frame, deadline).map_err(socket)?;
 
         let mut header = [0; RESPONSE_HEADER_LEN];
-        read_by(&mut stream, &mut header, deadline).map_err(socket)?;
+        // From here the command is out: a missing reply says nothing about
+        // whether it ran.
+        let no_reply = |_| ControlError::NoReply;
+        read_by(&mut stream, &mut header, deadline).map_err(no_reply)?;
         let code = u16::from_be_bytes([header[0], header[1]]);
         let len = usize::try_from(u32::from_be_bytes([
             header[2], header[3], header[4], header[5],
@@ -1095,7 +1107,7 @@ mod imp {
             return Err(ControlError::Response);
         }
         let mut rest = vec![0; len + MAC_LEN];
-        read_by(&mut stream, &mut rest, deadline).map_err(socket)?;
+        read_by(&mut stream, &mut rest, deadline).map_err(no_reply)?;
         let (json, mac) = rest.split_at(len);
         let expected = control_response_mac(
             &key,

@@ -12,7 +12,7 @@
 
 use std::{
     ffi::OsString,
-    io::{self, BufRead, Write},
+    io::{self, BufRead},
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -33,6 +33,8 @@ pub const NOT_RUNNING: &str = "The agent is not running (or not answering). Star
 pub const STOP_FIRST: &str =
     "The agent is running. Stop it first (menu item 9), then try again. Nothing was changed.";
 pub const LINE_TOO_LONG: &str = "That line is longer than 16384 bytes and was ignored.";
+pub const OUTCOME_UNKNOWN: &str = "The command was sent, but no valid reply came back: it may or may not have taken effect. Check Status (menu item 1) before trying again.";
+pub const NO_STATE: &str = "There is no agent state on this machine. Nothing was changed.";
 
 /// Exit status of a refused debug home in a release build.
 const EXIT_REFUSED: u8 = 3;
@@ -144,6 +146,8 @@ pub use imp::{Menu, menu};
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod imp {
+    use std::io::Write;
+
     use serde_json::{Value, json};
 
     use super::*;
@@ -239,7 +243,11 @@ mod imp {
         NotRunning,
         /// The root or `state.json` failed a check.
         Unsafe(StorageError),
-        /// The reply failed its proof or its validation.
+        /// The command was sent in full and no valid reply came back
+        /// (`NoReply`, `Response`): it may have run.
+        Unknown,
+        /// Nothing was sent (the server proof failed, or the command could
+        /// not be encoded).
         Failed(ControlError),
     }
 
@@ -273,7 +281,10 @@ mod imp {
         fn call(&self, id: u16, body: Value) -> Result<Response, Reach> {
             match self.client()?.call(&Command { id, body }) {
                 Ok(response) => Ok(response),
+                // Not connected, or cut before the whole command was out:
+                // the command did not run.
                 Err(ControlError::Socket) => Err(Reach::NotRunning),
+                Err(ControlError::NoReply | ControlError::Response) => Err(Reach::Unknown),
                 Err(error) => Err(Reach::Failed(error)),
             }
         }
@@ -395,8 +406,12 @@ mod imp {
                 out,
                 "The agent's state directory failed a safety check ({error:?}). Nothing was changed."
             ),
+            Err(Reach::Unknown) => writeln!(out, "{OUTCOME_UNKNOWN}"),
             Err(Reach::Failed(error)) => {
-                writeln!(out, "The control call failed ({error:?}).")
+                writeln!(
+                    out,
+                    "The control call failed ({error:?}). Nothing was sent."
+                )
             }
         }
     }
@@ -424,6 +439,7 @@ mod imp {
         };
         let on = |key: &str| if data[key] == true { "yes" } else { "no" };
         let listen = match (&data["bindHost"], &data["bindPort"]) {
+            (Value::String(host), port) if host.contains(':') => format!("[{host}]:{port}"),
             (Value::String(host), port) => format!("{host}:{port}"),
             _ => "not set".into(),
         };
@@ -481,6 +497,12 @@ mod imp {
     /// Shows what the resident scans, then sends the digest of exactly
     /// that disclosure (`SA-0G`).
     fn scope(menu: &Menu, input: &mut dyn BufRead, out: &mut dyn Write) -> io::Result<()> {
+        // Only a reachable resident can approve: no disclosure or prompt
+        // otherwise.
+        let reached = menu.call(STATUS, json!({}));
+        if !matches!(&reached, Ok(response) if response.code == OK) {
+            return report(out, &reached);
+        }
         let Some((lines, digest)) = menu.disclosure() else {
             return writeln!(
                 out,
@@ -508,7 +530,7 @@ mod imp {
             Ok(response) if response.code == OK => writeln!(out, "Scope approved."),
             Ok(response) if response.code == INVALID => writeln!(
                 out,
-                "The running agent was started with other inputs than the ones shown. Restart it, then try again. Nothing was approved."
+                "The agent refused the approval (invalid); the scope was not approved. If the running agent was started with other inputs than the ones shown (a change since it started), restart it and try again. Status (menu item 1) shows the current state."
             ),
             _ => report(out, &result),
         }
@@ -631,6 +653,10 @@ mod imp {
         match &result {
             Ok(response) if response.code == OK => {
                 writeln!(out, "Active grants: {}", response.data["activeGrantCount"])?;
+                writeln!(
+                    out,
+                    "While the agent runs, grants can only be counted, not listed (control has no grant list): revoke one by its grant ID, or stop the agent to see the list."
+                )?;
                 let Some(grant_id) = revoke_prompt(input, out)? else {
                     return Ok(());
                 };
@@ -668,29 +694,29 @@ mod imp {
         }
     }
 
+    /// Lists under the lock, lets the lock go for the prompt (a resident
+    /// may start meanwhile), then takes it again only to revoke. Writes
+    /// nothing when the root or `state.json` is missing: `StateStore::open`
+    /// would create a new identity there.
     fn grants_offline(menu: &Menu, input: &mut dyn BufRead, out: &mut dyn Write) -> io::Result<()> {
-        match SecureRoot::open_read_only(&menu.home, menu.suffix) {
-            Ok(Some(_)) => {}
-            Ok(None) => return writeln!(out, "There is no agent state on this machine."),
-            Err(error) => return report(out, &Err(Reach::Unsafe(error))),
-        }
-        let store = match crate::state_store::os_now_seconds()
-            .and_then(|now| StateStore::open(SecureRoot::open_under(&menu.home, menu.suffix)?, now))
-        {
-            Ok(store) => store,
-            Err(StorageError::Busy) => return writeln!(out, "{STOP_FIRST}"),
-            Err(error) => return report(out, &Err(Reach::Unsafe(error))),
+        let active: Vec<_> = {
+            let store = match open_existing_store(menu) {
+                Ok(Some(store)) => store,
+                Ok(None) => return writeln!(out, "{NO_STATE}"),
+                Err(StorageError::Busy) => return writeln!(out, "{STOP_FIRST}"),
+                Err(error) => return report(out, &Err(Reach::Unsafe(error))),
+            };
+            let state = match store.state() {
+                Ok(state) => state,
+                Err(error) => return report(out, &Err(Reach::Unsafe(error))),
+            };
+            state
+                .reference
+                .grants
+                .into_iter()
+                .filter(|grant| grant.state == GrantState::Active)
+                .collect()
         };
-        let state = match store.state() {
-            Ok(state) => state,
-            Err(error) => return report(out, &Err(Reach::Unsafe(error))),
-        };
-        let active: Vec<_> = state
-            .reference
-            .grants
-            .iter()
-            .filter(|grant| grant.state == GrantState::Active)
-            .collect();
         writeln!(
             out,
             "The agent is not running. Active grants: {}",
@@ -707,6 +733,17 @@ mod imp {
         }
         let Some(grant_id) = revoke_prompt(input, out)? else {
             return Ok(());
+        };
+        let store = match open_existing_store(menu) {
+            Ok(Some(store)) => store,
+            Ok(None) => return writeln!(out, "{NO_STATE}"),
+            Err(StorageError::Busy) => {
+                return writeln!(
+                    out,
+                    "The agent started meanwhile. Nothing was revoked; choose item 8 again."
+                );
+            }
+            Err(error) => return report(out, &Err(Reach::Unsafe(error))),
         };
         let os_now = crate::state_store::os_now_seconds().ok();
         let result = store.transition(|state| {
@@ -726,6 +763,20 @@ mod imp {
         }
     }
 
+    /// The state store under the owner lock, only when `state.json`
+    /// already exists (checked read-only first, so a missing root or file
+    /// is never created). `Ok(None)` when either is missing.
+    fn open_existing_store(menu: &Menu) -> Result<Option<StateStore>, StorageError> {
+        let Some(root) = SecureRoot::open_read_only(&menu.home, menu.suffix)? else {
+            return Ok(None);
+        };
+        if root.read_file(STATE_FILE, STATE_FILE_MAX_BYTES)?.is_none() {
+            return Ok(None);
+        }
+        let now = crate::state_store::os_now_seconds()?;
+        StateStore::open(SecureRoot::open_under(&menu.home, menu.suffix)?, now).map(Some)
+    }
+
     fn install_item(menu: &Menu, out: &mut dyn Write) -> io::Result<()> {
         if menu.running() {
             return writeln!(out, "{STOP_FIRST}");
@@ -736,7 +787,8 @@ mod imp {
                 "This program's own path is unknown. Nothing was installed."
             );
         };
-        // Held while installing: a resident that starts meanwhile waits.
+        // Held while installing: a resident that starts meanwhile cannot
+        // take the lock (it is non-blocking) and exits "already running".
         let _lock = match SecureRoot::open_under(&menu.home, menu.suffix) {
             Ok(root) => root,
             Err(StorageError::Busy) => return writeln!(out, "{STOP_FIRST}"),
@@ -771,28 +823,13 @@ mod imp {
         if confirm.as_deref() != Some("uninstall") {
             return writeln!(out, "Nothing was changed.");
         }
-        let (config_dir, data_dir) = default_dirs(&menu.home);
-        let mut config = AgentConfig::new(
-            menu.home.clone(),
-            config_dir,
-            data_dir,
-            ScannerSettings::default(),
-        );
-        config.state_suffix = menu.suffix;
-        let agent = match Agent::start(config) {
-            Ok(agent) => agent,
-            Err(
-                AgentError::Storage(StorageError::Busy)
-                | AgentError::Runtime(RuntimeError::Store(StorageError::Busy)),
-            ) => return writeln!(out, "{STOP_FIRST}"),
-            Err(error) => return writeln!(out, "Not uninstalled ({error:?})."),
-        };
         let outcome = |outcome: Outcome| match outcome {
             Outcome::Removed => "removed",
             Outcome::Absent => "not there",
             Outcome::ManualRepair => "LEFT IN PLACE, remove it by hand",
         };
-        match agent.uninstall(purge == "purge") {
+        // No runtime: nothing listens or serves during an uninstall.
+        match Agent::uninstall_stopped(&menu.home, menu.suffix, purge == "purge") {
             Ok(report) => {
                 writeln!(
                     out,
@@ -821,6 +858,7 @@ mod imp {
                     "An autostart entry that is loaded stays loaded until you unload it or log out."
                 )
             }
+            Err(AgentError::Storage(StorageError::Busy)) => writeln!(out, "{STOP_FIRST}"),
             Err(error) => writeln!(out, "Not uninstalled ({error:?})."),
         }
     }
