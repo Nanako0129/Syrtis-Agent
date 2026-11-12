@@ -50,7 +50,7 @@ When the code is 3 and the stored grant is still `active`, the producer also com
 Per grant, after steps 2–4, so only an authorized, valid request is counted. The table is keyed by grant ID, on the producer's injectable monotonic clock:
 
 - At most one request in flight per grant. It is in flight from step 5 until its response ends: the source call and every chunk.
-- A token bucket: 2 tokens, plus 1 for every 60 s, up to 2. An admitted request takes one; a refused one takes none.
+- A token bucket: 2 tokens, plus 1 for every 60 s, up to 2. A request refused at this step takes none. One admitted here takes one, and keeps it spent if a later step refuses it (`busy` for the compute slot or the ledger, `internal` for the source).
 - A bucket that is full and not in flight is removed at the next admission, so the table holds only grants used recently.
 
 ## Report source
