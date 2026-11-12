@@ -49,6 +49,8 @@ pub const REJECT: u16 = 6;
 pub const REVOKE: u16 = 7;
 pub const LISTEN_CONFIGURE: u16 = 8;
 pub const SHUTDOWN: u16 = 9;
+pub const SHARING_SET: u16 = 10;
+pub const SCOPE_APPROVE: u16 = 11;
 
 // Result codes.
 pub const OK: u16 = 0;
@@ -140,6 +142,10 @@ pub struct ScanStatus {
 /// thread; it must not block on the store.
 pub type ScanHook = Arc<dyn Fn() -> ScanStatus + Send + Sync>;
 
+/// Supplies `scopeApproved` of each `status` reply (`SA-0G`). Runs on the
+/// serving thread; it must not block on the store. Without one, `false`.
+pub type ScopeHook = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// The control client: the token and the socket path.
 pub struct Client {
     token: Secret32,
@@ -215,7 +221,27 @@ impl Server {
         on_listen_configured: ListenHook,
         scan: ScanHook,
     ) -> Result<Self, ControlError> {
-        imp::Server::start(store, clock, on_shutdown, on_listen_configured, scan).map(Self)
+        Self::start_with_scope_hook(
+            store,
+            clock,
+            on_shutdown,
+            on_listen_configured,
+            scan,
+            Arc::new(|| false),
+        )
+    }
+
+    /// [`start_with_hooks`](Self::start_with_hooks), plus `scope`, which
+    /// supplies `scopeApproved` of every `status` reply.
+    pub fn start_with_scope_hook(
+        store: Arc<StateStore>,
+        clock: Arc<dyn Clock>,
+        on_shutdown: ShutdownHook,
+        on_listen_configured: ListenHook,
+        scan: ScanHook,
+        scope: ScopeHook,
+    ) -> Result<Self, ControlError> {
+        imp::Server::start(store, clock, on_shutdown, on_listen_configured, scan, scope).map(Self)
     }
 
     pub fn socket_path(&self) -> &Path {
@@ -249,6 +275,7 @@ mod imp {
             _: ShutdownHook,
             _: ListenHook,
             _: ScanHook,
+            _: ScopeHook,
         ) -> Result<Self, ControlError> {
             Err(ControlError::Unsupported)
         }
@@ -329,6 +356,7 @@ mod imp {
         on_shutdown: ShutdownHook,
         on_listen_configured: ListenHook,
         scan: ScanHook,
+        scope: ScopeHook,
         /// The pre-auth memory ledger, in bytes.
         memory: AtomicUsize,
         /// A `try_clone` of each connection, so `stop` can shut it down;
@@ -354,6 +382,7 @@ mod imp {
             on_shutdown: ShutdownHook,
             on_listen_configured: ListenHook,
             scan: ScanHook,
+            scope: ScopeHook,
         ) -> Result<Self, ControlError> {
             Self::spawn(Shared {
                 store,
@@ -361,6 +390,7 @@ mod imp {
                 on_shutdown,
                 on_listen_configured,
                 scan,
+                scope,
                 memory: AtomicUsize::new(0),
                 live: Mutex::new(HashMap::new()),
                 #[cfg(test)]
@@ -685,7 +715,7 @@ mod imp {
             STATUS => {
                 let state = store.state().map_err(code_of)?;
                 let now_ms = record_ms(&state.reference, clock).map_err(|_| INTERNAL)?;
-                Ok(status(&state, now_ms, (shared.scan)()))
+                Ok(status(&state, now_ms, (shared.scan)(), (shared.scope)()))
             }
             OFFER_CREATE => offer_create(shared, body),
             OFFER_CANCEL => {
@@ -747,6 +777,9 @@ mod imp {
                 Ok(Value::Null)
             }
             SHUTDOWN => Ok(Value::Null),
+            // Wire frozen by SA-0G; the effect is wired in SA-2C2b. Until
+            // then: `internal`, nothing written.
+            SHARING_SET | SCOPE_APPROVE => Err(INTERNAL),
             _ => Err(INVALID),
         }
     }
@@ -812,7 +845,7 @@ mod imp {
     /// `now_ms` is [`record_ms`]: offers and pending records past their
     /// `expiresAt` by then are left out even before the housekeeping sweep
     /// stores them as expired. Grants are counted as stored.
-    fn status(state: &StoredState, now_ms: i64, scan: ScanStatus) -> Value {
+    fn status(state: &StoredState, now_ms: i64, scan: ScanStatus, scope_approved: bool) -> Value {
         let reference = &state.reference;
         let mut families = scan.families;
         families.sort_unstable();
@@ -843,6 +876,7 @@ mod imp {
                 ScanState::Ok => "ok",
                 ScanState::Error => "error",
             },
+            "scopeApproved": scope_approved,
             "sharingEnabled": reference.sharing_enabled,
             "sourceFamilies": families,
         })
@@ -1127,6 +1161,7 @@ mod imp {
                 on_shutdown: Arc::new(|| {}),
                 on_listen_configured: Arc::new(|| {}),
                 scan: Arc::new(ScanStatus::default),
+                scope: Arc::new(|| false),
                 memory: AtomicUsize::new(0),
                 live: Mutex::new(HashMap::new()),
                 peer_uid: Some(foreign),

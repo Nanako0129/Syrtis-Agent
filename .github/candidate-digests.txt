@@ -106,23 +106,36 @@
 # Review fix: spec/source-v1.md now fixes the ownerInputsSha256 encoding in
 # this crate (an engine pin cannot move it) and points at the state-store
 # spec's own statement of the tokscale-core exception.
+#
+# SA-0G amended the SA-0 contract on purpose: control command 10
+# `sharingSet{enabled}` and 11 `scopeApprove{ownerInputsSha256}` (64
+# lowercase hex), both with `null` success data; the `status` success data
+# gains the required bool `scopeApproved`; the source scope record
+# (`generation,ownerInputsSha256,schema`) is a registered localOnlyFields
+# surface; `enabled`, `scopeApproved` and `ownerInputsSha256` join
+# protocolFields, `generation` and `ownerInputsSha256` join localOnlyFields.
+# spec/v1.md, src/security.rs, tests/security_contract_v1.rs, the consent
+# fixture and spec/security-v1.md carry new digests. spec/control-v1.md
+# (the server answers `internal` to 10 and 11 until SA-2C2b; status reads
+# scopeApproved from a scope provider) and spec/source-v1.md (points at the
+# registered record and at scopeApprove) changed on purpose.
 4eb5d2ca0aa2906676095dd4d2450d142f15fd6e8cdfbff774ee9d7cbf2e9373  spec/cache-store-v1.md
 055a5c81aade6aec75c8f43bccb8128ab22ca1691b15b690ca833d0005176a2f  spec/install-v1.md
-854ea8a9ff1d20e9d9a4695e13e85364618e9209dd85d516ee25e7fd0978b955  spec/control-v1.md
+27b659d292e4d637c07870101ec3699004af06b78819cae6dd42f15e6fe94bf0  spec/control-v1.md
 6ba187336666045a8766cf1a03bad7b17a4133c3b6eb72270fc58f6588d5beff  spec/pairing-v1.md
 00fe7d6a909a0ebc531437909425d1191d3bc6d7616523deee2d2eefdd749b8a  spec/runtime-v1.md
 686951d4a0d463d5a29d5d3e9d2be97198211cba3ab81202da66643c1c79e6bc  spec/report-peer-v1.md
 3cce5944bf106ca5e5503505f3b4150f192eead0db3f9b1a3fdaf3617ae1c59b  spec/peer-store-v1.md
 79d1c0363e4576d67827ebfa029fad7e3a5981474f4aafba3bd71e54f1a98172  spec/report-cache-v1.md
-4234cdfdf319cf41907cbd34273067a3895473d84c4ab85d430bc2cbbe8791c0  spec/security-v1.md
+910fbb67d3d7b464863f4ad525e803f61e80b8e13d7ef4eba347d135c6616265  spec/security-v1.md
 1b125846c4aa9f5d70bd7c4ab4f07f99decd5087a20f4a9f3e7e900c524202f5  spec/state-store-v1.md
-c550bcafe14707a45ad0b661ce1afc7ba383153cbbdede4ff0e839175fa89726  spec/v1.md
-81901a08ce085ed49e892969e5a6c0416322f239db2be415050429ae8e5fd147  spec/source-v1.md
+8bc39c0eb646a39c500aa2efbb39ae9ca4d065365e4ad2388f931e0b2d7e9827  spec/v1.md
+0f305bfe61d77f2b51791cd8781608ecc6619325fa700da9b8f3f50cdff2f1e0  spec/source-v1.md
 d848fe32fd0c8f336433dbc016949ceff3f2fa5942dd64e691127ce5365cdfaf  spec/agent-v1.md
 ff21cbcfdd6aedfb68ac1b3cfda056663203f2c7f08fd05a856dc5dbe5e4c25a  src/cache.rs
 8b0add8d4fde2253edebdddd448d381559d63ff630f0e9d2f9faad8d9625567f  src/canonical.rs
 e3f35e33b4b26bab06e243d14eb087b5b2405a3b093a6a744cc84a5a36573ab0  src/report.rs
-3960f1c52ce6edb2409aa4b370649b4d2f8ed4b74396a028ac1798b1e9eb6434  src/security.rs
+026735a9ef784c2a26e195401b6f73910fd9a51b3f9a3065223230cd252cc911  src/security.rs
 c8b01baf8a687f066d8d361963b262d903e7776949ccf971130200759c86a167  tests/dependency_provenance_v1.rs
 e01e9d55a26fb4f807ff0baea4a9681b0cbbb86b61f6b00fe5c49d919a2ebb10  tests/fixtures/v1/cache/body.sha256
 edb92226baac009e4c7779cb2c7a7369049e0ea97615945f8e64378322785b19  tests/fixtures/v1/cache/filename.txt
@@ -134,7 +147,7 @@ c02dccddf2ffbb5c86f0a0230db59e59276efece0970aad85252d78af6d31d05  tests/fixtures
 60c2996518decd1ec26e810df8b92a32298530947e3df5eb59db1aaa4294d07c  tests/fixtures/v1/report/models.json
 6f4b4b0a76a50ea2ca666007e29847b17db82d95860573f6d9f93e424a1ee7e3  tests/fixtures/v1/runtime/storage/cargo-lock-baseline.json
 f8326f22b3df9d37df1ec1eea8dd6b4a160de6022b3a226a35bb618c4345f4e0  tests/fixtures/v1/runtime/storage/state-golden.json
-df32654d66d2771e741700d81590d4be410ec999faac30bfdc4774a9b3636070  tests/fixtures/v1/security/consent.json
+1687926712daab8925fcaa639ebb687fd3b397bf6a296dbbe31f7a225b1c9669  tests/fixtures/v1/security/consent.json
 a58bdd593173195fa9042f6c0e4065a11d553fcc88d4ae79bfc1a5e31f16692e  tests/fixtures/v1/security/control_mac.hex
 ad73bef2423761d5f2d473cab2561133560498054009e01e52c2a845a643dfd1  tests/fixtures/v1/security/linux_roots.json
 c5947513e177225ac089cef1980abe2814e3e8e2aa2ccf6cd609eb55dd4c272c  tests/fixtures/v1/security/memory_budget.json
@@ -149,4 +162,4 @@ cbd942c4fd168b5d78fbfc469acd06cb62f77c026fcbc256285c6c7d9680fdd1  tests/fixtures
 38d0e47b6ae5cd875d8962896e3d1fd51a1ccf66a25b5a9c97757d6784bda9ca  tests/fixtures/v1/source/default-roots.json
 6f0060490f34a9b82231d9f0bb85a4a7ef1394f7722879a0dabaeffdcb09b020  tests/fixtures/v1/source/environment-keys.json
 39c2823d68bf6de7854574899b606167897c21292037b8ed359b19fe2e08062c  tests/report_cache_v1.rs
-b5d5ed7cab7e0046e7ec82e1c4825f1ddac075b3b6bd18aab69f323e69e45c89  tests/security_contract_v1.rs
+34c2a335cc9bc3cb3e4af5e6f7bbefd153b5dcef4896cba3dc161f1ad2abdb02  tests/security_contract_v1.rs

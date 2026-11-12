@@ -480,7 +480,7 @@ fn control_mac_kats_and_strict_shapes() {
     let status = CanonicalJsonV1::encode(&json!({
         "code": 0,
         "controlVersion": 1,
-        "data": {"activeGrantCount": 1, "activeOfferCount": 0, "bindHost": "127.0.0.1", "bindPort": 49152, "lastScanAt": null, "nodeLabel": "node", "pendingCount": 0, "scanStatus": "never", "sharingEnabled": true, "sourceFamilies": ["claude", "codex"]},
+        "data": {"activeGrantCount": 1, "activeOfferCount": 0, "bindHost": "127.0.0.1", "bindPort": 49152, "lastScanAt": null, "nodeLabel": "node", "pendingCount": 0, "scanStatus": "never", "scopeApproved": false, "sharingEnabled": true, "sourceFamilies": ["claude", "codex"]},
         "requestId": hex_encode(&request_id)
     }))
     .unwrap();
@@ -489,7 +489,7 @@ fn control_mac_kats_and_strict_shapes() {
     // other non-string, a non-canonical host, a long label, a missing key
     // or a null port is still refused.
     let status_with = |edit: &dyn Fn(&mut serde_json::Map<String, Value>)| {
-        let mut data = json!({"activeGrantCount": 0, "activeOfferCount": 0, "bindHost": "127.0.0.1", "bindPort": 49152, "lastScanAt": null, "nodeLabel": "node", "pendingCount": 0, "scanStatus": "never", "sharingEnabled": false, "sourceFamilies": []});
+        let mut data = json!({"activeGrantCount": 0, "activeOfferCount": 0, "bindHost": "127.0.0.1", "bindPort": 49152, "lastScanAt": null, "nodeLabel": "node", "pendingCount": 0, "scanStatus": "never", "scopeApproved": true, "sharingEnabled": false, "sourceFamilies": []});
         edit(data.as_object_mut().unwrap());
         let body = CanonicalJsonV1::encode(&json!({
             "code": 0, "controlVersion": 1, "data": data, "requestId": hex_encode(&request_id)
@@ -522,6 +522,10 @@ fn control_mac_kats_and_strict_shapes() {
         json!({"nodeLabel": "x".repeat(129)}),
         json!({"nodeLabel": 7}),
         json!({"bindPort": null}),
+        // SA-0G: `scopeApproved` is a required bool.
+        json!({"scopeApproved": null}),
+        json!({"scopeApproved": 1}),
+        json!({"scopeApproved": "true"}),
     ] {
         let (key, value) = refused.as_object().unwrap().iter().next().unwrap();
         assert!(
@@ -532,7 +536,7 @@ fn control_mac_kats_and_strict_shapes() {
             "{key}: {value} must be refused"
         );
     }
-    for key in ["bindHost", "nodeLabel"] {
+    for key in ["bindHost", "nodeLabel", "scopeApproved"] {
         assert!(
             status_with(&|d| {
                 d.remove(key);
@@ -555,6 +559,66 @@ fn control_mac_kats_and_strict_shapes() {
     .unwrap();
     verify_control_response(&null_success, &request_id, 7, 0).unwrap();
     assert!(verify_control_response(&status, &request_id, 4, 0).is_err());
+}
+
+/// SA-0G acceptance (a) and (b): command 10 `sharingSet{enabled}` and
+/// command 11 `scopeApprove{ownerInputsSha256}`; their success data is
+/// `null`; command 12 stays refused.
+#[test]
+fn sharing_set_and_scope_approve_bodies_and_null_success() {
+    let request_id = [0x41; 16];
+    let command = |id: u16, body: Value| {
+        let json = CanonicalJsonV1::encode(&json!({
+            "body": body, "commandId": id, "controlVersion": 1, "requestId": hex_encode(&request_id)
+        }))
+        .unwrap();
+        verify_control_command(&json, &request_id, id)
+    };
+    command(10, json!({"enabled": true})).unwrap();
+    command(10, json!({"enabled": false})).unwrap();
+    for refused in [
+        json!({}),
+        json!({"enabled": true, "extra": 1}),
+        json!({"enabled": null}),
+        json!({"enabled": 1}),
+        json!({"enabled": "true"}),
+        json!({"ownerInputsSha256": "ab".repeat(32)}),
+    ] {
+        assert!(command(10, refused.clone()).is_err(), "10: {refused}");
+    }
+    let digest = "0123456789abcdef".repeat(4);
+    command(11, json!({"ownerInputsSha256": digest})).unwrap();
+    for refused in [
+        json!({}),
+        json!({"ownerInputsSha256": digest, "extra": 1}),
+        json!({"ownerInputsSha256": "ab".repeat(31)}),
+        json!({"ownerInputsSha256": "ab".repeat(33)}),
+        json!({"ownerInputsSha256": format!("{}a", "ab".repeat(31))}),
+        json!({"ownerInputsSha256": "AB".repeat(32)}),
+        json!({"ownerInputsSha256": "zz".repeat(32)}),
+        json!({"ownerInputsSha256": 7}),
+        json!({"enabled": true}),
+    ] {
+        assert!(command(11, refused.clone()).is_err(), "11: {refused}");
+    }
+    for body in [json!({}), json!({"enabled": true})] {
+        assert!(command(12, body.clone()).is_err(), "12: {body}");
+    }
+
+    let response = |id: u16, data: Value| {
+        let json = CanonicalJsonV1::encode(&json!({
+            "code": 0, "controlVersion": 1, "data": data, "requestId": hex_encode(&request_id)
+        }))
+        .unwrap();
+        verify_control_response(&json, &request_id, id, 0)
+    };
+    for id in [10, 11] {
+        response(id, Value::Null).unwrap();
+        for data in [json!({}), json!(true), json!([]), json!({"enabled": true})] {
+            assert!(response(id, data.clone()).is_err(), "{id}: {data}");
+        }
+    }
+    assert!(response(12, Value::Null).is_err());
 }
 
 const WALL_SECONDS: i64 = NOW_MS / 1_000;
@@ -2154,8 +2218,10 @@ fn consent_surface_and_privacy_registry() {
             &[
                 "bindHost",
                 "bindPort",
+                "enabled",
                 "grantId",
                 "offerId",
+                "ownerInputsSha256",
                 "pendingId",
                 "sasGeneration",
                 "ttlSeconds",
@@ -2178,6 +2244,7 @@ fn consent_surface_and_privacy_registry() {
                 "nodeLabel",
                 "pendingCount",
                 "scanStatus",
+                "scopeApproved",
                 "sharingEnabled",
                 "sourceFamilies",
             ],
@@ -2308,6 +2375,10 @@ fn consent_surface_and_privacy_registry() {
                 "expiresAtUnixMs",
             ],
         ),
+        (
+            "Source scope record",
+            &["generation", "ownerInputsSha256", "schema"],
+        ),
     ];
 
     for (name, fields) in named_shared_surfaces {
@@ -2412,6 +2483,23 @@ fn consent_surface_and_privacy_registry() {
         for local in ["initiatorStatic", "sasCode", "sasGeneration", "secretHash"] {
             assert!(!fields.contains(&local), "{name} carries {local}");
         }
+        // SA-0G: the control-only fields never reach a peer.
+        for control in ["enabled", "ownerInputsSha256", "scopeApproved"] {
+            assert!(!fields.contains(&control), "{name} carries {control}");
+        }
+    }
+    // SA-0G: each new field name is in the registry it was added to.
+    for field in ["enabled", "ownerInputsSha256", "scopeApproved"] {
+        assert!(
+            PROTOCOL_FIELDS.contains(&field),
+            "protocolFields lacks {field}"
+        );
+    }
+    for field in ["generation", "ownerInputsSha256"] {
+        assert!(
+            LOCAL_ONLY_FIELDS.contains(&field),
+            "localOnlyFields lacks {field}"
+        );
     }
 
     let shared_surfaces: Vec<&[&str]> = named_shared_surfaces.iter().map(|s| s.1).collect();

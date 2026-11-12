@@ -522,7 +522,7 @@ pub fn verify_control_command(
     if integer(object, "controlVersion")? != u64::from(CONTROL_VERSION)
         || integer(object, "commandId")? != u64::from(command_id)
         || string(object, "requestId")? != hex_encode(request_id)
-        || !(1..=9).contains(&command_id)
+        || !(1..=11).contains(&command_id)
     {
         return Err(SecurityError::Invalid);
     }
@@ -567,6 +567,17 @@ fn validate_command_body(command_id: u16, body: &Map<String, Value>) -> Result<(
                 Err(SecurityError::Invalid)
             }
         }
+        10 => {
+            exact_keys(body, &["enabled"])?;
+            body.get("enabled")
+                .and_then(Value::as_bool)
+                .map(|_| ())
+                .ok_or(SecurityError::Invalid)
+        }
+        11 => {
+            exact_keys(body, &["ownerInputsSha256"])?;
+            decode_fixed_hex::<32>(string(body, "ownerInputsSha256")?).map(|_| ())
+        }
         _ => Err(SecurityError::Invalid),
     }
 }
@@ -600,7 +611,7 @@ pub fn verify_control_response(
         1 => validate_status_data(data),
         2 => validate_offer_data(data),
         4 => validate_pending_data(data),
-        3 | 5..=9 if data.is_null() => Ok(()),
+        3 | 5..=11 if data.is_null() => Ok(()),
         _ => Err(SecurityError::Invalid),
     }
 }
@@ -618,6 +629,7 @@ fn validate_status_data(data: &Value) -> Result<(), SecurityError> {
             "nodeLabel",
             "pendingCount",
             "scanStatus",
+            "scopeApproved",
             "sharingEnabled",
             "sourceFamilies",
         ],
@@ -641,6 +653,10 @@ fn validate_status_data(data: &Value) -> Result<(), SecurityError> {
         || !host_ok
         || !label_ok
         || !matches!(string(object, "scanStatus")?, "never" | "ok" | "error")
+        || object
+            .get("scopeApproved")
+            .and_then(Value::as_bool)
+            .is_none()
         || object
             .get("sharingEnabled")
             .and_then(Value::as_bool)
@@ -1721,6 +1737,7 @@ pub const PROTOCOL_FIELDS: &[&str] = &[
     "commandId",
     "controlVersion",
     "data",
+    "enabled",
     "endDateExclusive",
     "endpoint",
     "expiresAt",
@@ -1729,6 +1746,7 @@ pub const PROTOCOL_FIELDS: &[&str] = &[
     "lastScanAt",
     "nodeLabel",
     "offerId",
+    "ownerInputsSha256",
     "pairUrl",
     "pendingCount",
     "pendingId",
@@ -1742,6 +1760,7 @@ pub const PROTOCOL_FIELDS: &[&str] = &[
     "sasGeneration",
     "saturated",
     "scanStatus",
+    "scopeApproved",
     "secret",
     "sharingEnabled",
     "sourceFamilies",
@@ -1770,6 +1789,7 @@ pub const LOCAL_ONLY_FIELDS: &[&str] = &[
     "endpoints",
     "expiresAt",
     "expiresAtUnixMs",
+    "generation",
     "grantId",
     "grants",
     "host",
@@ -1781,6 +1801,7 @@ pub const LOCAL_ONLY_FIELDS: &[&str] = &[
     "nodeLabel",
     "offerId",
     "offers",
+    "ownerInputsSha256",
     "peerStatic",
     "peers",
     "pending",
