@@ -88,7 +88,13 @@
 # retry), housekeeping's purge_expired and listener retry, the
 # listenConfigure hook keeping a listener already on the stored address,
 # the SA-2B3b acceptance map and three non-claims.
+#
+# SA-2C1 adds spec/install-v1.md, the install and uninstall contract (the
+# frozen install_objects paths, the descriptor-relative directory walk,
+# the autostart templates, the uninstall order and the purge rule). No
+# existing line changed.
 4eb5d2ca0aa2906676095dd4d2450d142f15fd6e8cdfbff774ee9d7cbf2e9373  spec/cache-store-v1.md
+055a5c81aade6aec75c8f43bccb8128ab22ca1691b15b690ca833d0005176a2f  spec/install-v1.md
 cb6f2e04a7968c74612fac18fcb9ed0e9e5b1a6d6ce746830463165e77f64e40  spec/control-v1.md
 6ba187336666045a8766cf1a03bad7b17a4133c3b6eb72270fc58f6588d5beff  spec/pairing-v1.md
 f1fc58f85411a7c99b20ca164837823cc236b0123cfdf2b706b9efa86e939755  spec/runtime-v1.md

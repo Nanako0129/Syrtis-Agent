@@ -588,7 +588,7 @@ fn clear_acl(file: &File) -> io::Result<()> {
 /// Constants from `<sys/acl.h>` (`acl_type_t`, `acl_tag_t` and
 /// `acl_entry_id_t` are C enums, so `int`).
 #[cfg(target_os = "macos")]
-mod acl {
+pub(crate) mod acl {
     use std::{
         ffi::{c_int, c_void},
         fs::File,

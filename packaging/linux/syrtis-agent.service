@@ -1,0 +1,8 @@
+[Unit]
+Description=Syrtis Agent
+
+[Service]
+ExecStart=@BINARY@ run
+
+[Install]
+WantedBy=default.target
