@@ -485,6 +485,62 @@ fn control_mac_kats_and_strict_shapes() {
     }))
     .unwrap();
     verify_control_response(&status, &request_id, 1, 0).unwrap();
+    // `bindHost` and `nodeLabel` are null until configured (SA-0F); any
+    // other non-string, a non-canonical host, a long label, a missing key
+    // or a null port is still refused.
+    let status_with = |edit: &dyn Fn(&mut serde_json::Map<String, Value>)| {
+        let mut data = json!({"activeGrantCount": 0, "activeOfferCount": 0, "bindHost": "127.0.0.1", "bindPort": 49152, "lastScanAt": null, "nodeLabel": "node", "pendingCount": 0, "scanStatus": "never", "sharingEnabled": false, "sourceFamilies": []});
+        edit(data.as_object_mut().unwrap());
+        let body = CanonicalJsonV1::encode(&json!({
+            "code": 0, "controlVersion": 1, "data": data, "requestId": hex_encode(&request_id)
+        }))
+        .unwrap();
+        verify_control_response(&body, &request_id, 1, 0)
+    };
+    status_with(&|_| {}).unwrap();
+    status_with(&|d| {
+        d.insert("bindHost".into(), Value::Null);
+    })
+    .unwrap();
+    status_with(&|d| {
+        d.insert("nodeLabel".into(), Value::Null);
+    })
+    .unwrap();
+    status_with(&|d| {
+        d.insert("bindHost".into(), Value::Null);
+        d.insert("nodeLabel".into(), Value::Null);
+    })
+    .unwrap();
+    status_with(&|d| {
+        d.insert("nodeLabel".into(), json!("x".repeat(128)));
+    })
+    .unwrap();
+    for refused in [
+        json!({"bindHost": "127.000.0.1"}),
+        json!({"bindHost": "Example.COM"}),
+        json!({"bindHost": 127}),
+        json!({"nodeLabel": "x".repeat(129)}),
+        json!({"nodeLabel": 7}),
+        json!({"bindPort": null}),
+    ] {
+        let (key, value) = refused.as_object().unwrap().iter().next().unwrap();
+        assert!(
+            status_with(&|d| {
+                d.insert(key.clone(), value.clone());
+            })
+            .is_err(),
+            "{key}: {value} must be refused"
+        );
+    }
+    for key in ["bindHost", "nodeLabel"] {
+        assert!(
+            status_with(&|d| {
+                d.remove(key);
+            })
+            .is_err(),
+            "missing {key} must be refused"
+        );
+    }
     let pending = CanonicalJsonV1::encode(&json!({
         "code": 0,
         "controlVersion": 1,
