@@ -63,6 +63,31 @@ pub(crate) enum Step {
     Staged,
     Rename,
     SyncDir,
+    /// `unlinkat` of one agent file by `SecureRoot::remove_file`; the
+    /// directory sync after it is `SyncDir`.
+    Unlink,
+}
+
+/// The only prefixes `SecureRoot::list` and `SecureRoot::remove_stale_temps`
+/// accept: the producer and receiver cache namespaces
+/// (`spec/cache-store-v1.md`).
+pub(crate) const CACHE_PREFIXES: [&str; 2] = ["pcache-", "rcache-"];
+
+/// Directory entries (`.` and `..` not counted) `SecureRoot::list` and
+/// `SecureRoot::remove_stale_temps` read before they give up with
+/// `UnsafeState`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) const LIST_ENTRIES_MAX: usize = 4_096;
+
+/// `Ok` only for a name in [`CACHE_PREFIXES`]; anything else, the empty
+/// string included, is `Refused(Invalid)`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn cache_prefix(prefix: &str) -> Result<(), StorageError> {
+    if CACHE_PREFIXES.contains(&prefix) {
+        Ok(())
+    } else {
+        Err(StorageError::Refused(SecurityError::Invalid))
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
