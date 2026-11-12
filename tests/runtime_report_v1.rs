@@ -1380,6 +1380,25 @@ mod disk {
             Some(FetchError::InvalidQuery)
         );
         assert!(!probe.connected(), "a bad query connected");
+        // Valid by `validate`, but too large for one request frame once
+        // encoded: 128 clients of 255 quotes, two bytes each on the wire.
+        let mut wide = query(Endpoint::Graph);
+        wide.clients = (0..128u8)
+            .map(|index| format!("{}{}", char::from(index + 1), "\"".repeat(254)))
+            .collect();
+        wide.clients.sort();
+        assert_eq!(
+            fetch(
+                &elsewhere,
+                &wide,
+                &receiver.store,
+                &receiver.ledger,
+                &receiver.limiter
+            )
+            .err(),
+            Some(FetchError::InvalidQuery)
+        );
+        assert!(!probe.connected(), "an oversized query connected");
         let revoked = PeerRecord {
             state: PeerState::Revoked,
             ..elsewhere.clone()

@@ -105,7 +105,7 @@ A client that stops reading makes a chunk's write time out after at most 2 s; th
 
 | Step | Check | Failure |
 |---|---|---|
-| 1 | `ReportRequest::validate` on the request built from the record and the query | `InvalidQuery`; nothing is sent |
+| 1 | `ReportRequest::validate` on the request built from the record and the query, and its canonical encoding fits one request frame (61,402 bytes) | `InvalidQuery`; nothing is sent |
 | 2 | `peer_store::usable(record, stateStore)`, and the identity read again for the handshake equals the record's `initiatorStatic` (a reset between the two reads must not send under an identity the record is not bound to) | `Unusable`; nothing is sent |
 | 3 | A slot of the `FetchLimiter`: at most 2 fetches at once per limiter, no queue. The agent shares one per process | `TooMany`; nothing is sent |
 | 4 | Connect and handshake, `responderStatic` pinned (`noise::connect`) | `Transport` |
@@ -114,7 +114,7 @@ A client that stops reading makes a chunk's write time out after at most 2 s; th
 | 7 | Reserve `chunkCount × 61,402` on the ledger before keeping any chunk; the body is then allocated once at that capacity and never grows | `Memory`, and no later chunk is read |
 | 8 | Each later chunk: kind Response, the same `requestId`, the same `chunkCount`, the next `chunkIndex`, and the total at most 16,777,216 bytes. Chunks are checked one by one with the rules of the frozen `assemble_response`, which is not called (it would copy the body again) | `Protocol` |
 | 9 | The shape gate and counts ("Before decoding") | `Invalid` |
-| 10 | Reserve the decode cost ("Before decoding") | `Memory` |
+| 10 | Reserve the decode cost ("Before decoding") | `TooLarge` when the cost exceeds the whole 384 MiB ledger (no retry can fit); otherwise `Memory` |
 | 11 | The frozen `decode_response(body, Some(request))`: CanonicalJsonV1, the typed decode, and `validate` against the request this receiver sent (echo fields, endpoint, records) | `Invalid` |
 
 Any failure discards everything received and returns every reservation. Errors carry no bytes from the producer.
@@ -185,7 +185,7 @@ The bound is checked by measurement, not only argued: `tests/runtime_report_memo
 ### Receiver non-claims
 
 - The ledger is an accounting model: an allocation is charged at its size rounded up to 16 bytes. Allocator headers and fragmentation are not modelled.
-- A body whose reservations do not fit the free ledger is refused with `Memory`, so a large legitimate body can fail while the ledger is busy. With the cost above, a body near 16 MiB of the smallest records needs 377–432 MiB besides its 16.8 MiB body reservation, more than the 384 MiB ledger, and is refused even when nothing else holds the ledger; the measured decoder peak for those bodies is 184–210 MiB.
+- A body whose reservations do not fit the free ledger is refused with `Memory`, so a large legitimate body can fail while the ledger is busy. With the cost above, a body near 16 MiB of the smallest records needs 377–432 MiB besides its 16.8 MiB body reservation, more than the 384 MiB ledger, and is refused with `TooLarge` even when nothing else holds the ledger; the measured decoder peak for those bodies is 184–210 MiB.
 - The node sizes follow `std`'s B-tree layout (11 entries per node). The measurement test is the guard on each toolchain CI runs; it is not re-derived at run time.
 - `Fetched` is returned outside the ledger.
 

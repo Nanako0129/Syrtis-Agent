@@ -474,8 +474,11 @@ pub enum FetchError {
     /// The body was refused, by the shape gate or by the frozen decoder
     /// and `validate` against the request that was sent.
     Invalid,
-    /// The memory ledger refused a reservation.
+    /// The memory ledger refused a reservation. A later fetch may fit.
     Memory,
+    /// The body's decode cost is more than the whole ledger
+    /// ([`REMOTE_MEMORY_MAX`]): no later fetch of the same report can fit.
+    TooLarge,
 }
 
 /// At most [`MAX_FETCHES`] fetches at once. Share one per process.
@@ -541,6 +544,12 @@ pub fn fetch(
         tzdb_revision: TZDB_REVISION.into(),
     };
     request.validate().map_err(|_| FetchError::InvalidQuery)?;
+    // A query can pass `validate` and still not fit one request frame
+    // (128 clients of 255 escaped bytes). Refuse it here, before anything
+    // is sent, not as a frame error after the handshake.
+    if CanonicalJsonV1::encode(&request).map_or(true, |bytes| bytes.len() > FRAME_PAYLOAD_MAX) {
+        return Err(FetchError::InvalidQuery);
+    }
     if !usable(peer, store) {
         return Err(FetchError::Unusable);
     }
@@ -626,6 +635,10 @@ fn exchange(
         body.extend_from_slice(&frame.payload);
     }
     let cost = decode_reservation(&body, endpoint).map_err(|_| FetchError::Invalid)?;
+    // More than the whole ledger: no retry can ever fit it.
+    if cost > crate::security::REMOTE_MEMORY_MAX {
+        return Err(FetchError::TooLarge);
+    }
     let _decode_reservation = ledger.reserve(cost).ok_or(FetchError::Memory)?;
     #[cfg(test)]
     receive_seams::before_decode();
@@ -635,6 +648,9 @@ fn exchange(
         Endpoint::Hourly => decode::<HourlyRecord>(&body, request, Records::Hourly),
         Endpoint::Agents => decode::<AgentsRecord>(&body, request, Records::Agents),
     }?;
+    // The buffer was sized for `chunkCount` full chunks; the caller gets
+    // one sized for the body.
+    body.shrink_to_fit();
     Ok(Fetched {
         body,
         records,
@@ -1114,7 +1130,7 @@ impl<'a> Scanner<'a> {
             let digit = char::from(self.next()?)
                 .to_digit(16)
                 .ok_or(ScanError::Shape)?;
-            value = value << 4 | digit as u16;
+            value = (value << 4) | digit as u16;
         }
         Ok(value)
     }
@@ -2274,6 +2290,28 @@ mod receiver_tests {
         assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
         assert_eq!(receive_seams::decodes(), before);
         drop(held);
+        assert_eq!(ledger.used(), 0);
+    }
+
+    /// A body whose decode cost exceeds the whole ledger is `TooLarge`, not
+    /// `Memory`: retrying cannot help. The decoder never runs.
+    #[test]
+    fn a_body_costing_more_than_the_whole_ledger_is_too_large() {
+        let ledger = MemoryLedger::default();
+        let body = graph_body(&request(Endpoint::Graph), 70_000);
+        assert!(
+            body.len() <= crate::security::LOGICAL_BODY_MAX,
+            "{}",
+            body.len()
+        );
+        let cost = decode_reservation(&body, Endpoint::Graph).unwrap();
+        assert!(cost > REMOTE_MEMORY_MAX, "{cost}");
+        let before = receive_seams::decodes();
+        assert_eq!(
+            run(Endpoint::Graph, &ledger, serve(body)).err(),
+            Some(FetchError::TooLarge)
+        );
+        assert_eq!(receive_seams::decodes(), before);
         assert_eq!(ledger.used(), 0);
     }
 
