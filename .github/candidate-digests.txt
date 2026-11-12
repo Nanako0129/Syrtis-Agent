@@ -25,7 +25,15 @@
 # field sets with the spec table rows. spec/v1.md, src/security.rs, the
 # consent fixture, tests/security_contract_v1.rs and spec/security-v1.md
 # (which pins that test module's hash) carry new digests.
-97ec5c2337388c6661e749f5ac9751a4b115216a44b07d94362b870c20914e73  spec/pairing-v1.md
+#
+# SA-2B2a2 adds spec/peer-store-v1.md, the receiver peer store contract
+# (peers.json). spec/pairing-v1.md changed on purpose: the receiver claim
+# now takes the Pair URL, and the attempt-record rule changed (a refusal
+# sent before any commit removes the record its own connection created, a
+# transport failure after the handshake ends the call, and a full record
+# table no longer stops the client from connecting).
+decd029ad3b036e22536443602a7664c94d5b92802e40b0f9f2e2791f7a7d159  spec/pairing-v1.md
+1d982b186a00e4ddaaa8b47f6569cd3c68bcc170b17a74044ed3ed515ea5b83f  spec/peer-store-v1.md
 79d1c0363e4576d67827ebfa029fad7e3a5981474f4aafba3bd71e54f1a98172  spec/report-cache-v1.md
 3e0b75e33fd362eab1040254de8f656e3a1bf855e0f3c008915b33e3ec2ee523  spec/security-v1.md
 ea302173340ae0dfb6f2a421326e7e178d2454bcab45ac28d74b144c1f17890e  spec/state-store-v1.md

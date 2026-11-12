@@ -6,8 +6,8 @@
 //! [`StateStore`]. Every change goes through [`StateStore::transition`] with
 //! a closure that calls only frozen `ReferenceState` transitions; status
 //! answers come from one [`StateStore::state`] snapshot and authorize
-//! nothing. The client returns what it confirmed and stores nothing
-//! (`peers.json` is `SA-2B2a2`).
+//! nothing. The client returns what it confirmed and stores nothing; the
+//! caller persists a [`ConfirmedGrant`] through `peer_store`.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -30,8 +30,8 @@ use crate::{
     secure_fs::StorageError,
     security::{
         ClockStatus, Frame, FrameKind, GrantState, MemoryLedger, OfferClaim, PEER_PROTOCOL_VERSION,
-        PairOffer, PendingApproval, PendingState, ReferenceState, SecurityError, clock_status,
-        decode_fixed_hex, hex_encode, offer_secret_hash, pair_sas,
+        PendingApproval, PendingState, ReferenceState, SecurityError, clock_status,
+        decode_fixed_hex, hex_encode, offer_secret_hash, pair_sas, parse_pair_url,
     },
     state_store::{StateStore, random},
 };
@@ -44,7 +44,8 @@ pub const PAIRING_PAYLOAD_MAX: usize = 4_096;
 pub const RATE_INTERVAL: Duration = Duration::from_secs(1);
 pub const RATE_TABLE_MAX: usize = 256;
 /// Attempt records per offer. A record is removed only by the record rule
-/// ([`ClaimAttempts`]); there is no eviction to make room.
+/// ([`ClaimAttempts`]); there is no eviction to make room. With all five
+/// used, a claim still connects but creates no record.
 pub const CLAIM_ATTEMPTS_MAX: usize = 5;
 /// Connect or handshake failures in one `claim` call.
 pub const CLAIM_CONNECT_FAILURES_MAX: usize = 5;
@@ -701,21 +702,21 @@ pub fn approve(
 pub enum ClientError {
     /// The offer names this device's own static key.
     SelfPairing,
-    /// The Pair offer fields are malformed.
+    /// The Pair URL was refused by the frozen `parse_pair_url` (malformed,
+    /// not canonical, or outside its lifetime). Nothing was sent.
     InvalidOffer,
     /// Pair claim answered `unauthorized`. The cause is not inferred.
     OfferUnusable,
-    /// A claim succeeded with a pending ID none of this device's attempts
-    /// derived, or every attempt slot for the offer is used.
+    /// A claim succeeded with a pending ID that neither a kept record nor
+    /// this connection derived.
     LostAttempt,
     /// The producer answered with this error code. From `claim`,
-    /// `Code(Busy)` means [`CLAIM_BUSY_MAX`] `busy` answers in one call.
-    /// Those `busy` connections committed nothing, but the call can still
-    /// leave records from its earlier tries (a transport failure after the
-    /// handshake keeps one), so the caller must keep its [`ClaimAttempts`].
-    /// `Code(Internal)` ends the call at once and spends one record per
-    /// call, because the request may have been committed; the UI must not
-    /// retry it automatically.
+    /// `Code(Busy)` means [`CLAIM_BUSY_MAX`] `busy` answers in one call;
+    /// none of them left a record, but records kept by earlier calls stay,
+    /// so the caller must keep its [`ClaimAttempts`]. `Code(Internal)` ends
+    /// the call at once and keeps the record its connection created (the
+    /// request may have been committed); the UI must not retry it
+    /// automatically.
     Code(PeerCode),
     Rejected,
     Expired,
@@ -724,7 +725,9 @@ pub enum ClientError {
     Aborted,
     /// The poll window or the request cap ran out.
     PollLimit,
-    /// Connect, handshake, transport, deadline or memory failure.
+    /// Connect, handshake, transport, deadline or memory failure. From
+    /// `claim`, a failure after the handshake ends the call at once and
+    /// keeps the record its connection created.
     Transport(NoiseError),
 }
 
@@ -766,14 +769,17 @@ struct Attempt {
 /// was committed, so a record is kept while it may still be answered.
 ///
 /// Record rule: a record is created after the handshake (a pending ID
-/// exists only from `hFinal` on) and before the request is written. It is
-/// removed in exactly two cases: (a) an authenticated `busy` on Pair claim,
-/// which proves nothing was committed; (b) a success whose pending ID
-/// matches an *earlier* record, which then removes only the record just
-/// created for this connection, since the offer was consumed by that
-/// earlier attempt. It is kept for `internal`, for a transport failure
-/// after the handshake, and for a success that matches itself. A new
-/// attempt or another offer clears only what is displayed, never this.
+/// exists only from `hFinal` on) and before the request is written, unless
+/// the offer already has [`CLAIM_ATTEMPTS_MAX`] records: then the
+/// connection still goes ahead, without a record. Only the record this
+/// connection itself created is ever removed, and only when (a) an
+/// authenticated `busy`, `unauthorized`, `invalid` or `incompatible`
+/// answers it (all are sent before any commit), or (b) a success names an
+/// *earlier* record's pending ID (that earlier attempt consumed the offer).
+/// It is kept for `internal`, for a transport failure after the handshake
+/// (both end the call), for a protocol violation, and for a success that
+/// matches itself. A connection that created no record removes nothing. A
+/// new attempt or another offer clears only what is displayed, never this.
 #[derive(Clone, Debug, Default)]
 pub struct ClaimAttempts {
     records: BTreeMap<[u8; 16], Vec<Attempt>>,
@@ -857,25 +863,27 @@ enum Reply {
 }
 
 impl PairingClient<'_> {
-    /// Pair claim. `offer` must come from the frozen `parse_pair_url`, which
-    /// owns the full offer validation (the canonical host check among it);
-    /// this rechecks only `version` and `port`.
+    /// Pair claim from a Pair URL. The URL goes through the frozen
+    /// `parse_pair_url` at `effective_now_ms`, which owns the whole offer
+    /// validation; anything it refuses is [`ClientError::InvalidOffer`]
+    /// before any connection. The URL and the parsed offer, which holds the
+    /// secret, are never formatted, logged or returned.
     ///
-    /// Within one call, retries `busy` and transport failures at least
-    /// [`CLAIM_RETRY_INTERVAL`] apart; `internal` ends the call. Attempt
-    /// records follow the record rule of [`ClaimAttempts`]. A connect or
-    /// handshake failure takes no record, and after
-    /// [`CLAIM_CONNECT_FAILURES_MAX`] of them this call returns
-    /// [`ClientError::Transport`]; after [`CLAIM_BUSY_MAX`] `busy` answers
-    /// it returns `Code(Busy)`. A later call may try again.
+    /// Attempt records follow the record rule of [`ClaimAttempts`].
+    /// Within one call, `busy` and connect or handshake failures are
+    /// retried at least [`CLAIM_RETRY_INTERVAL`] apart; after
+    /// [`CLAIM_BUSY_MAX`] `busy` answers the call returns `Code(Busy)`, and
+    /// after [`CLAIM_CONNECT_FAILURES_MAX`] connect or handshake failures
+    /// [`ClientError::Transport`]. `internal` and a transport failure after
+    /// the handshake end the call at once. A later call may try again.
     pub fn claim(
         &self,
-        offer: &PairOffer,
+        pair_url: &str,
+        effective_now_ms: i64,
         attempts: &mut ClaimAttempts,
     ) -> Result<Claimed, ClientError> {
-        if offer.version != PROTOCOL || offer.port < 1024 {
-            return Err(ClientError::InvalidOffer);
-        }
+        let offer =
+            parse_pair_url(pair_url, effective_now_ms).map_err(|_| ClientError::InvalidOffer)?;
         let offer_id =
             decode_fixed_hex::<16>(&offer.offer_id).map_err(|_| ClientError::InvalidOffer)?;
         let responder_static = decode_fixed_hex::<32>(&offer.responder_static)
@@ -883,6 +891,7 @@ impl PairingClient<'_> {
         let secret = crate::state_store::Secret32::new(
             decode_fixed_hex::<32>(&offer.secret).map_err(|_| ClientError::InvalidOffer)?,
         );
+        let (host, port) = (offer.host, offer.port);
         if constant_time_eq(&responder_static, self.identity.public()) {
             return Err(ClientError::SelfPairing);
         }
@@ -898,26 +907,22 @@ impl PairingClient<'_> {
         let mut busy = 0;
         let mut retry = false;
         loop {
-            if tries.len() >= CLAIM_ATTEMPTS_MAX {
-                return Err(ClientError::LostAttempt);
-            }
             if retry {
                 self.clock.sleep(CLAIM_RETRY_INTERVAL);
             }
             retry = true;
-            let mut session =
-                match noise::connect(&offer.host, offer.port, self.identity, &responder_static) {
-                    Ok(session) => session,
-                    Err(error) => {
-                        connect_failures += 1;
-                        if connect_failures >= CLAIM_CONNECT_FAILURES_MAX {
-                            return Err(ClientError::Transport(error));
-                        }
-                        continue;
+            let mut session = match noise::connect(&host, port, self.identity, &responder_static) {
+                Ok(session) => session,
+                Err(error) => {
+                    connect_failures += 1;
+                    if connect_failures >= CLAIM_CONNECT_FAILURES_MAX {
+                        return Err(ClientError::Transport(error));
                     }
-                };
+                    continue;
+                }
+            };
             let h_final = session.h_final();
-            tries.push(Attempt {
+            let own = Attempt {
                 pending_id: derive_pending_id(&secret_hash, h_final),
                 sas: pair_sas(
                     PROTOCOL,
@@ -926,7 +931,21 @@ impl PairingClient<'_> {
                     self.identity.public(),
                     h_final,
                 ),
-            });
+            };
+            // With every slot used the connection still goes ahead, but
+            // without a record: a reply naming this connection's own ID
+            // still succeeds below, and a lost one cannot be recovered.
+            let created = tries.len() < CLAIM_ATTEMPTS_MAX;
+            if created {
+                tries.push(own.clone());
+            }
+            // Removes only the record this connection created, which is
+            // the last one; a connection that created none removes nothing.
+            let drop_own = |tries: &mut Vec<Attempt>| {
+                if created {
+                    tries.pop();
+                }
+            };
             match self.exchange(&mut session, payload.clone()) {
                 Ok(Reply::Body(received)) => {
                     let response: PairClaimResponse =
@@ -937,38 +956,43 @@ impl PairingClient<'_> {
                     }
                     let pending_id = decode_fixed_hex::<16>(&response.pending_id)
                         .map_err(|_| ClientError::Aborted)?;
-                    let index = tries
+                    let sas = match tries
                         .iter()
-                        .position(|attempt| attempt.pending_id == pending_id)
-                        .ok_or(ClientError::LostAttempt)?;
-                    let sas = tries[index].sas.clone();
+                        .find(|attempt| attempt.pending_id == pending_id)
+                    {
+                        Some(attempt) => attempt.sas.clone(),
+                        None if pending_id == own.pending_id => own.sas.clone(),
+                        None => return Err(ClientError::LostAttempt),
+                    };
                     // Rule (b): an earlier attempt consumed the offer, so the
-                    // ID this connection derived is never answered. Only the
-                    // record just created (the last) goes.
-                    if index + 1 != tries.len() {
-                        tries.pop();
+                    // ID this connection derived is never answered.
+                    if pending_id != own.pending_id {
+                        drop_own(tries);
                     }
                     return Ok(Claimed {
                         offer_id,
                         responder_static,
-                        host: offer.host.clone(),
-                        port: offer.port,
+                        host,
+                        port,
                         pending_id,
                         sas,
                         expires_at_ms: response.expires_at,
                         claimed_at: self.clock.monotonic(),
                     });
                 }
-                Ok(Reply::Code(PeerCode::Unauthorized)) => return Err(ClientError::OfferUnusable),
+                // Rule (a): every one of these is sent before any commit
+                // (on Pair claim a store `Busy` is sent as `internal`), so
+                // this connection's ID can never be answered.
+                Ok(Reply::Code(PeerCode::Unauthorized)) => {
+                    drop_own(tries);
+                    return Err(ClientError::OfferUnusable);
+                }
                 Ok(Reply::Code(code @ (PeerCode::Invalid | PeerCode::Incompatible))) => {
+                    drop_own(tries);
                     return Err(ClientError::Code(code));
                 }
-                // Rule (a): on Pair claim `busy` comes only from the rate
-                // limiter, before any state is read (a store `Busy` is sent
-                // as `internal`): nothing was committed, so this
-                // connection's record can never be answered.
                 Ok(Reply::Code(PeerCode::Busy)) => {
-                    tries.pop();
+                    drop_own(tries);
                     busy += 1;
                     if busy >= CLAIM_BUSY_MAX {
                         return Err(ClientError::Code(PeerCode::Busy));
@@ -979,9 +1003,9 @@ impl PairingClient<'_> {
                 Ok(Reply::Code(PeerCode::Internal)) => {
                     return Err(ClientError::Code(PeerCode::Internal));
                 }
-                // The request may have reached the producer: the record
-                // stays and the call retries.
-                Err(ClientError::Transport(_)) => {}
+                // The request may have reached the producer and been
+                // committed: the record stays, and the call ends, as for
+                // `internal`. A protocol violation keeps it too.
                 Err(error) => return Err(error),
             }
         }

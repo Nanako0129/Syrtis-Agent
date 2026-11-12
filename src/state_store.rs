@@ -9,7 +9,7 @@ use std::{
     collections::BTreeSet,
     fmt,
     net::IpAddr,
-    sync::{Mutex, PoisonError, RwLock, RwLockWriteGuard},
+    sync::{Arc, Mutex, PoisonError, RwLock, RwLockWriteGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -113,7 +113,9 @@ pub struct AuthorizationQuery {
 /// durable; any commit failure makes the store sticky-unknown until the
 /// process restarts.
 pub struct StateStore {
-    root: SecureRoot,
+    /// Shared with the receiver peer store, so both files sit under one
+    /// owner lock.
+    root: Arc<SecureRoot>,
     /// Serializes writers.
     commit: Mutex<()>,
     /// `None` is the sticky unknown state. Writers hold this exclusively from
@@ -137,10 +139,16 @@ impl StateStore {
             }
         };
         Ok(Self {
-            root,
+            root: Arc::new(root),
             commit: Mutex::new(()),
             current: RwLock::new(Some(state)),
         })
+    }
+
+    /// The open secure root, for another store in the same root (and
+    /// under the same owner lock), such as `peers.json`.
+    pub fn root(&self) -> Arc<SecureRoot> {
+        Arc::clone(&self.root)
     }
 
     /// A copy of the current durable state.
