@@ -912,6 +912,10 @@ pub struct ConfirmedGrant {
     pub responder_static: [u8; 32],
     pub initiator_static: [u8; 32],
     pub pending_id: [u8; 16],
+    /// Where the claimed offer pointed (the Pair URL's `host` and `port`),
+    /// carried from [`Claimed`] by [`PairingClient::poll`].
+    pub host: String,
+    pub port: u16,
 }
 
 /// The receiver side of the pairing wire.
@@ -1192,6 +1196,8 @@ impl PairingClient<'_> {
                             responder_static: claimed.responder_static,
                             initiator_static: *self.identity.public(),
                             pending_id: claimed.pending_id,
+                            host: claimed.host.clone(),
+                            port: claimed.port,
                         }),
                         GrantStatus::Revoked => Err(ClientError::Revoked),
                         GrantStatus::Expired => Err(ClientError::Expired),

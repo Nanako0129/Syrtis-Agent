@@ -2,7 +2,7 @@
 
 ## Purpose and boundary
 
-This document fixes how a receiver stores the producers it has paired with: the file `peers.json`, its bytes, how it is validated on load and on write, how it is replaced, and when a record may be written or used. It does not define keys. The two key sets are frozen by `spec/v1.md` (rows "Receiver peer store top level" and "Receiver peer record") and this store adds none. Implementation: `src/peer_store.rs`; acceptance: `tests/runtime_peer_store_v1.rs` and the unit tests in `src/peer_store.rs`.
+This document fixes how a receiver stores the producers it has paired with: the file `peers.json`, its bytes, how it is validated on load and on write, how it is replaced, and when a record may be written or used. It does not define keys. The two key sets are frozen by `spec/v1.md` (rows "Receiver peer store top level" and "Receiver peer record") and this store adds none. Implementation: `src/peer_store.rs`; acceptance: `tests/runtime_peer_store_v1.rs` (the grant guards: `grant_guards_refuse_stale_writes_and_leave_the_file_alone`) and the unit tests in `src/peer_store.rs`.
 
 > A peer record grants the receiver nothing. Every request the receiver makes is still authorized by the producer, against the producer's own grant and the Noise static binding (`spec/pairing-v1.md`, `spec/v1.md` (i)). A record only tells the receiver where to connect and which grant to name.
 
@@ -55,12 +55,15 @@ Load fails closed. An absent `peers.json` is an empty list, and opening does not
 
 ## Writes
 
-Every write builds the next list, encodes it, and runs those bytes through the load decoder before staging them: the store never writes a file that load would refuse. A write load would refuse is `refused(invalid)` and writes nothing; it is a caller error, so the store does not become unknown. A write that leaves the list unchanged writes nothing.
+Every write builds the next list, encodes it, and runs those bytes through the load decoder before staging them: the store never writes a file that load would refuse. A write load would refuse is `refused(invalid)` and writes nothing; it is a caller error, so the store does not become unknown. So is a guard refusal (`refused(conflict)` below). A write that leaves the list unchanged writes nothing.
+
+A caller recording what a producer answered names the record by the `responderStatic` and `grantId` of the record it asked with, never by bytes of the answer (`spec/report-peer-v1.md`, "Receiver").
 
 | Operation | Rule |
 |---|---|
-| `upsert(record)` | Only an `active` record. A record for a `responderStatic` already present replaces it (re-pairing); a new one is inserted in order. A 17th distinct producer is `refused(bounds)`. Anything else load would refuse (an over-long or non-NFC `nodeLabel`, a non-canonical `host`, a `port` below 1024) is `refused(invalid)` |
-| `set_state(responderStatic, state)` | `revoked` or `expired` only; `active` comes only from `upsert`. An unknown producer is `refused(invalid)` |
+| `upsert(record)` | Only an `active` record. A record for a `responderStatic` already present replaces it (re-pairing) when its `authEpoch` is equal or higher; a lower one is `refused(conflict)`, so a stale answer cannot overwrite a newer pairing. A new one is inserted in order. A 17th distinct producer is `refused(bounds)`. Anything else load would refuse (an over-long or non-NFC `nodeLabel`, a non-canonical `host`, a `port` below 1024) is `refused(invalid)` |
+| `set_state(responderStatic, grantId, state)` | `revoked` or `expired` only; `active` comes only from `upsert`. An unknown producer is `refused(invalid)`; a record holding another `grantId` (the producer was paired again since) is `refused(conflict)` |
+| `update_grant(responderStatic, grantId, authEpoch, sourceScopeGeneration, expiresAt)` | Stores what Grant status answered `active`. Only the record holding `grantId` and still `active`, and never to a lower `authEpoch` (equal is allowed); otherwise `refused(conflict)`. An unknown producer is `refused(invalid)` |
 | `remove(responderStatic)` | Removes that producer's record; an absent one is not an error |
 | `peers()` | A snapshot, sorted by `responderStatic` |
 
@@ -68,7 +71,7 @@ A commit follows the state store: one commit mutex serializes writers; the in-me
 
 ## When a record is written
 
-Only from a `ConfirmedGrant`, which the receiver client returns only when Grant status answered `active` (`spec/pairing-v1.md`): `PeerRecord::from_confirmed(grant, host, port, nodeLabel, createdAt)` takes the grant ID, `authEpoch`, `sourceScopeGeneration`, `expiresAt`, `pendingId`, `responderStatic` and `initiatorStatic` from the grant, and `host` and `port` from the claim. Grant status `revoked` or `expired` is recorded with `set_state`.
+Only from a `ConfirmedGrant`, which the receiver client returns only when Grant status answered `active` (`spec/pairing-v1.md`): `PeerRecord::from_confirmed(grant, nodeLabel, createdAt)` takes the grant ID, `authEpoch`, `sourceScopeGeneration`, `expiresAt`, `pendingId`, `responderStatic`, `initiatorStatic`, `host` and `port` from the grant; `poll` carries `host` and `port` into the grant from the claim (the Pair URL's). Grant status `revoked` or `expired` is recorded with `set_state`, a later `active` answer with `update_grant`.
 
 ## When a record is usable
 

@@ -1,10 +1,10 @@
-# Syrtis Agent Peer Report Transport v1 (producer)
+# Syrtis Agent Peer Report Transport v1
 
 ## Purpose and boundary
 
-This document fixes how the producer answers a Peer request on the peer wire: dispatch, the static binding, authorization, the error codes, limits, the report source seam, memory accounting, and how a response is sent in chunks while revocation stays effective. The Peer request and response field sets, value rules and obligations (i)–(iii) are frozen by `spec/v1.md`, and the request and response codecs by `spec/report-cache-v1.md` and `src/report.rs`; this document adds none. Transport (Noise IK, frames, deadlines) and the product listener are in `spec/pairing-v1.md`. Implementation: `src/report_peer.rs`, the dispatch in `src/pairing.rs`, and `StateStore::authorize_then` in `src/state_store.rs`. Acceptance: `tests/runtime_report_v1.rs` and the unit tests in `src/report_peer.rs`.
+This document fixes how the producer answers a Peer request on the peer wire (dispatch, the static binding, authorization, the error codes, limits, the report source seam, memory accounting, and how a response is sent in chunks while revocation stays effective) and how the receiver asks for one and checks the reply (section "Receiver"). The Peer request and response field sets, value rules and obligations (i)–(iii) are frozen by `spec/v1.md`, and the request and response codecs by `spec/report-cache-v1.md` and `src/report.rs`; this document adds none. Transport (Noise IK, frames, deadlines) and the product listener are in `spec/pairing-v1.md`; the receiver's peer records in `spec/peer-store-v1.md`. Implementation: `src/report_peer.rs`, the dispatch in `src/pairing.rs`, and `StateStore::authorize_then` in `src/state_store.rs`. Acceptance: `tests/runtime_report_v1.rs`, `tests/runtime_report_memory_v1.rs` and the unit tests in `src/report_peer.rs`.
 
-Not in this slice: the receiver's `fetch` and its count-before-decode scan (`SA-2B2b2`); the real report source and cache (`SA-2B3`); checkpoint and sweep scheduling (`SA-2B2c`).
+Not in this slice: the real report source and cache, and charging a fetched report while it is kept (`SA-2B3`); checkpoint and sweep scheduling (`SA-2B2c`); background polling, automatic retry and UI.
 
 ## Connection
 
@@ -97,6 +97,98 @@ Every chunk is authorized again. `StateStore::authorize_then(query, f)` evaluate
 
 A client that stops reading makes a chunk's write time out after at most 2 s; the producer then closes and returns the body's reservation.
 
+## Receiver
+
+`report_peer::fetch(peer, query, stateStore, ledger, limiter)` asks the producer named by one peer record for one report and returns `Fetched { body, records, saturated }`, the records typed by the endpoint asked for. The producer is untrusted for framing, size and content. `fetch` never retries, never polls in the background and writes no cache and no log.
+
+`query` is the endpoint, `startDate`, `endDateExclusive`, `timezone` and `clients`. Everything else in the Peer request comes from the record (`grantId`, `authEpoch`, `sourceScopeGeneration`) or is a protocol constant; `requestId` is 16 random bytes, the same in the payload and in the frame header.
+
+| Step | Check | Failure |
+|---|---|---|
+| 1 | `ReportRequest::validate` on the request built from the record and the query | `InvalidQuery`; nothing is sent |
+| 2 | `peer_store::usable(record, stateStore)`, and the identity read again for the handshake equals the record's `initiatorStatic` (a reset between the two reads must not send under an identity the record is not bound to) | `Unusable`; nothing is sent |
+| 3 | A slot of the `FetchLimiter`: at most 2 fetches at once per limiter, no queue. The agent shares one per process | `TooMany`; nothing is sent |
+| 4 | Connect and handshake, `responderStatic` pinned (`noise::connect`) | `Transport` |
+| 5 | Send the request, then read the reply. One absolute deadline covers both: 135 s (the producer's 120 s compute deadline plus its 15 s response deadline) from the end of the handshake, never extended by progress | `Timeout` |
+| 6 | First frame: its `requestId` is the one sent; kind Error is mapped below; kind Request is a violation; kind Response must have `chunkIndex` 0. The frozen `Frame::decode` already holds every Response frame to `chunkCount` 1..=274 and `final` to the last index | `Protocol` |
+| 7 | Reserve `chunkCount × 61,402` on the ledger before keeping any chunk; the body is then allocated once at that capacity and never grows | `Memory`, and no later chunk is read |
+| 8 | Each later chunk: kind Response, the same `requestId`, the same `chunkCount`, the next `chunkIndex`, and the total at most 16,777,216 bytes. Chunks are checked one by one with the rules of the frozen `assemble_response`, which is not called (it would copy the body again) | `Protocol` |
+| 9 | The shape gate and counts ("Before decoding") | `Invalid` |
+| 10 | Reserve the decode cost ("Before decoding") | `Memory` |
+| 11 | The frozen `decode_response(body, Some(request))`: CanonicalJsonV1, the typed decode, and `validate` against the request this receiver sent (echo fields, endpoint, records) | `Invalid` |
+
+Any failure discards everything received and returns every reservation. Errors carry no bytes from the producer.
+
+| Error frame `{code, protocol}` | `FetchError` |
+|---|---|
+| 3 | `Expired` |
+| 4 | `Revoked` |
+| 2 | `CheckGrantStatus`: the grant may be fine and the record stale (a revocation of another grant renumbers `authEpoch`). The caller asks Grant status (`PairingClient::grant_status`) and stores its answer with `PeerStore::update_grant` |
+| 5 | `Busy`. The producer answers `busy` after its rate step too, with a token already spent (section "Limits"), so the caller must not retry at once: not before 60 s |
+| 8 | `Internal` |
+| 1, 6 | `Rejected` |
+| Another code, `protocol` other than 1, or a payload that is not a CanonicalJsonV1 `{code, protocol}` | `Protocol` |
+
+**Which record.** Nothing in the reply chooses the type, the endpoint or the record: the reply is checked against the request this receiver built. A caller that updates `peers.json` after a fetch (`set_state`, `update_grant`) names the record by the `responderStatic` and `grantId` of the record it fetched with, never by bytes of the reply. `PeerStore` refuses a write naming another `grantId` (`spec/peer-store-v1.md`).
+
+### Before decoding
+
+The frozen decoder builds a `serde_json` value tree (objects are `BTreeMap<String, Value>`: `serde_json` is built without `preserve_order`), converts it to the typed response, then builds a second tree when it re-encodes the typed value to check canonical form. Those allocations are reserved before it runs (`spec/security-v1.md`, the remote-memory ledger), from one pass over the body that allocates nothing (`report_peer::scan`). The pass does two things.
+
+**Shape gate.** It refuses, before any tree is built, the structures the typed decode or `validate` refuses anyway, and it replaces none of the decoder's checks, which all still run in step 11. Two limits come on top and are the receiver's own: the decoder would accept a body over them (only the 8 MiB one can be reached within 16 MiB).
+
+- No whitespace and nothing after the top-level value (CanonicalJsonV1 has neither).
+- The top level is an object whose keys are exactly the 15 response keys, in canonical order, written without escapes.
+- `clients` is an array of at most 128 strings. `records` is an array of objects, each with exactly the endpoint's record keys in canonical order, and each value a string, an integer or `null`.
+- Every other top-level value is a string, an integer, `true`, `false` or `null`. No other array or object appears anywhere (depth at most 3).
+- An integer has at most 20 digits; a fraction or exponent (a float) is refused.
+- Every string, key or value, is at most 255 bytes once decoded (no valid response holds a longer one), has no raw control character, no unknown escape and no unpaired surrogate escape. This also bounds the decoder's escape scratch buffer and the NFC checks' buffers.
+- Receiver limits: at most 262,144 `records` (unreachable: the smallest record takes over 200 bytes, so 16 MiB holds fewer than 84,000), and the value strings together at most 8 MiB decoded (keys are not counted here; they are in the cost).
+
+**Counts.** Objects, entries (keys) and the keys' decoded bytes, value strings and their decoded bytes, every value, array elements and records, with decoded lengths computed as `serde_json` decodes (`\uXXXX` by its UTF-8 length, a surrogate pair as 4 bytes). A unit test checks these counts equal the counts of the tree `serde_json` builds from the same bytes, escapes included.
+
+**Cost.** Checked arithmetic, one term per allocation class, each allocation rounded up to 16 bytes:
+
+| Term | Bytes |
+|---|---|
+| Object nodes, per object | `std`'s B-tree holds 11 entries per node. A leaf is `16 + 11 × (size_of String + size_of Value)` and an internal node a leaf plus 12 edge pointers, each rounded up to 16 (640 and 736 on 64-bit). 1–11 entries: one leaf. 12–17 entries: two leaves and one internal node, whether the map is built by insertion (the second tree) or in bulk (the first): after the split at 12 each leaf holds at least 5, so neither can split again before 18. The gate admits only 13–15 |
+| Strings | Each key and each value string: its decoded length rounded up to 16, bounded as `bytes + 15 × count` |
+| Value slots | `size_of Value` for the top-level value and twice for each array element (`Vec` growth); map values live inside the nodes |
+| One tree | nodes + strings + value slots |
+| Trees | two (the first tree and the re-encoded second) |
+| Typed records | `2 × records × size_of R` (`Vec` growth) |
+| Re-encoding buffer | `3 × body length` (doubling growth, and the old and new buffer while it grows) |
+| Slack | 64 KiB: the scratch and NFC buffers of strings at most 255 bytes, the `clients` vectors, the request copy `validate` makes, error text |
+
+The bound is checked by measurement, not only argued: `tests/runtime_report_memory_v1.rs` installs a counting global allocator (std only; it charges each allocation rounded up to 16 and counts a growing `Vec`'s old and new buffers at once) and asserts, for each body shape, that the decoder's real peak is at most the reservation. Measured (macOS, `SA-2B2b2`):
+
+| Body | Records | Decoder peak | Reservation |
+|---|---|---|---|
+| graph, smallest records, 16 MiB | 74,233 | 204.2 MiB | 419.6 MiB |
+| models, smallest records, 16 MiB | 65,279 | 184.4 MiB | 379.4 MiB |
+| hourly, smallest records, 16 MiB | 65,534 | 185.0 MiB | 376.8 MiB |
+| agents, smallest records, 16 MiB | 76,958 | 210.3 MiB | 432.1 MiB |
+| agents, every string 255 bytes, just over 8 MiB | 6,837 | 54.1 MiB | 71.8 MiB |
+| agents, every string 255 bytes, at the 8 MiB string limit (9.6 MiB) | 8,224 | 59.8 MiB | 86.3 MiB |
+
+### Receiver memory
+
+| What | Ledger |
+|---|---|
+| Each received frame | Charged: `Session::receive` reserves 3 × the declared ciphertext length; returned once the frame is copied |
+| The body | Charged: `chunkCount × 61,402`, reserved at the first chunk before any is kept, held until `fetch` returns |
+| The decoder | Charged: the decode cost above, reserved before the decoder runs, held until `fetch` returns |
+| The request this receiver encodes and sends | Not charged: at most 61,402 bytes, built from local input |
+| An error frame's payload decode | Not charged: the payload is at most 4,096 bytes (`ERROR_PAYLOAD_MAX`) |
+| The returned `Fetched` | Not charged once returned; keeping it is `SA-2B3`'s (cache accounting) |
+
+### Receiver non-claims
+
+- The ledger is an accounting model: an allocation is charged at its size rounded up to 16 bytes. Allocator headers and fragmentation are not modelled.
+- A body whose reservations do not fit the free ledger is refused with `Memory`, so a large legitimate body can fail while the ledger is busy. With the cost above, a body near 16 MiB of the smallest records needs 377–432 MiB besides its 16.8 MiB body reservation, more than the 384 MiB ledger, and is refused even when nothing else holds the ledger; the measured decoder peak for those bodies is 184–210 MiB.
+- The node sizes follow `std`'s B-tree layout (11 entries per node). The measurement test is the guard on each toolchain CI runs; it is not re-derived at run time.
+- `Fetched` is returned outside the ledger.
+
 ## Acceptance map
 
 | Acceptance | Test |
@@ -115,4 +207,18 @@ A client that stops reading makes a chunk's write time out after at most 2 s; th
 | (12) `authorize_then` and the turnstile | `authorize_then_skips_a_refused_query_and_a_revoke_is_not_starved` (timing: a revoke against two readers taking turns); unit `state_store::tests::disk::a_commit_holds_the_turnstile_and_authorize_then_waits_for_it` (deterministic: each half of the turnstile) |
 | (13) expiry then a clock moved back | `after_expiry_a_clock_moved_back_is_still_expired` |
 
-The tests that need a secure root run on macOS and Linux; the unit tests of the limit, the slot and the code numbering run on all three platforms.
+Receiver (`SA-2B2b2`):
+
+| Acceptance | Test |
+|---|---|
+| (1) pair, then fetch the four endpoints, one in several chunks | `fetch_returns_the_stub_records_for_all_four_endpoints`; unit `a_multi_chunk_reply_decodes_to_the_producers_records` |
+| (2) `Revoked`, `Expired`, `CheckGrantStatus` then Grant status and `update_grant` | `fetch_reports_revoked_expired_and_a_stale_epoch` |
+| (3) hostile framing | unit `hostile_framing_is_refused_and_the_ledger_returns_to_baseline`, `error_codes_map_to_their_variants` |
+| (4) echo mismatch | unit `a_body_echoing_another_request_is_invalid` |
+| (5) memory: gate, limits, reservations, differential, measured bound | unit `the_shape_gate_refuses_before_reserving_or_decoding`, `the_scanner_limits_records_strings_and_clients`, `scanner_counts_equal_what_serde_json_decodes`, `the_gate_key_lists_are_the_typed_keys`, `a_full_ledger_stops_the_fetch_at_the_first_chunk`, `the_decode_cost_is_reserved_before_the_decoder_runs`, `two_large_pulls_at_once_the_second_is_refused_by_the_ledger`; `tests/runtime_report_memory_v1.rs` `the_reservation_bounds_the_decoders_measured_peak` |
+| (6) at most two fetches at once | `a_third_fetch_at_once_is_refused_without_connecting`; unit `the_fetch_limiter_admits_two_at_once` |
+| (7) nothing sent for an unusable record or a bad query | `unusable_records_and_bad_queries_never_connect` |
+| (8) the absolute deadline | unit `the_fetch_deadline_is_absolute` (a shortened deadline: a silent producer, and chunks 300 ms apart that together outlast it) |
+| (9) `peer_store` guards | `spec/peer-store-v1.md` |
+
+The tests that need a secure root run on macOS and Linux; the unit tests of the limit, the slot and the code numbering, the receiver unit tests (a scripted producer that completes a real handshake, then writes any frame) and the memory measurement run on all three platforms.

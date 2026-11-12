@@ -1,8 +1,14 @@
 //! SA-2B2b1 acceptance: the producer's peer report service
 //! (`src/report_peer.rs`, `spec/report-peer-v1.md`), end to end through the
 //! product `Listener` over real loopback sockets. The test client is
-//! written by hand over `noise::connect` and frames; the receiver's
-//! `fetch` is `SA-2B2b2`.
+//! written by hand over `noise::connect` and frames.
+//!
+//! SA-2B2b2 acceptance (the receiver's `fetch` against the product
+//! listener, with a receiver state store and peer store on their own temp
+//! root) is the `receiver` section at the end. Its hostile-producer,
+//! gate, memory and deadline cases need no secure root and are unit tests
+//! in `src/report_peer.rs` (`receiver_tests`), on all three platforms; the
+//! measured memory bound is `tests/runtime_report_memory_v1.rs`.
 //!
 //! Every test here needs a secure root, so they run on macOS and Linux
 //! only: Windows fails closed (`tests/runtime_storage_v1.rs`). The
@@ -32,22 +38,28 @@ mod disk {
         canonical::CanonicalJsonV1,
         listener::Listener,
         noise::{self, Deadline, StaticKey},
-        pairing::{Claimed, Clock, PairingClient, RateLimiter, approve},
+        pairing::{ClaimAttempts, Claimed, Clock, PairingClient, RateLimiter, approve},
+        peer_store::{PeerRecord, PeerState, PeerStore},
         report::{
-            AgentsRecord, GraphRecord, HourlyRecord, ModelsRecord, ReportRecord, ReportRequest,
-            ReportResponse, decode_response, encode_response,
+            AgentsRecord, Endpoint, GraphRecord, HourlyRecord, ModelsRecord, ReportRecord,
+            ReportRequest, ReportResponse, decode_response, encode_response,
         },
-        report_peer::{GRANT_REFILL, ReportSource, Reports, SourceError},
+        report_peer::{
+            FetchError, FetchLimiter, Fetched, GRANT_REFILL, Records, ReportQuery, ReportSource,
+            Reports, SourceError, fetch,
+        },
         secure_fs::{SecureRoot, StorageError},
         security::{
             FRAME_PAYLOAD_MAX, Frame, FrameKind, GrantState, LOGICAL_BODY_MAX, MemoryLedger, Offer,
-            OfferClaim, OfferState, REMOTE_MEMORY_MAX, assemble_response, hex_encode,
-            offer_secret_hash,
+            OfferClaim, OfferState, PairOffer, REMOTE_MEMORY_MAX, assemble_response, hex_encode,
+            offer_secret_hash, pair_url,
         },
         state_store::{AuthorizationQuery, StateStore},
     };
 
     const NOW: i64 = 1_700_000_000;
+    #[allow(dead_code)]
+    const _RECEIVER: () = ();
     const SUFFIX: &[&str] = &["Library", "AppSupport", "agent"];
     const LOOPBACK: &str = "127.0.0.1";
     const REQUEST_ID: [u8; 16] = [0x5a; 16];
@@ -1031,6 +1043,383 @@ mod disk {
         assert_eq!(
             refused(&node.fetch(&key, &request(&granted, 1))),
             error_payload(3)
+        );
+    }
+
+    // ----------------------------------------------------------- receiver
+
+    /// A receiver agent on its own temp root: its state store (the
+    /// identity `usable` checks) and its peer store.
+    struct Receiver {
+        store: StateStore,
+        peers: PeerStore,
+        key: StaticKey,
+        ledger: MemoryLedger,
+        limiter: FetchLimiter,
+        _home: TempHome,
+    }
+
+    impl Receiver {
+        fn new() -> Self {
+            let home = TempHome::new();
+            let store =
+                retry_busy(|| StateStore::open(SecureRoot::open_under(&home.0, SUFFIX)?, NOW))
+                    .unwrap();
+            let peers = PeerStore::open(store.root()).unwrap();
+            let key = StaticKey::from_state(&store.state().unwrap()).unwrap();
+            Self {
+                store,
+                peers,
+                key,
+                ledger: MemoryLedger::default(),
+                limiter: FetchLimiter::default(),
+                _home: home,
+            }
+        }
+
+        fn fetch(&self, peer: &PeerRecord, endpoint: Endpoint) -> Result<Fetched, FetchError> {
+            fetch(
+                peer,
+                &query(endpoint),
+                &self.store,
+                &self.ledger,
+                &self.limiter,
+            )
+        }
+
+        fn client<'a>(&'a self, node: &'a Node) -> PairingClient<'a> {
+            PairingClient {
+                identity: &self.key,
+                ledger: &self.ledger,
+                clock: &*node.clock,
+            }
+        }
+    }
+
+    impl Node {
+        /// Pairs `receiver` with this node over the wire (offer `n`, claim
+        /// from the Pair URL, owner approval, poll) and stores the record
+        /// from the confirmed grant, as the receiver's UI would.
+        fn pair(&self, n: u8, receiver: &Receiver) -> PeerRecord {
+            let os_now = self.clock.os();
+            let (offer_id, secret) = ([0x40 | n; 16], [0x40 | n; 32]);
+            let responder = self.responder;
+            let expires_at_ms = os_now * 1_000 + 600_000;
+            self.store
+                .transition(|state| {
+                    state.create_offer(
+                        Offer {
+                            offer_id,
+                            secret_hash: offer_secret_hash(&offer_id, &secret, &responder),
+                            created_at_ms: os_now * 1_000,
+                            expires_at_ms,
+                            state: OfferState::Active,
+                        },
+                        os_now,
+                    )
+                })
+                .unwrap();
+            let url = pair_url(&PairOffer {
+                expires_at: expires_at_ms,
+                host: LOOPBACK.into(),
+                offer_id: hex_encode(&offer_id),
+                port: self.port(),
+                responder_static: hex_encode(&responder),
+                secret: hex_encode(&secret),
+                version: 1,
+            })
+            .unwrap();
+            let client = receiver.client(self);
+            let claimed = client
+                .claim(&url, os_now * 1_000, &mut ClaimAttempts::default())
+                .unwrap();
+            approve(&self.store, claimed.pending_id, 1, true, os_now).unwrap();
+            let confirmed = client.poll(&claimed).unwrap();
+            let record = PeerRecord::from_confirmed(&confirmed, None, NOW * 1_000);
+            receiver.peers.upsert(record.clone()).unwrap();
+            record
+        }
+    }
+
+    fn query(endpoint: Endpoint) -> ReportQuery {
+        ReportQuery {
+            endpoint,
+            start_date: "2025-01-01".into(),
+            end_date_exclusive: "2025-02-01".into(),
+            timezone: "America/Los_Angeles".into(),
+            clients: vec!["claude".into(), "codex".into()],
+        }
+    }
+
+    /// The stub's records for `endpoint`, decoded from its body.
+    fn stub_records(endpoint: Endpoint) -> Records {
+        let granted = Granted {
+            grant_id: [0; 16],
+            pending_id: [0; 16],
+            auth_epoch: 1,
+            source_scope_generation: 1,
+            expires_at_ms: 0,
+        };
+        let body = canonical(&request(&granted, endpoint.into())).unwrap();
+        match endpoint {
+            Endpoint::Graph => Records::Graph(decode_response(&body, None).unwrap().records),
+            Endpoint::Models => Records::Models(decode_response(&body, None).unwrap().records),
+            Endpoint::Hourly => Records::Hourly(decode_response(&body, None).unwrap().records),
+            Endpoint::Agents => Records::Agents(decode_response(&body, None).unwrap().records),
+        }
+    }
+
+    /// A port nothing connects to unless a fetch does.
+    struct Probe(TcpListener);
+
+    impl Probe {
+        fn new() -> Self {
+            let listener = TcpListener::bind((LOOPBACK, 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            Self(listener)
+        }
+
+        fn port(&self) -> u16 {
+            self.0.local_addr().unwrap().port()
+        }
+
+        /// Whether a connection is waiting. A fetch that connected did so
+        /// before it returned; the pause covers the accept queue.
+        fn connected(&self) -> bool {
+            thread::sleep(Duration::from_millis(100));
+            self.0.accept().is_ok()
+        }
+    }
+
+    /// SA-2B2b2 acceptance (1): two agents pair over the wire; the
+    /// receiver fetches each endpoint with the stored record and gets the
+    /// stub's records, the graph body in several chunks.
+    #[test]
+    fn fetch_returns_the_stub_records_for_all_four_endpoints() {
+        let node = Node::new(canonical);
+        let receiver = Receiver::new();
+        let peer = node.pair(1, &receiver);
+        assert_eq!(peer.host, LOOPBACK);
+        assert_eq!(peer.port, node.port());
+        for endpoint in [
+            Endpoint::Graph,
+            Endpoint::Models,
+            Endpoint::Hourly,
+            Endpoint::Agents,
+        ] {
+            node.clock.advance(GRANT_REFILL);
+            let fetched = receiver.fetch(&peer, endpoint).unwrap();
+            assert_eq!(fetched.records, stub_records(endpoint), "{endpoint:?}");
+            if endpoint == Endpoint::Graph {
+                assert!(fetched.body.len() > FRAME_PAYLOAD_MAX);
+            }
+        }
+        assert_eq!(receiver.ledger.used(), 0);
+        node.ledger_at_baseline();
+    }
+
+    /// SA-2B2b2 acceptance (2): after a revoke `Revoked`; at expiry
+    /// `Expired`; after another peer's grant is revoked (which renumbers
+    /// this grant's `authEpoch`) `CheckGrantStatus`, and once Grant status
+    /// and `update_grant` store the new epoch the fetch succeeds. The
+    /// receiver records each outcome with the record it fetched with.
+    #[test]
+    fn fetch_reports_revoked_expired_and_a_stale_epoch() {
+        let node = Node::new(canonical);
+        let receiver = Receiver::new();
+        let peer = node.pair(1, &receiver);
+        receiver.fetch(&peer, Endpoint::Graph).unwrap();
+        node.store
+            .transition(|state| state.revoke_commit(peer.grant_id, NOW * 1_000))
+            .unwrap();
+        assert_eq!(
+            receiver.fetch(&peer, Endpoint::Graph).err(),
+            Some(FetchError::Revoked)
+        );
+        receiver
+            .peers
+            .set_state(&peer.responder_static, &peer.grant_id, PeerState::Revoked)
+            .unwrap();
+        assert_eq!(receiver.peers.peers().unwrap()[0].state, PeerState::Revoked);
+
+        let node = Node::new(canonical);
+        let receiver = Receiver::new();
+        let peer = node.pair(1, &receiver);
+        node.advance_wall_to(peer.expires_at_ms / 1_000);
+        assert_eq!(
+            receiver.fetch(&peer, Endpoint::Graph).err(),
+            Some(FetchError::Expired)
+        );
+
+        let node = Node::new(canonical);
+        let (alice, bob) = (Receiver::new(), Receiver::new());
+        let a = node.pair(1, &alice);
+        let b = node.pair(2, &bob);
+        node.store
+            .transition(|state| state.revoke_commit(a.grant_id, NOW * 1_000))
+            .unwrap();
+        assert_eq!(
+            bob.fetch(&b, Endpoint::Graph).err(),
+            Some(FetchError::CheckGrantStatus)
+        );
+        let claimed = Claimed {
+            offer_id: [0; 16],
+            responder_static: b.responder_static,
+            host: b.host.clone(),
+            port: b.port,
+            pending_id: b.pending_id,
+            sas: String::new(),
+            expires_at_ms: 0,
+            claimed_at: Duration::ZERO,
+        };
+        // The pairing limiter admits one request per static per second.
+        node.clock.advance(GRANT_REFILL);
+        let answer = bob
+            .client(&node)
+            .grant_status(&claimed, b.grant_id)
+            .unwrap();
+        assert!(answer.auth_epoch > b.auth_epoch);
+        bob.peers
+            .update_grant(
+                &b.responder_static,
+                &b.grant_id,
+                answer.auth_epoch,
+                answer.source_scope_generation,
+                answer.expires_at_ms,
+            )
+            .unwrap();
+        let renewed = bob.peers.peers().unwrap()[0].clone();
+        assert_eq!(renewed.auth_epoch, answer.auth_epoch);
+        let fetched = bob.fetch(&renewed, Endpoint::Graph).unwrap();
+        assert_eq!(fetched.records, stub_records(Endpoint::Graph));
+    }
+
+    /// SA-2B2b2 acceptance (6): with two fetches in flight (each producer's
+    /// source held), a third is refused at once and connects nowhere; once
+    /// the two finish, a fetch goes ahead.
+    #[test]
+    fn a_third_fetch_at_once_is_refused_without_connecting() {
+        fn held(
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        ) -> impl Fn(&ReportRequest) -> Result<Vec<u8>, SourceError> + Send + Sync + 'static
+        {
+            let gate = Mutex::new((entered, release));
+            move |request| {
+                if request.endpoint == 2 {
+                    let gate = gate.lock().unwrap();
+                    gate.0.send(()).unwrap();
+                    let _ = gate.1.recv_timeout(LONG);
+                }
+                canonical(request)
+            }
+        }
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_one, release_one_rx) = mpsc::channel();
+        let (release_two, release_two_rx) = mpsc::channel();
+        let one = Node::new(held(entered_tx.clone(), release_one_rx));
+        let two = Node::new(held(entered_tx, release_two_rx));
+        let receiver = Receiver::new();
+        let (p1, p2) = (one.pair(1, &receiver), two.pair(1, &receiver));
+        let probe = Probe::new();
+        let elsewhere = PeerRecord {
+            port: probe.port(),
+            ..p1.clone()
+        };
+        thread::scope(|scope| {
+            let first = scope.spawn(|| receiver.fetch(&p1, Endpoint::Models));
+            let second = scope.spawn(|| receiver.fetch(&p2, Endpoint::Models));
+            entered_rx.recv_timeout(LONG).unwrap();
+            entered_rx.recv_timeout(LONG).unwrap();
+            assert_eq!(
+                receiver.fetch(&elsewhere, Endpoint::Graph).err(),
+                Some(FetchError::TooMany)
+            );
+            assert!(!probe.connected(), "the third fetch connected");
+            release_one.send(()).unwrap();
+            release_two.send(()).unwrap();
+            assert_eq!(
+                first.join().unwrap().unwrap().records,
+                stub_records(Endpoint::Models)
+            );
+            assert_eq!(
+                second.join().unwrap().unwrap().records,
+                stub_records(Endpoint::Models)
+            );
+        });
+        // Control: the slots are free again.
+        receiver.fetch(&p1, Endpoint::Graph).unwrap();
+        assert_eq!(receiver.ledger.used(), 0);
+    }
+
+    /// SA-2B2b2 acceptance (7): a bad query (a 371-day range) and an
+    /// unusable record (revoked, or bound to the identity a reset
+    /// replaced) are refused before anything connects. Control: a usable
+    /// record with a good query does connect.
+    #[test]
+    fn unusable_records_and_bad_queries_never_connect() {
+        let node = Node::new(canonical);
+        let receiver = Receiver::new();
+        let peer = node.pair(1, &receiver);
+        let probe = Probe::new();
+        let elsewhere = PeerRecord {
+            port: probe.port(),
+            ..peer
+        };
+        let mut long = query(Endpoint::Graph);
+        long.end_date_exclusive = "2026-01-07".into();
+        assert_eq!(
+            fetch(
+                &elsewhere,
+                &long,
+                &receiver.store,
+                &receiver.ledger,
+                &receiver.limiter
+            )
+            .err(),
+            Some(FetchError::InvalidQuery)
+        );
+        assert!(!probe.connected(), "a bad query connected");
+        let revoked = PeerRecord {
+            state: PeerState::Revoked,
+            ..elsewhere.clone()
+        };
+        assert_eq!(
+            receiver.fetch(&revoked, Endpoint::Graph).err(),
+            Some(FetchError::Unusable)
+        );
+        assert!(!probe.connected(), "a revoked record connected");
+        receiver.store.reset(NOW + 10, (NOW + 10) * 1_000).unwrap();
+        assert_eq!(
+            receiver.fetch(&elsewhere, Endpoint::Graph).err(),
+            Some(FetchError::Unusable)
+        );
+        assert!(!probe.connected(), "a record of the old identity connected");
+        // Control: bound to the new identity, the same record connects (the
+        // probe then closes, so the fetch fails in transport).
+        let rebound = PeerRecord {
+            initiator_static: receiver.store.state().unwrap().identity_public().unwrap(),
+            ..elsewhere
+        };
+        let result = thread::scope(|scope| {
+            let fetching = scope.spawn(|| receiver.fetch(&rebound, Endpoint::Graph));
+            let until = Instant::now() + LONG;
+            let accepted = loop {
+                if let Ok((stream, _)) = probe.0.accept() {
+                    break Some(stream);
+                }
+                if Instant::now() > until {
+                    break None;
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            assert!(accepted.is_some(), "control: no connection");
+            drop(accepted);
+            fetching.join().unwrap()
+        });
+        assert!(
+            matches!(result, Err(FetchError::Transport(_))),
+            "{result:?}"
         );
     }
 }
