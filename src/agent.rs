@@ -129,7 +129,7 @@ mod imp {
 
     use super::{AgentConfig, AgentError, AgentUninstallReport};
     use crate::{
-        control::{ScanHook, ScanStatus},
+        control::{ScanHook, ScanStatus, ScopeApproveHook, ScopeHook},
         install::{self, Outcome},
         merge::{Combined, FailureClass, PeerData, PeerPart, Report, classify, combine},
         pairing::Clock,
@@ -141,7 +141,7 @@ mod imp {
         report_peer::{MAX_FETCHES, Records, ReportQuery, ReportSource},
         runtime::Runtime,
         secure_fs::{SecureRoot, StorageError},
-        security::clock_status,
+        security::{SecurityError, clock_status},
         source::{EngineSource, SCOPE_FILE, SOURCE_CACHE_DIR},
         state_store::StateStore,
     };
@@ -156,8 +156,9 @@ mod imp {
         /// `AgentConfig::trusted_home`: the home of the install objects
         /// `uninstall` removes, the same one the secure root is below.
         trusted_home: PathBuf,
-        /// Serializes `approve_scope`.
-        approving: Mutex<()>,
+        /// Serializes `approve_scope`, shared with the control
+        /// `scopeApprove` hook.
+        approving: Arc<Mutex<()>>,
         /// Serializes `pull_all`: the runtime's fetch limiter refuses
         /// (`TooMany`) rather than waits, so overlapping calls would lose
         /// pulls.
@@ -198,8 +199,25 @@ mod imp {
                     .map_or_else(ScanStatus::default, |source| source.scan_status())
             });
             let fill = Arc::clone(&slot);
+            let read = Arc::clone(&slot);
+            // Before the source exists (the server starts first): `false`.
+            let scope: ScopeHook = Arc::new(move |store| {
+                read.get()
+                    .is_some_and(|source| scope_approved(store, source))
+            });
+            let approving = Arc::new(Mutex::new(()));
+            let (read, serial) = (Arc::clone(&slot), Arc::clone(&approving));
+            let approve: ScopeApproveHook = Arc::new(move |store, digest| {
+                let source = read.get().ok_or(StorageError::Unknown)?;
+                // The owner consented to the inputs they were shown; the
+                // running source may see others (`SA-0G`).
+                if digest != source.owner_inputs_sha256() {
+                    return Err(StorageError::Refused(SecurityError::Invalid));
+                }
+                approve_scope(store, source, &serial)
+            });
             let home = trusted_home.clone();
-            let runtime = Runtime::start_with(
+            let runtime = Runtime::start_with_scope(
                 root,
                 move |root| {
                     let source = Arc::new(EngineSource::new(
@@ -213,6 +231,8 @@ mod imp {
                     Ok(source as Arc<dyn ReportSource>)
                 },
                 scan,
+                scope,
+                Some(approve),
                 options,
             )
             .map_err(AgentError::Runtime)?;
@@ -227,7 +247,7 @@ mod imp {
                 source,
                 clock,
                 trusted_home: home,
-                approving: Mutex::new(()),
+                approving,
                 pulling: Mutex::new(()),
             })
         }
@@ -252,37 +272,19 @@ mod imp {
         /// this agent's inputs, and its generation is the state's
         /// `sourceScopeGeneration`: what `report` requires besides the
         /// request's own generation. False when anything is unreadable.
+        /// Control `status` reports the same (`scopeApproved`).
         pub fn scope_approved(&self) -> bool {
-            let Ok(state) = self.runtime.store().state() else {
-                return false;
-            };
-            matches!(
-                self.source.scope_record(),
-                Ok(Some(record)) if record.inputs_match
-                    && record.generation == state.reference.source_scope_generation
-            )
+            scope_approved(self.runtime.store(), &self.source)
         }
 
         /// Owner action. No record, or a record for other inputs: the
         /// frozen `source_change_commit` (generation forward, every grant
         /// so far denied), then `approve`. The same inputs at another
         /// generation (after a reset, or a crash between those two steps):
-        /// `approve` only. Already approved: nothing is written.
+        /// `approve` only. Already approved: nothing is written. Control
+        /// `scopeApprove` runs the same body, under the same lock.
         pub fn approve_scope(&self) -> Result<(), StorageError> {
-            let _approving = self
-                .approving
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let store = self.runtime.store();
-            let generation = store.state()?.reference.source_scope_generation;
-            match self.source.scope_record()? {
-                Some(record) if record.inputs_match && record.generation == generation => Ok(()),
-                Some(record) if record.inputs_match => self.source.approve(store),
-                _ => {
-                    store.transition(|state| state.source_change_commit())?;
-                    self.source.approve(store)
-                }
-            }
+            approve_scope(self.runtime.store(), &self.source, &self.approving)
         }
 
         /// Pulls `query` from every usable peer (`Runtime::pull`, at most
@@ -393,6 +395,38 @@ mod imp {
                 source_cache,
                 scope_removed,
             })
+        }
+    }
+
+    /// The body of [`Agent::scope_approved`], shared with the control
+    /// `status` provider.
+    fn scope_approved(store: &StateStore, source: &EngineSource) -> bool {
+        let Ok(state) = store.state() else {
+            return false;
+        };
+        matches!(
+            source.scope_record(),
+            Ok(Some(record)) if record.inputs_match
+                && record.generation == state.reference.source_scope_generation
+        )
+    }
+
+    /// The body of [`Agent::approve_scope`], shared with the control
+    /// `scopeApprove` hook; `approving` is the agent's one lock.
+    fn approve_scope(
+        store: &StateStore,
+        source: &EngineSource,
+        approving: &Mutex<()>,
+    ) -> Result<(), StorageError> {
+        let _approving = approving.lock().unwrap_or_else(PoisonError::into_inner);
+        let generation = store.state()?.reference.source_scope_generation;
+        match source.scope_record()? {
+            Some(record) if record.inputs_match && record.generation == generation => Ok(()),
+            Some(record) if record.inputs_match => source.approve(store),
+            _ => {
+                store.transition(|state| state.source_change_commit())?;
+                source.approve(store)
+            }
         }
     }
 

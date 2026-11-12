@@ -13,6 +13,15 @@ pub struct SecureRoot(Infallible);
 
 pub(crate) struct Staged<'a>(Infallible, PhantomData<&'a ()>);
 
+/// Uninhabited like [`SecureRoot`]: [`SecureRoot::open_read_only`] fails.
+pub struct ReadOnlyRoot(Infallible);
+
+impl ReadOnlyRoot {
+    pub fn read_file(&self, _: &str, _: usize) -> Result<Option<Vec<u8>>, StorageError> {
+        match self.0 {}
+    }
+}
+
 pub fn trusted_home() -> Result<PathBuf, StorageError> {
     Err(StorageError::UnsafeState)
 }
@@ -27,6 +36,13 @@ impl SecureRoot {
     }
 
     pub fn open_under(_home: &Path, _suffix: &[&str]) -> Result<Self, StorageError> {
+        Err(StorageError::UnsafeState)
+    }
+
+    pub fn open_read_only(
+        _home: &Path,
+        _suffix: &[&str],
+    ) -> Result<Option<ReadOnlyRoot>, StorageError> {
         Err(StorageError::UnsafeState)
     }
 

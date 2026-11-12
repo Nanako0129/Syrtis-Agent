@@ -2295,6 +2295,11 @@ mod receiver_tests {
 
     /// A body whose decode cost exceeds the whole ledger is `TooLarge`, not
     /// `Memory`: retrying cannot help. The decoder never runs.
+    ///
+    /// The body is several megabytes sent through Noise over loopback; on a
+    /// loaded CI runner that took longer than [`SHORT`] and the fetch ended
+    /// `Timeout` (PR #25, Ubuntu). This test's own deadline is therefore
+    /// [`FETCH_DEADLINE`]: the outcome under test does not depend on time.
     #[test]
     fn a_body_costing_more_than_the_whole_ledger_is_too_large() {
         let ledger = MemoryLedger::default();
@@ -2308,7 +2313,9 @@ mod receiver_tests {
         assert!(cost > REMOTE_MEMORY_MAX, "{cost}");
         let before = receive_seams::decodes();
         assert_eq!(
-            run(Endpoint::Graph, &ledger, serve(body)).err(),
+            run_within(Endpoint::Graph, &ledger, FETCH_DEADLINE, serve(body))
+                .0
+                .err(),
             Some(FetchError::TooLarge)
         );
         assert_eq!(receive_seams::decodes(), before);

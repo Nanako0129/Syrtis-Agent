@@ -20,6 +20,7 @@ use serde_json::Value;
 
 use crate::{
     pairing::Clock,
+    secure_fs::StorageError,
     state_store::{Secret32, StateStore},
 };
 
@@ -142,9 +143,37 @@ pub struct ScanStatus {
 /// thread; it must not block on the store.
 pub type ScanHook = Arc<dyn Fn() -> ScanStatus + Send + Sync>;
 
-/// Supplies `scopeApproved` of each `status` reply (`SA-0G`). Runs on the
-/// serving thread; it must not block on the store. Without one, `false`.
-pub type ScopeHook = Arc<dyn Fn() -> bool + Send + Sync>;
+/// Supplies `scopeApproved` of each `status` reply (`SA-0G`), given the
+/// server's store. Runs on the serving thread. It may read the store and
+/// the scope record (`Agent`'s provider does), so `scopeApproved` and the
+/// other `status` fields are not guaranteed to come from one snapshot.
+/// Without one, `false`.
+pub type ScopeHook = Arc<dyn Fn(&StateStore) -> bool + Send + Sync>;
+
+/// Runs `sharingSet{enabled}` (`SA-2C2b`): the runtime passes its enable
+/// gate and F-7 disable (`spec/runtime-v1.md`). Runs on the serving thread;
+/// like [`ShutdownHook`], it must not stop the server. Its error is mapped
+/// like every store error. Without one, `sharingSet` is `internal`.
+pub type SharingHook = Arc<dyn Fn(bool) -> Result<(), StorageError> + Send + Sync>;
+
+/// Runs `scopeApprove{ownerInputsSha256}` (`SA-2C2b`) with the server's
+/// store and the body's digest: `Agent` compares the digest with its
+/// running source's and calls its scope approval. A refusal is
+/// `Refused(_)`, mapped to `invalid`. Runs on the serving thread; it must
+/// not stop the server. Without one, `scopeApprove` is `internal`.
+pub type ScopeApproveHook =
+    Arc<dyn Fn(&StateStore, &str) -> Result<(), StorageError> + Send + Sync>;
+
+/// Every hook a server runs. [`Server::start`] and the other constructors
+/// fill what they do not take with the defaults stated on each.
+pub struct Hooks {
+    pub on_shutdown: ShutdownHook,
+    pub on_listen_configured: ListenHook,
+    pub scan: ScanHook,
+    pub scope: ScopeHook,
+    pub sharing: Option<SharingHook>,
+    pub scope_approve: Option<ScopeApproveHook>,
+}
 
 /// The control client: the token and the socket path.
 pub struct Client {
@@ -227,7 +256,7 @@ impl Server {
             on_shutdown,
             on_listen_configured,
             scan,
-            Arc::new(|| false),
+            Arc::new(|_| false),
         )
     }
 
@@ -241,7 +270,28 @@ impl Server {
         scan: ScanHook,
         scope: ScopeHook,
     ) -> Result<Self, ControlError> {
-        imp::Server::start(store, clock, on_shutdown, on_listen_configured, scan, scope).map(Self)
+        Self::start_with_all_hooks(
+            store,
+            clock,
+            Hooks {
+                on_shutdown,
+                on_listen_configured,
+                scan,
+                scope,
+                sharing: None,
+                scope_approve: None,
+            },
+        )
+    }
+
+    /// Every hook, including the `sharingSet` and `scopeApprove` effects
+    /// (`SA-2C2b`).
+    pub fn start_with_all_hooks(
+        store: Arc<StateStore>,
+        clock: Arc<dyn Clock>,
+        hooks: Hooks,
+    ) -> Result<Self, ControlError> {
+        imp::Server::start(store, clock, hooks).map(Self)
     }
 
     pub fn socket_path(&self) -> &Path {
@@ -272,10 +322,7 @@ mod imp {
         pub(super) fn start(
             _: Arc<StateStore>,
             _: Arc<dyn Clock>,
-            _: ShutdownHook,
-            _: ListenHook,
-            _: ScanHook,
-            _: ScopeHook,
+            _: Hooks,
         ) -> Result<Self, ControlError> {
             Err(ControlError::Unsupported)
         }
@@ -357,6 +404,8 @@ mod imp {
         on_listen_configured: ListenHook,
         scan: ScanHook,
         scope: ScopeHook,
+        sharing: Option<SharingHook>,
+        scope_approve: Option<ScopeApproveHook>,
         /// The pre-auth memory ledger, in bytes.
         memory: AtomicUsize,
         /// A `try_clone` of each connection, so `stop` can shut it down;
@@ -379,11 +428,16 @@ mod imp {
         pub(super) fn start(
             store: Arc<StateStore>,
             clock: Arc<dyn Clock>,
-            on_shutdown: ShutdownHook,
-            on_listen_configured: ListenHook,
-            scan: ScanHook,
-            scope: ScopeHook,
+            hooks: Hooks,
         ) -> Result<Self, ControlError> {
+            let Hooks {
+                on_shutdown,
+                on_listen_configured,
+                scan,
+                scope,
+                sharing,
+                scope_approve,
+            } = hooks;
             Self::spawn(Shared {
                 store,
                 clock,
@@ -391,6 +445,8 @@ mod imp {
                 on_listen_configured,
                 scan,
                 scope,
+                sharing,
+                scope_approve,
                 memory: AtomicUsize::new(0),
                 live: Mutex::new(HashMap::new()),
                 #[cfg(test)]
@@ -715,7 +771,12 @@ mod imp {
             STATUS => {
                 let state = store.state().map_err(code_of)?;
                 let now_ms = record_ms(&state.reference, clock).map_err(|_| INTERNAL)?;
-                Ok(status(&state, now_ms, (shared.scan)(), (shared.scope)()))
+                Ok(status(
+                    &state,
+                    now_ms,
+                    (shared.scan)(),
+                    (shared.scope)(store),
+                ))
             }
             OFFER_CREATE => offer_create(shared, body),
             OFFER_CANCEL => {
@@ -777,9 +838,27 @@ mod imp {
                 Ok(Value::Null)
             }
             SHUTDOWN => Ok(Value::Null),
-            // Wire frozen by SA-0G; the effect is wired in SA-2C2b. Until
-            // then: `internal`, nothing written.
-            SHARING_SET | SCOPE_APPROVE => Err(INTERNAL),
+            // The effect is the hook's, never a transition here: the
+            // runtime's enable gate and F-7 disable, the agent's scope
+            // approval. Without a hook: `internal`, nothing written.
+            SHARING_SET => {
+                let hook = shared.sharing.as_ref().ok_or(INTERNAL)?;
+                let enabled = body
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .ok_or(INVALID)?;
+                hook(enabled).map_err(code_of)?;
+                Ok(Value::Null)
+            }
+            SCOPE_APPROVE => {
+                let hook = shared.scope_approve.as_ref().ok_or(INTERNAL)?;
+                let digest = body
+                    .get("ownerInputsSha256")
+                    .and_then(Value::as_str)
+                    .ok_or(INVALID)?;
+                hook(store, digest).map_err(code_of)?;
+                Ok(Value::Null)
+            }
             _ => Err(INVALID),
         }
     }
@@ -1161,7 +1240,9 @@ mod imp {
                 on_shutdown: Arc::new(|| {}),
                 on_listen_configured: Arc::new(|| {}),
                 scan: Arc::new(ScanStatus::default),
-                scope: Arc::new(|| false),
+                scope: Arc::new(|_| false),
+                sharing: None,
+                scope_approve: None,
                 memory: AtomicUsize::new(0),
                 live: Mutex::new(HashMap::new()),
                 peer_uid: Some(foreign),

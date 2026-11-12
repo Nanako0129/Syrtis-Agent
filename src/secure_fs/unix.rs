@@ -527,6 +527,116 @@ impl Staged<'_> {
     }
 }
 
+/// An agent root opened by [`SecureRoot::open_read_only`]: no owner lock,
+/// and the only operation is [`ReadOnlyRoot::read_file`].
+pub struct ReadOnlyRoot {
+    dir: File,
+}
+
+impl SecureRoot {
+    /// Opens `home/suffix…` for reading only (`SA-2C2b`), for a second
+    /// process of the owner while the resident agent holds the lock. The
+    /// checks of [`SecureRoot::open_under`], on the same descriptors: the
+    /// home opened by path and owned by the effective UID, not group- or
+    /// other-writable, deny-only ACL (macOS); every component opened
+    /// relative to its parent with `O_NOFOLLOW`; intermediates owned and not
+    /// group- or other-writable (deny-only ACL on macOS); the root owned,
+    /// exactly `0700`, no ACL (macOS), on a local filesystem. Unlike
+    /// `open_under` it creates, chmods, syncs, tags and locks nothing.
+    /// `Ok(None)` when a component does not exist.
+    ///
+    /// No lock is taken, so the resident agent may replace a file while it
+    /// is read; replacement is a `rename`, so a read sees the old or the new
+    /// file whole.
+    pub fn open_read_only(
+        home: &Path,
+        suffix: &[&str],
+    ) -> Result<Option<ReadOnlyRoot>, StorageError> {
+        let home = home.as_os_str().as_bytes();
+        if !absolute(home) || suffix.is_empty() {
+            return Err(StorageError::UnsafeState);
+        }
+        let home = CString::new(home).map_err(|_| StorageError::UnsafeState)?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+        let mut dir = file_from(unsafe { libc::open(home.as_ptr(), flags) })?;
+        let meta = metadata(&dir)?;
+        check_owner(&meta, Object::Home)?;
+        guard(
+            meta.mode() & 0o022 == 0,
+            HOME_MODE,
+            StorageError::UnsafeState,
+        )?;
+        #[cfg(target_os = "macos")]
+        guard(
+            acl::deny_only(&dir),
+            INTERMEDIATE_ACL,
+            StorageError::UnsafeState,
+        )?;
+        for (index, component) in suffix.iter().enumerate() {
+            let name = component_name(component)?;
+            let next = match open_dir_at(&dir, &name) {
+                Ok(next) => next,
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+                Err(_) => return Err(StorageError::UnsafeState),
+            };
+            let meta = metadata(&next)?;
+            guard(meta.is_dir(), 0, StorageError::UnsafeState)?;
+            if index + 1 == suffix.len() {
+                check_owner(&meta, Object::Root)?;
+                #[cfg(target_os = "macos")]
+                guard(acl::none(&next), ACL, StorageError::UnsafeState)?;
+                guard(
+                    meta.mode() & 0o7777 == 0o700,
+                    MODE,
+                    StorageError::UnsafeState,
+                )?;
+                guard(local_filesystem(&next), LOCAL_FS, StorageError::UnsafeState)?;
+            } else {
+                check_owner(&meta, Object::Intermediate)?;
+                guard(
+                    meta.mode() & 0o022 == 0,
+                    INTERMEDIATE,
+                    StorageError::UnsafeState,
+                )?;
+                #[cfg(target_os = "macos")]
+                guard(
+                    acl::deny_only(&next),
+                    INTERMEDIATE_ACL,
+                    StorageError::UnsafeState,
+                )?;
+            }
+            dir = next;
+        }
+        Ok(Some(ReadOnlyRoot { dir }))
+    }
+}
+
+impl ReadOnlyRoot {
+    /// [`SecureRoot::read_file`] on this root: no-follow, regular, owned by
+    /// the effective UID, `0600`, one link, no ACL (macOS), at most `max`
+    /// bytes. `Ok(None)` when absent.
+    // ponytail: the body repeats `SecureRoot::read_file` because SA-2C2b
+    // may only add to secure_fs; fold both into one helper when that file
+    // is next open for change.
+    pub fn read_file(&self, name: &str, max: usize) -> Result<Option<Vec<u8>>, StorageError> {
+        let name = file_name(name)?;
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK | nofollow();
+        let fd = unsafe { libc::openat(self.dir.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+            return Ok(None);
+        }
+        let file = file_from(fd)?;
+        check_private_file(&file)?;
+        let mut bytes = Vec::new();
+        (&file)
+            .take(u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|_| StorageError::UnsafeState)?;
+        guard(bytes.len() <= max, BYTE_CAP, StorageError::Corrupt)?;
+        Ok(Some(bytes))
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Object {
     Home,

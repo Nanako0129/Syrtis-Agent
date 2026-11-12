@@ -14,7 +14,7 @@ macOS and Linux. `Agent::start` returns `Unsupported` on every target without th
 
 1. `SecureRoot::open_under(trusted_home, state_suffix)`. `AgentConfig::new` sets `state_suffix` to the frozen platform suffix (`secure_fs::STATE_SUFFIX`) and `options` to `Options::default()`; a product passes `secure_fs::trusted_home()` as `trusted_home`. A test passes a temp home and a suffix without spaces.
 2. The agent keeps `trusted_home`; `uninstall` uses it (below), so the install objects and the secure root are always below the same home.
-3. `Runtime::start_with`, whose `make_source` builds the one `EngineSource` of this root from the state store's own root, with `home = trusted_home`, `config_dir`, `data_dir` and `settings`. Control `status` reads that source's scan record (`spec/source-v1.md`, "Scan record").
+3. `Runtime::start_with_scope`, whose `make_source` builds the one `EngineSource` of this root from the state store's own root, with `home = trusted_home`, `config_dir`, `data_dir` and `settings`. Control `status` reads that source's scan record (`spec/source-v1.md`, "Scan record") and `scopeApproved` (below); control `scopeApprove` runs the scope approval (below). The control server starts before the source exists: until it does, `scopeApproved` is false and `scopeApprove` is `internal`.
 
 The inputs are fixed for the agent's life. To change a scan setting the caller stops the agent and starts a new one with the new settings; the approved scope then no longer matches (below).
 
@@ -31,6 +31,8 @@ The inputs are fixed for the agent's life. To change a scan setting the caller s
 | None, or a digest other than these inputs | `StateStore::transition(source_change_commit)` (generation forward, deny floor raised: every grant so far stops authorizing), then `EngineSource::approve`. A first approval takes this row too, so a grant paired before the first approval does not inherit the scope approved after it. |
 | Same digest, generation other than the state's (after `reset`, or a crash between the commit and `approve` after which the owner set the inputs back) | `EngineSource::approve` only; no commit. |
 | Same digest and generation | Nothing is written. |
+
+**Through control (`SA-2C2b`).** Both bodies are functions in `agent.rs` over the state store, the agent's `EngineSource` and one `approving` mutex; `Agent::scope_approved` and `approve_scope` call them, and so do the two hooks `Agent::start` passes to the runtime. Control `status` reports `scopeApproved` with the same function, so it is true exactly when the record conditions `report` checks hold. Control `scopeApprove{ownerInputsSha256}` first compares the digest with the running source's (`EngineSource::owner_inputs_sha256`, computed once at start): another value is `Refused(Invalid)`, `invalid`, nothing written, because the owner consented to the inputs they were shown and the running agent may have been started with others (`SA-0G`). An equal digest runs the table above under the same mutex as `approve_scope`.
 
 The record is removed only by `uninstall` with `purge` (below). `reset` keeps it: removing it without moving the generation would let a later `approve` put new inputs under grants that are still valid.
 
@@ -109,6 +111,8 @@ Not classified with certainty:
 | (8) uninstall, purge, another store handle | `live::uninstall_ends_grants_and_clears_the_source_cache`, `live::purge_removes_the_scope_record_and_the_next_start_is_new`, `live::uninstall_with_another_store_handle_fails_and_removes_nothing` |
 | (8b) `clear_private_subdir` (`src/secure_fs/unix.rs`) | `clear_private_subdir_empties_nested_dirs_and_unlinks_symlinks_only`, `clear_private_subdir_follows_a_symlink_only_without_nofollow`, `clear_private_subdir_refuses_a_symlinked_or_loose_directory` |
 | (8c) source cache not clearable | `live::a_source_cache_that_cannot_be_cleared_only_marks_manual_repair` |
+| `SA-2C2b` (3) `scopeApprove`: digest check, full approval | `live::scope_approve_over_control_needs_the_running_digest_and_ends_earlier_grants` |
+| `SA-2C2b` (4) `scopeApproved` agrees with `report` | `live::status_scope_approved_matches_what_report_serves` |
 
 ## Non-claims
 

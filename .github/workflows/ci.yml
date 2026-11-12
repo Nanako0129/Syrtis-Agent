@@ -36,3 +36,20 @@ jobs:
       - run: cargo test --locked --offline --all-targets
       - run: cargo fmt --check
       - run: cargo clippy --locked --offline --all-targets -- -D warnings
+      # SA-2C2b (5b): a release build has no way to change its home. With the
+      # debug-only variable set it must stop before parsing arguments or
+      # opening any root, with the fixed message and status 3. The extra
+      # argument makes a binary without that gate stop at the usage check
+      # (status 2) instead of opening the runner's real home.
+      - name: Release build refuses the debug home
+        shell: bash
+        run: |
+          set -u
+          cargo build --release --locked --offline
+          set +e
+          message=$(SYRTIS_AGENT_DEBUG_HOME=/nonexistent ./target/release/syrtis-agent run --release-gate-check 2>&1)
+          status=$?
+          set -e
+          echo "status $status: $message"
+          test "$status" -eq 3
+          test "$message" = "syrtis-agent: SYRTIS_AGENT_DEBUG_HOME is set, but this build does not accept it. Nothing was opened."

@@ -239,7 +239,10 @@ mod live {
     use serde_json::{Value, json};
     use syrtis_agent::{
         agent::{Agent, AgentConfig, AgentError, ScannerSettings},
-        control::{Client, Command, LISTEN_CONFIGURE, OFFER_CREATE, OK, REVOKE, STATUS},
+        control::{
+            Client, Command, INVALID, LISTEN_CONFIGURE, OFFER_CREATE, OK, REVOKE, Response,
+            SCOPE_APPROVE, STATUS,
+        },
         install::{self, Outcome},
         merge::{Combined, PartStatus},
         noise::StaticKey,
@@ -419,12 +422,24 @@ mod live {
     }
 
     fn call(runtime: &Runtime, id: u16, body: Value) -> Value {
-        let token = *runtime.store().state().unwrap().control_token.expose();
-        let reply = Client::new(Secret32::new(token), runtime.socket_path().to_path_buf())
-            .call(&Command { id, body })
-            .unwrap();
+        let reply = reply(runtime, id, body);
         assert_eq!(reply.code, OK);
         reply.data
+    }
+
+    /// One control command, whatever its code.
+    fn reply(runtime: &Runtime, id: u16, body: Value) -> Response {
+        let token = *runtime.store().state().unwrap().control_token.expose();
+        Client::new(Secret32::new(token), runtime.socket_path().to_path_buf())
+            .call(&Command { id, body })
+            .unwrap()
+    }
+
+    /// `scopeApproved` of control `status`.
+    fn status_scope(agent: &Agent) -> bool {
+        call(agent.runtime(), STATUS, json!({}))["scopeApproved"]
+            .as_bool()
+            .unwrap()
     }
 
     /// A producer with the session fixture, listening on loopback.
@@ -693,6 +708,97 @@ mod live {
         let paired = pull_all(&receiver, &clock, Endpoint::Graph);
         assert_eq!(status_of(&paired, &producer_static), PartStatus::Fresh);
         assert!(!is_empty(&paired));
+    }
+
+    /// SA-2C2b acceptance (3): control `scopeApprove` runs the full
+    /// `approve_scope`. A digest other than the running source's is
+    /// `invalid` and writes nothing (no record yet, then an existing record
+    /// byte for byte); the running digest approves, moves the generation
+    /// and ends the grant paired before the first approval, as
+    /// `approve_scope` does.
+    #[test]
+    fn scope_approve_over_control_needs_the_running_digest_and_ends_earlier_grants() {
+        let clock = TestClock::new();
+        let (producer_home, receiver_home) = (TempHome::new(), TempHome::new());
+        let producer = producer(&producer_home, &clock);
+        let receiver = start(&receiver_home, &clock, ScannerSettings::default());
+        let producer_static = pair(producer.runtime(), &receiver, &clock);
+        let scope = producer_home.root().join(SCOPE_FILE);
+        let digest = producer.source().owner_inputs_sha256().to_owned();
+        let other = if digest == "00".repeat(32) {
+            "11".repeat(32)
+        } else {
+            "00".repeat(32)
+        };
+
+        let before = generation(&producer);
+        let refused = reply(
+            producer.runtime(),
+            SCOPE_APPROVE,
+            json!({ "ownerInputsSha256": other }),
+        );
+        assert_eq!((refused.code, refused.data), (INVALID, Value::Null));
+        assert!(!scope.exists(), "a refused scopeApprove wrote the record");
+        assert_eq!(generation(&producer), before);
+        assert!(!status_scope(&producer));
+
+        call(
+            producer.runtime(),
+            SCOPE_APPROVE,
+            json!({ "ownerInputsSha256": digest }),
+        );
+        assert!(status_scope(&producer));
+        assert!(producer.scope_approved());
+        assert_eq!(generation(&producer), before + 1);
+        let old_grant = pull_all(&receiver, &clock, Endpoint::Graph);
+        assert_eq!(
+            status_of(&old_grant, &producer_static),
+            PartStatus::Refused,
+            "a grant made before the first approval still reads"
+        );
+        pair(producer.runtime(), &receiver, &clock);
+        let paired = pull_all(&receiver, &clock, Endpoint::Graph);
+        assert_eq!(status_of(&paired, &producer_static), PartStatus::Fresh);
+
+        let record = fs::read(&scope).unwrap();
+        let refused = reply(
+            producer.runtime(),
+            SCOPE_APPROVE,
+            json!({ "ownerInputsSha256": other }),
+        );
+        assert_eq!(refused.code, INVALID);
+        assert_eq!(fs::read(&scope).unwrap(), record);
+        assert!(status_scope(&producer));
+    }
+
+    /// SA-2C2b acceptance (4): `status` says `scopeApproved` false before
+    /// the approval, true after it, false again after a reset, and each
+    /// time the source's own `report` agrees (refuses or serves).
+    #[test]
+    fn status_scope_approved_matches_what_report_serves() {
+        let clock = TestClock::new();
+        let home = TempHome::new();
+        let producer = producer(&home, &clock);
+        let serves = |agent: &Agent| {
+            agent
+                .source()
+                .report(&request(Endpoint::Graph, generation(agent)), far())
+                .is_ok()
+        };
+        assert!(!status_scope(&producer));
+        assert!(!serves(&producer));
+        let digest = producer.source().owner_inputs_sha256().to_owned();
+        call(
+            producer.runtime(),
+            SCOPE_APPROVE,
+            json!({ "ownerInputsSha256": digest }),
+        );
+        assert!(status_scope(&producer));
+        assert!(serves(&producer));
+        let now = clock.os_now_seconds().unwrap();
+        producer.runtime().store().reset(now, now * 1_000).unwrap();
+        assert!(!status_scope(&producer));
+        assert!(!serves(&producer));
     }
 
     /// Acceptance (3): new scan settings after a restart are not approved
