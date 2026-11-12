@@ -115,6 +115,31 @@ pub type ShutdownHook = Arc<dyn Fn() + Send + Sync>;
 /// server.
 pub type ListenHook = Arc<dyn Fn() + Send + Sync>;
 
+/// `scanStatus` of `status` (`spec/v1.md`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ScanState {
+    #[default]
+    Never,
+    Ok,
+    Error,
+}
+
+/// The scan fields of `status`. The default is what a runtime without a
+/// scanning source reports: `null`, `never`, `[]`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ScanStatus {
+    /// `lastScanAt`: Unix seconds of the last successful scan.
+    pub last_scan_at: Option<i64>,
+    pub state: ScanState,
+    /// `sourceFamilies`; `status` sorts, deduplicates and keeps the first
+    /// 128 (the frozen bound), whatever the provider returns.
+    pub families: Vec<String>,
+}
+
+/// Supplies the scan fields of each `status` reply. Runs on the serving
+/// thread; it must not block on the store.
+pub type ScanHook = Arc<dyn Fn() -> ScanStatus + Send + Sync>;
+
 /// The control client: the token and the socket path.
 pub struct Client {
     token: Secret32,
@@ -164,14 +189,33 @@ impl Server {
     }
 
     /// [`start`](Self::start), plus `on_listen_configured`, called after
-    /// each committed `listenConfigure`.
+    /// each committed `listenConfigure`. The scan fields of `status` are the
+    /// [`ScanStatus`] default.
     pub fn start_with_listen_hook(
         store: Arc<StateStore>,
         clock: Arc<dyn Clock>,
         on_shutdown: ShutdownHook,
         on_listen_configured: ListenHook,
     ) -> Result<Self, ControlError> {
-        imp::Server::start(store, clock, on_shutdown, on_listen_configured).map(Self)
+        Self::start_with_hooks(
+            store,
+            clock,
+            on_shutdown,
+            on_listen_configured,
+            Arc::new(ScanStatus::default),
+        )
+    }
+
+    /// [`start_with_listen_hook`](Self::start_with_listen_hook), plus
+    /// `scan`, which supplies the scan fields of every `status` reply.
+    pub fn start_with_hooks(
+        store: Arc<StateStore>,
+        clock: Arc<dyn Clock>,
+        on_shutdown: ShutdownHook,
+        on_listen_configured: ListenHook,
+        scan: ScanHook,
+    ) -> Result<Self, ControlError> {
+        imp::Server::start(store, clock, on_shutdown, on_listen_configured, scan).map(Self)
     }
 
     pub fn socket_path(&self) -> &Path {
@@ -204,6 +248,7 @@ mod imp {
             _: Arc<dyn Clock>,
             _: ShutdownHook,
             _: ListenHook,
+            _: ScanHook,
         ) -> Result<Self, ControlError> {
             Err(ControlError::Unsupported)
         }
@@ -283,6 +328,7 @@ mod imp {
         clock: Arc<dyn Clock>,
         on_shutdown: ShutdownHook,
         on_listen_configured: ListenHook,
+        scan: ScanHook,
         /// The pre-auth memory ledger, in bytes.
         memory: AtomicUsize,
         /// A `try_clone` of each connection, so `stop` can shut it down;
@@ -307,12 +353,14 @@ mod imp {
             clock: Arc<dyn Clock>,
             on_shutdown: ShutdownHook,
             on_listen_configured: ListenHook,
+            scan: ScanHook,
         ) -> Result<Self, ControlError> {
             Self::spawn(Shared {
                 store,
                 clock,
                 on_shutdown,
                 on_listen_configured,
+                scan,
                 memory: AtomicUsize::new(0),
                 live: Mutex::new(HashMap::new()),
                 #[cfg(test)]
@@ -637,7 +685,7 @@ mod imp {
             STATUS => {
                 let state = store.state().map_err(code_of)?;
                 let now_ms = record_ms(&state.reference, clock).map_err(|_| INTERNAL)?;
-                Ok(status(&state, now_ms))
+                Ok(status(&state, now_ms, (shared.scan)()))
             }
             OFFER_CREATE => offer_create(shared, body),
             OFFER_CANCEL => {
@@ -764,8 +812,12 @@ mod imp {
     /// `now_ms` is [`record_ms`]: offers and pending records past their
     /// `expiresAt` by then are left out even before the housekeeping sweep
     /// stores them as expired. Grants are counted as stored.
-    fn status(state: &StoredState, now_ms: i64) -> Value {
+    fn status(state: &StoredState, now_ms: i64, scan: ScanStatus) -> Value {
         let reference = &state.reference;
+        let mut families = scan.families;
+        families.sort_unstable();
+        families.dedup();
+        families.truncate(128);
         json!({
             "activeGrantCount": reference
                 .grants
@@ -779,17 +831,20 @@ mod imp {
                 .count(),
             "bindHost": state.config.bind_host,
             "bindPort": state.config.bind_port,
-            // Real sources are SA-2B3.
-            "lastScanAt": Value::Null,
+            "lastScanAt": scan.last_scan_at,
             "nodeLabel": state.config.node_label,
             "pendingCount": reference
                 .pending
                 .iter()
                 .filter(|pending| awaiting(pending, now_ms))
                 .count(),
-            "scanStatus": "never",
+            "scanStatus": match scan.state {
+                ScanState::Never => "never",
+                ScanState::Ok => "ok",
+                ScanState::Error => "error",
+            },
             "sharingEnabled": reference.sharing_enabled,
-            "sourceFamilies": [],
+            "sourceFamilies": families,
         })
     }
 
@@ -1071,6 +1126,7 @@ mod imp {
                 clock: Arc::new(SystemClock),
                 on_shutdown: Arc::new(|| {}),
                 on_listen_configured: Arc::new(|| {}),
+                scan: Arc::new(ScanStatus::default),
                 memory: AtomicUsize::new(0),
                 live: Mutex::new(HashMap::new()),
                 peer_uid: Some(foreign),

@@ -31,6 +31,8 @@ The engine's `reqwest`, `tokio`, `rusqlite` (bundled SQLite) and `zstd` are not 
 
 `SecureRoot::private_subdir(name)` opens `name` directly below the root, no-follow and relative to the root's descriptor, creating it `0700` (exact mode set on the descriptor, ACL cleared on macOS) when missing; it must be a directory owned by the effective UID, exactly `0700`, with no extended ACL on macOS. An existing directory is checked as found and never repaired: a symlink or a mode other than `0700` is `UnsafeState`. It returns the directory's path, because the engine takes paths. The stub on other platforms is uncallable (no root can exist there).
 
+`SecureRoot::clear_private_subdir(name)` (`SA-2C2a`; called only by `Agent::uninstall` with `source-cache`) opens `name` the same way and with the same checks, but never creates or chmods it; absent is success. It empties the directory and keeps it: each entry is classified by a no-follow `fstatat` on its parent's descriptor; a directory is opened `O_DIRECTORY|O_NOFOLLOW` relative to that descriptor, emptied the same way and removed with `unlinkat(AT_REMOVEDIR)`; every other entry, a symlink included, is removed with `unlinkat`, which removes the link, never its target. More than 32 nested levels, or any failed call, is `UnsafeState`, and what was removed before it stays removed. The entry list is not capped (a same-UID process can grow it; same-UID non-claim). The stub on other platforms is uncallable.
+
 Nothing writes pricing files yet. With `pricing/` empty the engine prices every record at zero cost (the engine's fail-soft rule, its test `pricing_snapshot_absence_zeroes_cost_and_changes_nothing_else`, which passed at the pin; this crate's tests observe zero cost only for a model missing from a non-empty pricing root); filling it is out of this slice. One `EngineSource` per root.
 
 ## Owner inputs and the approved scope
@@ -50,6 +52,7 @@ D1: consent binds `ownerInputsSha256`, not the engine's fingerprint. The engine'
 
 ## `report(request, deadline)`
 
+0. If `Instant::now()` is already past `deadline`, `SourceError` before anything is read (`SA-2C2a`). Such a call is not a scan (below).
 1. The endpoint must be one of the four; else `SourceError`.
 2. Deny (`SourceError`) unless `source-scope.json` exists, decodes, has `schema` 1, its `generation` equals `request.sourceScopeGeneration` (which the producer's admission already checked against the durable counter), and its `ownerInputsSha256` equals this source's.
 3. Build `RemoteSourceScopeTokenV1` from the engine's `preview_fingerprint` of the same inputs and the request's generation, then `RemoteSourceContextV1::new`.
@@ -58,6 +61,12 @@ D1: consent binds `ownerInputsSha256`, not the engine's fingerprint. The engine'
 6. If `Instant::now()` is past `deadline` when the body is ready, `SourceError`.
 
 Every failure is `SourceError`; no path, engine message or file content leaves this module.
+
+### Scan record and scope read (`SA-2C2a`)
+
+A scan is a `report` call that reached the engine, step 3. A call refused before it (step 0, an unknown endpoint, or a scope denial at step 2) is not a scan and leaves the record unchanged, so pulls before the owner approves do not read as a broken engine. `EngineSource::scan_status()` returns what control `status` shows (`spec/control-v1.md`): `scanStatus` is `ok` when the last scan returned a body and `error` when it failed at any of steps 3–6 (an engine or encoding failure, or a late body); `never` until the first scan of this process. `lastScanAt` is the OS wall clock (`SystemTime`, whole seconds) when the last successful scan finished; `sourceFamilies` is the set of `client` values in all four endpoints of that scan's engine bundle, sorted, at most 128. A failed scan changes only `scanStatus`. The record is in memory only; a restart starts at `never`.
+
+`EngineSource::scope_record()` reads `source-scope.json` without writing: `None` when absent, otherwise its `generation` and whether its digest equals this source's inputs; a record that cannot be read or decoded is that error.
 
 ## D1 containment (per pin)
 

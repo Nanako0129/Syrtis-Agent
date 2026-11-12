@@ -10,7 +10,9 @@ macOS and Linux only. Elsewhere the control server fails closed (`Unsupported`),
 
 ## Assembly
 
-`Runtime::start(root, source, options)`:
+`Runtime::start(root, source, options)` is `Runtime::start_with(root, |_| Ok(source), <default scan fields>, options)`.
+
+`Runtime::start_with(root, make_source, scan, options)` (`SA-2C2a`): after step 1, `make_source` is called once with the state store's own root (`Arc<SecureRoot>`), so a source that checks the root's identity (`EngineSource::approve`) is built over the same one; its error is `RuntimeError::Store` and nothing runs yet. `scan` is passed to the control server for the scan fields of `status`.
 
 1. Reads the OS clock (`options.clock`), opens `StateStore` in `root` (a new state's install wall is that reading), and opens `PeerStore` in the same root, under the same owner lock.
 2. Creates one memory ledger, one pairing rate limiter and one `Reports` (with `source`) for the process; every listener the runtime starts shares them. Opens the receiver `CacheStore` (`spec/cache-store-v1.md`) in the same root on that ledger. If it does not open (`UnsafeState`, `Busy`, anything else), the runtime runs without a cache until the next start: `pull` still works, nothing is cached, `last_good` is `None`. It is not retried.
@@ -43,7 +45,9 @@ The control `shutdown` hook sets a flag and wakes `wait()`. It never stops anyth
 3. Takes the listener mutex, sets `stopping`, stops and joins the listener.
 4. Halts the housekeeping thread and joins it; its last act is one final checkpoint.
 
-It returns only after every thread has ended. Dropping the runtime calls `stop()`. The control socket file stays; the next start replaces it (`spec/control-v1.md`, "Socket"). Step 2 alone already prevents a hook from starting a listener after step 3; the `stopping` flag is a second, independent guard.
+It returns only after every thread has ended. Dropping the runtime calls `stop()`.
+
+`into_store(self)` (`SA-2C2a`) clones the store's `Arc`, calls `stop()`, drops the runtime and unwraps the `Arc`. After `stop()` no runtime thread or hook holds a clone, so the only other holder can be a caller's clone of `store()`; then it is `Err(Busy)`, the clone it took is dropped, and nothing else happens (the runtime is stopped either way). `install::uninstall` takes the store by value through this. The control socket file stays; the next start replaces it (`spec/control-v1.md`, "Socket"). Step 2 alone already prevents a hook from starting a listener after step 3; the `stopping` flag is a second, independent guard.
 
 ## Sharing entry points (F-7)
 

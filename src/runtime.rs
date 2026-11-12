@@ -24,7 +24,7 @@ use std::{
 use crate::{
     cache::{CACHE_RETENTION_MILLIS, CacheKey, CacheRole},
     cache_store::{CacheStore, CachedBody},
-    control::{self, ControlError},
+    control::{self, ControlError, ScanHook, ScanStatus},
     listener::{Listener, bind_address},
     pairing::{Clock, RateLimiter, SystemClock},
     peer_store::{PeerRecord, PeerState, PeerStore, usable},
@@ -153,9 +153,24 @@ impl Runtime {
         source: Arc<dyn ReportSource>,
         options: Options,
     ) -> Result<Self, RuntimeError> {
+        Self::start_with(root, |_| Ok(source), Arc::new(ScanStatus::default), options)
+    }
+
+    /// [`start`](Self::start), with the report source built by `make_source`
+    /// from the store's own root, after the state store and the peer store
+    /// opened and before anything serves (an error from it is
+    /// [`RuntimeError::Store`]). `scan` supplies the scan fields of control
+    /// `status`.
+    pub fn start_with(
+        root: SecureRoot,
+        make_source: impl FnOnce(Arc<SecureRoot>) -> Result<Arc<dyn ReportSource>, StorageError>,
+        scan: ScanHook,
+        options: Options,
+    ) -> Result<Self, RuntimeError> {
         Self::start_inner(
             root,
-            source,
+            make_source,
+            scan,
             options,
             #[cfg(test)]
             None,
@@ -164,7 +179,8 @@ impl Runtime {
 
     fn start_inner(
         root: SecureRoot,
-        source: Arc<dyn ReportSource>,
+        make_source: impl FnOnce(Arc<SecureRoot>) -> Result<Arc<dyn ReportSource>, StorageError>,
+        scan: ScanHook,
         options: Options,
         #[cfg(test)] before_restart: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<Self, RuntimeError> {
@@ -174,6 +190,7 @@ impl Runtime {
             .map_err(RuntimeError::Store)?;
         let store = Arc::new(StateStore::open(root, os_now).map_err(RuntimeError::Store)?);
         let peers = PeerStore::open(store.root()).map_err(RuntimeError::Store)?;
+        let source = make_source(store.root()).map_err(RuntimeError::Store)?;
         let ledger = MemoryLedger::default();
         // Not retried: a cache that is unsafe or busy now stays off until
         // the next start. `pull` works without it.
@@ -196,11 +213,12 @@ impl Runtime {
             before_restart,
         });
         let (on_shutdown, on_listen) = (Arc::clone(&inner), Arc::clone(&inner));
-        let server = control::Server::start_with_listen_hook(
+        let server = control::Server::start_with_hooks(
             store,
             Arc::clone(&inner.clock),
             Arc::new(move || request_shutdown(&on_shutdown)),
             Arc::new(move || restart_listener(&on_listen)),
+            scan,
         )
         .map_err(RuntimeError::Control)?;
         let runtime = Self {
@@ -469,6 +487,21 @@ impl Runtime {
         if let Some(handle) = lock(&self.housekeeping).take() {
             let _ = handle.join();
         }
+    }
+}
+
+impl Runtime {
+    /// Stops the runtime and returns its state store, which must then be
+    /// the only handle: every thread has ended, so the runtime's own clones
+    /// are gone once `self` is. Any other holder of the store's `Arc`
+    /// (a caller's clone of [`store`](Self::store)) makes this
+    /// `Err(StorageError::Busy)`; the store is then dropped here and
+    /// nothing else happens.
+    pub fn into_store(self) -> Result<StateStore, StorageError> {
+        let store = Arc::clone(&self.inner.store);
+        self.stop();
+        drop(self);
+        Arc::try_unwrap(store).map_err(|_| StorageError::Busy)
     }
 }
 
@@ -787,7 +820,14 @@ mod tests {
         });
         let root = SecureRoot::open_under(&home.0, &["r"]).unwrap();
         let runtime = Arc::new(
-            Runtime::start_inner(root, Arc::new(NoSource), Options::default(), Some(gate)).unwrap(),
+            Runtime::start_inner(
+                root,
+                |_| Ok(Arc::new(NoSource)),
+                Arc::new(ScanStatus::default),
+                Options::default(),
+                Some(gate),
+            )
+            .unwrap(),
         );
         let state = runtime.store().state().unwrap();
         runtime
