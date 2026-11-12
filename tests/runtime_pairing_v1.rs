@@ -1747,6 +1747,8 @@ mod disk {
                     responder_static: *node.key.public(),
                     initiator_static: *receiver.public(),
                     pending_id: pending.pending_id,
+                    host: "127.0.0.1".into(),
+                    port: claimed.port,
                 })
             );
             assert_eq!(grant.grant_id, derive_grant_id(&pending.pending_id));

@@ -55,13 +55,11 @@ pub struct PeerRecord {
 
 impl PeerRecord {
     /// The record for a grant Grant status confirmed `active`. `host` and
-    /// `port` are the claimed offer's; `node_label` is the receiver's own
-    /// input. Nothing is validated here: [`PeerStore::upsert`] refuses
-    /// what load would refuse.
+    /// `port` are the claimed offer's, carried by the grant; `node_label` is
+    /// the receiver's own input. Nothing is validated here:
+    /// [`PeerStore::upsert`] refuses what load would refuse.
     pub fn from_confirmed(
         grant: &ConfirmedGrant,
-        host: String,
-        port: u16,
         node_label: Option<String>,
         created_at_ms: i64,
     ) -> Self {
@@ -70,11 +68,11 @@ impl PeerRecord {
             created_at_ms,
             expires_at_ms: grant.expires_at_ms,
             grant_id: grant.grant_id,
-            host,
+            host: grant.host.clone(),
             initiator_static: grant.initiator_static,
             node_label,
             pending_id: grant.pending_id,
-            port,
+            port: grant.port,
             responder_static: grant.responder_static,
             source_scope_generation: grant.source_scope_generation,
             state: PeerState::Active,
@@ -262,7 +260,9 @@ impl PeerStore {
     /// Adds `record`, replacing the record of the same producer. Only an
     /// `active` record (from [`PeerRecord::from_confirmed`]) is accepted.
     /// A 17th producer is `Refused(Bounds)`; a record load would refuse is
-    /// `Refused(Invalid)`. A refusal writes nothing.
+    /// `Refused(Invalid)`; a record with a lower `authEpoch` than the one
+    /// it would replace is `Refused(Conflict)`, so a stale answer cannot
+    /// overwrite a newer pairing. A refusal writes nothing.
     pub fn upsert(&self, record: PeerRecord) -> Result<(), StorageError> {
         if record.state != PeerState::Active {
             return Err(StorageError::Refused(SecurityError::Invalid));
@@ -271,6 +271,9 @@ impl PeerStore {
             let mut next = peers.to_vec();
             match next.binary_search_by(|peer| peer.responder_static.cmp(&record.responder_static))
             {
+                Ok(index) if next[index].auth_epoch > record.auth_epoch => {
+                    return Err(StorageError::Refused(SecurityError::Conflict));
+                }
                 Ok(index) => next[index] = record,
                 Err(_) if next.len() >= PEERS_MAX => {
                     return Err(StorageError::Refused(SecurityError::Bounds));
@@ -283,10 +286,13 @@ impl PeerStore {
 
     /// Marks the producer's record `revoked` or `expired`. `active` comes
     /// only from [`Self::upsert`], and an unknown producer is refused; both
-    /// are `Refused(Invalid)` with nothing written.
+    /// are `Refused(Invalid)` with nothing written. A record holding another
+    /// `grantId` (the producer was paired again since the answer was asked
+    /// for) is `Refused(Conflict)`, nothing written.
     pub fn set_state(
         &self,
         responder_static: &[u8; 32],
+        grant_id: &[u8; 16],
         state: PeerState,
     ) -> Result<(), StorageError> {
         if state == PeerState::Active {
@@ -294,11 +300,34 @@ impl PeerStore {
         }
         self.commit(|peers| {
             let mut next = peers.to_vec();
-            let peer = next
-                .iter_mut()
-                .find(|peer| peer.responder_static == *responder_static)
-                .ok_or(StorageError::Refused(SecurityError::Invalid))?;
+            let peer = find(&mut next, responder_static, grant_id)?;
             peer.state = state;
+            Ok(next)
+        })
+    }
+
+    /// Stores what Grant status answered `active` for the producer's grant:
+    /// its `authEpoch`, `sourceScopeGeneration` and `expiresAt`. Only for
+    /// the record holding `grant_id` and still `active`, and never to a
+    /// lower `authEpoch`; anything else is `Refused(Conflict)`. An unknown
+    /// producer is `Refused(Invalid)`. A refusal writes nothing.
+    pub fn update_grant(
+        &self,
+        responder_static: &[u8; 32],
+        grant_id: &[u8; 16],
+        auth_epoch: u64,
+        source_scope_generation: u64,
+        expires_at_ms: i64,
+    ) -> Result<(), StorageError> {
+        self.commit(|peers| {
+            let mut next = peers.to_vec();
+            let peer = find(&mut next, responder_static, grant_id)?;
+            if peer.state != PeerState::Active || auth_epoch < peer.auth_epoch {
+                return Err(StorageError::Refused(SecurityError::Conflict));
+            }
+            peer.auth_epoch = auth_epoch;
+            peer.source_scope_generation = source_scope_generation;
+            peer.expires_at_ms = expires_at_ms;
             Ok(next)
         })
     }
@@ -353,6 +382,23 @@ impl PeerStore {
     fn write(&self) -> Result<RwLockWriteGuard<'_, Option<Vec<PeerRecord>>>, StorageError> {
         self.current.write().map_err(|_| StorageError::Unknown)
     }
+}
+
+/// The producer's record, only if it holds `grant_id`: an unknown producer
+/// is `Refused(Invalid)`, another grant `Refused(Conflict)`.
+fn find<'a>(
+    peers: &'a mut [PeerRecord],
+    responder_static: &[u8; 32],
+    grant_id: &[u8; 16],
+) -> Result<&'a mut PeerRecord, StorageError> {
+    let peer = peers
+        .iter_mut()
+        .find(|peer| peer.responder_static == *responder_static)
+        .ok_or(StorageError::Refused(SecurityError::Invalid))?;
+    if peer.grant_id != *grant_id {
+        return Err(StorageError::Refused(SecurityError::Conflict));
+    }
+    Ok(peer)
 }
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]

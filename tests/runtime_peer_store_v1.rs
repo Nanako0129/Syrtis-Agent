@@ -496,8 +496,8 @@ mod disk {
     /// Two agents on two temp roots pair over loopback: the producer
     /// creates an offer, the receiver claims it from the Pair URL, the
     /// owner approves, and the receiver polls to a confirmed grant.
-    /// Returns the receiver's confirmed grant and the claimed host and port.
-    fn pair(producer_home: &Path, receiver: &StateStore) -> (ConfirmedGrant, String, u16) {
+    /// Returns the receiver's confirmed grant and the port it was served on.
+    fn pair(producer_home: &Path, receiver: &StateStore) -> (ConfirmedGrant, u16) {
         let producer_store = open_state(producer_home);
         producer_store
             .transition(|state| state.enable_sharing())
@@ -558,8 +558,7 @@ mod disk {
                 clock.os_now_seconds().unwrap(),
             )
             .unwrap();
-            let confirmed = client.poll(&claimed).unwrap();
-            (confirmed, claimed.host, claimed.port)
+            (client.poll(&claimed).unwrap(), port)
         })
     }
 
@@ -573,15 +572,13 @@ mod disk {
         let (store, peers) = open_both(&receiver_home.path);
         assert_eq!(peers.peers().unwrap(), vec![]);
         assert!(!receiver_home.peers_file().exists(), "absent until a write");
-        let (confirmed, host, port) = pair(&producer_home.path, &store);
-        let record = PeerRecord::from_confirmed(
-            &confirmed,
-            host,
-            port,
-            Some("studio-mac".into()),
-            NOW * 1_000 + 9,
-        );
+        let (confirmed, port) = pair(&producer_home.path, &store);
+        let record =
+            PeerRecord::from_confirmed(&confirmed, Some("studio-mac".into()), NOW * 1_000 + 9);
         assert_eq!(record.state, PeerState::Active);
+        // Acceptance (9) of SA-2B2b2: host and port come from the grant,
+        // which carries the claimed Pair URL's.
+        assert_eq!((record.host.as_str(), record.port), ("127.0.0.1", port));
         assert_eq!(record.grant_id, confirmed.grant_id);
         assert_eq!(record.responder_static, confirmed.responder_static);
         assert_eq!(record.initiator_static, confirmed.initiator_static);
@@ -697,11 +694,11 @@ mod disk {
             assert_eq!(peers.peers().unwrap().len(), PEERS_MAX, "{label}");
         }
         assert_eq!(
-            peers.set_state(&[1; 32], PeerState::Active),
+            peers.set_state(&[1; 32], &[1; 16], PeerState::Active),
             Err(StorageError::Refused(Invalid))
         );
         assert_eq!(
-            peers.set_state(&[99; 32], PeerState::Revoked),
+            peers.set_state(&[99; 32], &[99; 16], PeerState::Revoked),
             Err(StorageError::Refused(Invalid))
         );
         assert_eq!(home.read_peers(), full);
@@ -722,8 +719,12 @@ mod disk {
             (2..=PEERS_MAX as u8).map(record).collect::<Vec<_>>()[..]
         );
 
-        peers.set_state(&[2; 32], PeerState::Revoked).unwrap();
-        peers.set_state(&[3; 32], PeerState::Expired).unwrap();
+        peers
+            .set_state(&[2; 32], &[2; 16], PeerState::Revoked)
+            .unwrap();
+        peers
+            .set_state(&[3; 32], &[3; 16], PeerState::Expired)
+            .unwrap();
         peers.remove(&[4; 32]).unwrap();
         peers.remove(&[4; 32]).unwrap();
         drop((_state, peers));
@@ -743,8 +744,8 @@ mod disk {
     fn usable_needs_active_and_the_current_identity() {
         let (producer_home, receiver_home) = (TempHome::new(), TempHome::new());
         let (store, peers) = open_both(&receiver_home.path);
-        let (confirmed, host, port) = pair(&producer_home.path, &store);
-        let record = PeerRecord::from_confirmed(&confirmed, host, port, None, NOW * 1_000);
+        let (confirmed, _) = pair(&producer_home.path, &store);
+        let record = PeerRecord::from_confirmed(&confirmed, None, NOW * 1_000);
         peers.upsert(record.clone()).unwrap();
         assert!(usable(&record, &store), "control: active and bound");
         for state in [PeerState::Revoked, PeerState::Expired] {
@@ -788,5 +789,85 @@ mod disk {
         drop(peers);
         let free = retry_busy(|| SecureRoot::open_under(&home.path, SUFFIX).map(|_| ()));
         assert_eq!(free, Ok(()), "control: the lock is free once both are gone");
+    }
+
+    /// SA-2B2b2 acceptance (9): the grant guards. `set_state` naming
+    /// another `grantId` is `Refused(Conflict)` and leaves the file
+    /// bit-identical; an `upsert` with a lower `authEpoch` than the stored
+    /// record is refused, an equal or higher one replaces; `update_grant`
+    /// changes only the matching `active` record and never lowers the
+    /// epoch. Each refusal has a control that the same call succeeds.
+    #[test]
+    fn grant_guards_refuse_stale_writes_and_leave_the_file_alone() {
+        use syrtis_agent::security::SecurityError::{Conflict, Invalid};
+        let home = TempHome::new();
+        let (_state, peers) = open_both(&home.path);
+        let current = PeerRecord {
+            auth_epoch: 5,
+            ..record(1)
+        };
+        peers.upsert(current.clone()).unwrap();
+        peers.upsert(record(2)).unwrap();
+        let file = home.read_peers();
+        let conflict = Err(StorageError::Refused(Conflict));
+
+        // set_state: another grant of the same producer.
+        assert_eq!(
+            peers.set_state(&[1; 32], &[0xee; 16], PeerState::Revoked),
+            conflict
+        );
+        assert_eq!(home.read_peers(), file);
+
+        // upsert: an older pairing answer does not replace a newer one.
+        let older = PeerRecord {
+            auth_epoch: 4,
+            grant_id: [0xee; 16],
+            ..record(1)
+        };
+        assert_eq!(peers.upsert(older), conflict);
+        assert_eq!(home.read_peers(), file);
+
+        // update_grant: another grant, a lower epoch, an unknown producer.
+        assert_eq!(peers.update_grant(&[1; 32], &[0xee; 16], 9, 2, 7), conflict);
+        assert_eq!(peers.update_grant(&[1; 32], &[1; 16], 4, 2, 7), conflict);
+        assert_eq!(
+            peers.update_grant(&[99; 32], &[99; 16], 9, 2, 7),
+            Err(StorageError::Refused(Invalid))
+        );
+        assert_eq!(home.read_peers(), file);
+
+        // Controls: the matching grant moves forward; an equal epoch is
+        // not a lowering.
+        peers.update_grant(&[1; 32], &[1; 16], 9, 2, 7).unwrap();
+        peers.update_grant(&[1; 32], &[1; 16], 9, 3, 8).unwrap();
+        let updated = PeerRecord {
+            auth_epoch: 9,
+            source_scope_generation: 3,
+            expires_at_ms: 8,
+            ..current.clone()
+        };
+        assert_eq!(peers.peers().unwrap()[0], updated);
+        assert_eq!(peers.peers().unwrap()[1], record(2), "only producer 1");
+        // An equal epoch replaces (re-pairing at the same counter).
+        let repaired = PeerRecord {
+            grant_id: [0xee; 16],
+            ..updated.clone()
+        };
+        peers.upsert(repaired.clone()).unwrap();
+        assert_eq!(peers.peers().unwrap()[0], repaired);
+
+        // update_grant on a record no longer `active`.
+        peers
+            .set_state(&[1; 32], &[0xee; 16], PeerState::Expired)
+            .unwrap();
+        let expired = home.read_peers();
+        assert_eq!(
+            peers.update_grant(&[1; 32], &[0xee; 16], 10, 3, 9),
+            conflict
+        );
+        assert_eq!(home.read_peers(), expired);
+        drop((_state, peers));
+        let (_state, peers) = open_both(&home.path);
+        assert_eq!(peers.peers().unwrap()[0].state, PeerState::Expired);
     }
 }

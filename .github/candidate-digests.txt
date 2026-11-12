@@ -45,9 +45,16 @@
 # spec/pairing-v1.md changed on purpose: the Peer request key set now
 # dispatches to the report path (F-10), the 4,096-byte cap applies to the
 # three pairing surfaces only, and Listener::start takes the report state.
+#
+# SA-2B2b2 changed spec/report-peer-v1.md on purpose: it adds the
+# "Receiver" section (fetch steps, error mapping, the shape gate, the
+# measured decode reservation, receiver memory and non-claims) and the
+# receiver acceptance map. spec/peer-store-v1.md changed on purpose: the
+# grant guards (set_state and update_grant name the grantId, upsert refuses
+# a lower authEpoch) and from_confirmed taking host and port from the grant.
 7fcd1eefd06566e9de262fa2645f289025cac7e52a0b050fa12c7533d12281ea  spec/pairing-v1.md
-c91ade311123eef3e4765de0406519895f155cb82f7b88594dd327d1b2e25c97  spec/report-peer-v1.md
-1d982b186a00e4ddaaa8b47f6569cd3c68bcc170b17a74044ed3ed515ea5b83f  spec/peer-store-v1.md
+686951d4a0d463d5a29d5d3e9d2be97198211cba3ab81202da66643c1c79e6bc  spec/report-peer-v1.md
+3cce5944bf106ca5e5503505f3b4150f192eead0db3f9b1a3fdaf3617ae1c59b  spec/peer-store-v1.md
 79d1c0363e4576d67827ebfa029fad7e3a5981474f4aafba3bd71e54f1a98172  spec/report-cache-v1.md
 3e0b75e33fd362eab1040254de8f656e3a1bf855e0f3c008915b33e3ec2ee523  spec/security-v1.md
 ea302173340ae0dfb6f2a421326e7e178d2454bcab45ac28d74b144c1f17890e  spec/state-store-v1.md
