@@ -6,7 +6,7 @@ This document fixes the local control wire: how a program of the same user (the 
 
 macOS and Linux only. Every other platform, Windows included, fails closed: the server does not start and the client does not connect (`Unsupported`). The Windows named pipe is deferred with Windows storage (before `SA-4`).
 
-Not in this slice (`SA-2B2c2`): the `Runtime` that assembles store, listener and control and can be shut down; the F-7 disable composition; the sharing enable and disable entry points (none of the nine commands is one); the SEC-SPLIT-02 checkpoint and `expire_one` schedule; the real effect of `shutdown`; restarting the peer listener after `listenConfigure`.
+The `Runtime` that assembles store, listener and control (`SA-2B2c2`, `spec/runtime-v1.md`) owns what this wire leaves to its hooks: the real effect of `shutdown`, restarting the peer listener after `listenConfigure`, the sharing enable and disable entry points (none of the nine commands is one) with the F-7 disable composition, and the SEC-SPLIT-02 checkpoint and `expire_one` schedule.
 
 > v1 makes no claim against the same UID (`spec/state-store-v1.md`). The socket mode, the peer-UID check and the mutual proof stop other local UIDs and rogue endpoints; a process of the same UID can read the token from `state.json` and can exhaust the four pre-auth slots.
 
@@ -55,19 +55,19 @@ One command per connection. All integers are big-endian.
 
 ## Commands
 
-Bodies arrive already checked by the frozen validator. Every state change goes through `StateStore::transition` with frozen `ReferenceState` transitions, `StateStore::set_listen_config`, or `pairing::approve`. A terminal record's timestamp is the effective now (`max(osNow, lastAcceptedWall)`), or the durable wall when the OS clock is unavailable or anomalous, so `revoke`, `reject` and `offerCancel` never fail on the clock.
+Bodies arrive already checked by the frozen validator. Every state change goes through `StateStore::transition` with frozen `ReferenceState` transitions, `StateStore::set_listen_config`, or `pairing::approve`. A terminal record's timestamp is the effective now (`max(osNow, lastAcceptedWall)`), or the durable wall when the OS clock is unavailable or anomalous, so `revoke`, `reject` and `offerCancel` never fail on the clock. `status` and `pendingList` read "now" the same way (in milliseconds): an offer or pending record whose `expiresAt` that now has reached is left out, whether or not housekeeping has stored it as expired yet.
 
 | Command | Effect |
 |---|---|
-| `status` | From one snapshot: counts of `active` grants, `active` offers and `awaitingApproval` pending records; `bindHost`, `bindPort`, `nodeLabel` from the listen config (`null` while unset, SA-0F); `sharingEnabled`; `lastScanAt: null`, `scanStatus: "never"`, `sourceFamilies: []` (real sources are `SA-2B3`). |
+| `status` | From one snapshot: counts of `active` grants, of `active` offers and of `awaitingApproval` pending records (offers and pending records past `expiresAt` by now are not counted; grants are counted as stored); `bindHost`, `bindPort`, `nodeLabel` from the listen config (`null` while unset, SA-0F); `sharingEnabled`; `lastScanAt: null`, `scanStatus: "never"`, `sourceFamilies: []` (real sources are `SA-2B3`). |
 | `offerCreate{ttlSeconds}` | Needs a `bindHost` (else `invalid`) that passes `listener::bind_address` with the stored port (else `invalid`; a hostname or `0x0` that the store accepted is refused here, as the listener would). The `responderStatic` is the identity of the same snapshot. `offerId` and `secret` come from the CSPRNG; `secretHash = offer_secret_hash(offerId, secret, responderStatic)`; the frozen `create_offer` runs with `createdAt` = effective now and `expiresAt = createdAt + ttlSeconds × 1000`. Its refusals (sharing off, five active offers, clock anomaly, record cap) are `unauthorized`. A reset between the snapshot and the commit turns sharing off, so `create_offer` refuses an offer bound to the old identity. Success data: `{expiresAt, offerId, pairUrl}`, `pairUrl = pair_url(…)` with the stored host and port. |
 | `offerCancel{offerId}` | Frozen `cancel_offer`. Not an active offer → `invalid`. |
-| `pendingList` | `awaitingApproval` records as `{expiresAt, pendingId, sasCode}`, sorted by `pendingId`. v1 never re-issues a SAS, so the `sasGeneration` to approve or reject with is 1. |
+| `pendingList` | `awaitingApproval` records not past `expiresAt` by now, as `{expiresAt, pendingId, sasCode}`, sorted by `pendingId`. v1 never re-issues a SAS, so the `sasGeneration` to approve or reject with is 1. |
 | `approve{pendingId, sasGeneration}` | `pairing::approve` with `disclosureExact = true`. The server cannot see what the owner was shown: showing the disclosure and getting the owner's confirmation before sending `approve` is the caller's (App or CLI) obligation. |
 | `reject{pendingId, sasGeneration}` | Frozen `reject_pending`. |
 | `revoke{grantId}` | Frozen `revoke_commit`; the terminal record's ID is the `grantId`. |
-| `listenConfigure{bindHost, bindPort}` | `listener::bind_address(bindHost, bindPort)` first; a refusal is `invalid` and nothing is written. Then `set_listen_config`, keeping the stored `nodeLabel`. The running peer listener is not restarted (`SA-2B2c2`). |
-| `shutdown` | Answered `ok`; then, on the serving thread, the hook the server was started with is called, whether or not the reply could be written: the command was authenticated, so a client that disconnects still shuts the agent down. The hook must not stop the server synchronously (stopping joins that thread). It is not called for a refused body. |
+| `listenConfigure{bindHost, bindPort}` | `listener::bind_address(bindHost, bindPort)` first; a refusal is `invalid` and nothing is written. Then `set_listen_config`, keeping the stored `nodeLabel`. After that commit and before the reply, on the serving thread, the listen hook the server was started with is called (`Server::start_with_listen_hook`; `Server::start` passes none): the runtime restarts the peer listener there, so a client that sees `ok` finds it already moved or stopped (`spec/runtime-v1.md`, "Listener slot"). |
+| `shutdown` | Answered `ok`; then, on the serving thread, the hook the server was started with is called, whether or not the reply could be written: the command was authenticated, so a client that disconnects still shuts the agent down. The hook must not stop the server synchronously (stopping joins that thread); the runtime's hook only sets a flag and wakes `Runtime::wait`. It is not called for a refused body. |
 
 | Store error | Code |
 |---|---|
@@ -116,3 +116,4 @@ The token, the offer secret and the Pair URL never appear in a `Debug` output or
 | 13 | `listen_configure_refuses_what_the_listener_would_not_bind` |
 | 14 | `a_residue_that_is_not_our_socket_fails_closed_and_stays` |
 | 15 | `revoke_completes_within_five_seconds_while_four_hellos_stall` |
+| `SA-2B2c2` | The expiry filter of `status` and `pendingList`: `tests/runtime_lifecycle_v1.rs` `status_and_pending_list_leave_out_what_has_expired`; the hooks: that file and `spec/runtime-v1.md` |

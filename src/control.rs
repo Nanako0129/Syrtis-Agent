@@ -109,6 +109,12 @@ impl fmt::Debug for Response {
 /// joins that same thread.
 pub type ShutdownHook = Arc<dyn Fn() + Send + Sync>;
 
+/// Called on the serving thread after `listenConfigure` committed, before
+/// the reply is written. The runtime restarts the peer listener here
+/// (`spec/runtime-v1.md`). Like [`ShutdownHook`], it must not stop the
+/// server.
+pub type ListenHook = Arc<dyn Fn() + Send + Sync>;
+
 /// The control client: the token and the socket path.
 pub struct Client {
     token: Secret32,
@@ -154,7 +160,18 @@ impl Server {
         clock: Arc<dyn Clock>,
         on_shutdown: ShutdownHook,
     ) -> Result<Self, ControlError> {
-        imp::Server::start(store, clock, on_shutdown).map(Self)
+        Self::start_with_listen_hook(store, clock, on_shutdown, Arc::new(|| {}))
+    }
+
+    /// [`start`](Self::start), plus `on_listen_configured`, called after
+    /// each committed `listenConfigure`.
+    pub fn start_with_listen_hook(
+        store: Arc<StateStore>,
+        clock: Arc<dyn Clock>,
+        on_shutdown: ShutdownHook,
+        on_listen_configured: ListenHook,
+    ) -> Result<Self, ControlError> {
+        imp::Server::start(store, clock, on_shutdown, on_listen_configured).map(Self)
     }
 
     pub fn socket_path(&self) -> &Path {
@@ -186,6 +203,7 @@ mod imp {
             _: Arc<StateStore>,
             _: Arc<dyn Clock>,
             _: ShutdownHook,
+            _: ListenHook,
         ) -> Result<Self, ControlError> {
             Err(ControlError::Unsupported)
         }
@@ -242,10 +260,10 @@ mod imp {
         secure_fs::StorageError,
         security::{
             CONTROL_VERSION, GrantState, Offer, OfferState, PEER_PROTOCOL_VERSION, PairOffer,
-            PendingState, ReferenceState, SecurityError, clock_status, control_command_mac,
-            control_key, control_response_mac, control_server_mac, decode_fixed_hex, hex_encode,
-            offer_secret_hash, pair_url, verify_control_command, verify_control_response,
-            verify_mac,
+            Pending, PendingState, ReferenceState, SecurityError, clock_status,
+            control_command_mac, control_key, control_response_mac, control_server_mac,
+            decode_fixed_hex, hex_encode, offer_secret_hash, pair_url, verify_control_command,
+            verify_control_response, verify_mac,
         },
         state_store::{StoredState, random},
     };
@@ -264,6 +282,7 @@ mod imp {
         store: Arc<StateStore>,
         clock: Arc<dyn Clock>,
         on_shutdown: ShutdownHook,
+        on_listen_configured: ListenHook,
         /// The pre-auth memory ledger, in bytes.
         memory: AtomicUsize,
         /// A `try_clone` of each connection, so `stop` can shut it down;
@@ -287,11 +306,13 @@ mod imp {
             store: Arc<StateStore>,
             clock: Arc<dyn Clock>,
             on_shutdown: ShutdownHook,
+            on_listen_configured: ListenHook,
         ) -> Result<Self, ControlError> {
             Self::spawn(Shared {
                 store,
                 clock,
                 on_shutdown,
+                on_listen_configured,
                 memory: AtomicUsize::new(0),
                 live: Mutex::new(HashMap::new()),
                 #[cfg(test)]
@@ -613,7 +634,11 @@ mod imp {
         let store = &*shared.store;
         let clock = &*shared.clock;
         match command_id {
-            STATUS => Ok(status(&store.state().map_err(code_of)?)),
+            STATUS => {
+                let state = store.state().map_err(code_of)?;
+                let now_ms = record_ms(&state.reference, clock).map_err(|_| INTERNAL)?;
+                Ok(status(&state, now_ms))
+            }
             OFFER_CREATE => offer_create(shared, body),
             OFFER_CANCEL => {
                 let offer_id = id(body, "offerId")?;
@@ -622,7 +647,11 @@ mod imp {
                     .map_err(code_of)?;
                 Ok(Value::Null)
             }
-            PENDING_LIST => Ok(pending_list(&store.state().map_err(code_of)?)),
+            PENDING_LIST => {
+                let state = store.state().map_err(code_of)?;
+                let now_ms = record_ms(&state.reference, clock).map_err(|_| INTERNAL)?;
+                Ok(pending_list(&state, now_ms))
+            }
             APPROVE => {
                 let (pending_id, generation) = (id(body, "pendingId")?, generation(body)?);
                 let os_now = clock.os_now_seconds().map_err(code_of)?;
@@ -664,6 +693,9 @@ mod imp {
                 store
                     .set_listen_config(Some(host.to_owned()), port, label)
                     .map_err(code_of)?;
+                // Before the reply: once the client sees `ok`, the listener
+                // already serves the new address (or is stopped).
+                (shared.on_listen_configured)();
                 Ok(Value::Null)
             }
             SHUTDOWN => Ok(Value::Null),
@@ -729,7 +761,10 @@ mod imp {
         }))
     }
 
-    fn status(state: &StoredState) -> Value {
+    /// `now_ms` is [`record_ms`]: offers and pending records past their
+    /// `expiresAt` by then are left out even before the housekeeping sweep
+    /// stores them as expired. Grants are counted as stored.
+    fn status(state: &StoredState, now_ms: i64) -> Value {
         let reference = &state.reference;
         json!({
             "activeGrantCount": reference
@@ -740,7 +775,7 @@ mod imp {
             "activeOfferCount": reference
                 .offers
                 .iter()
-                .filter(|offer| offer.state == OfferState::Active)
+                .filter(|offer| offer.state == OfferState::Active && now_ms < offer.expires_at_ms)
                 .count(),
             "bindHost": state.config.bind_host,
             "bindPort": state.config.bind_port,
@@ -750,7 +785,7 @@ mod imp {
             "pendingCount": reference
                 .pending
                 .iter()
-                .filter(|pending| pending.state == PendingState::AwaitingApproval)
+                .filter(|pending| awaiting(pending, now_ms))
                 .count(),
             "scanStatus": "never",
             "sharingEnabled": reference.sharing_enabled,
@@ -758,15 +793,20 @@ mod imp {
         })
     }
 
-    fn pending_list(state: &StoredState) -> Value {
-        let mut awaiting: Vec<_> = state
+    /// Awaiting approval and not past `expiresAt` at `now_ms`.
+    fn awaiting(pending: &Pending, now_ms: i64) -> bool {
+        pending.state == PendingState::AwaitingApproval && now_ms < pending.expires_at_ms
+    }
+
+    fn pending_list(state: &StoredState, now_ms: i64) -> Value {
+        let mut listed: Vec<_> = state
             .reference
             .pending
             .iter()
-            .filter(|pending| pending.state == PendingState::AwaitingApproval)
+            .filter(|pending| awaiting(pending, now_ms))
             .collect();
-        awaiting.sort_by_key(|pending| pending.pending_id);
-        awaiting
+        listed.sort_by_key(|pending| pending.pending_id);
+        listed
             .into_iter()
             .map(|pending| {
                 json!({
@@ -1030,6 +1070,7 @@ mod imp {
                 store,
                 clock: Arc::new(SystemClock),
                 on_shutdown: Arc::new(|| {}),
+                on_listen_configured: Arc::new(|| {}),
                 memory: AtomicUsize::new(0),
                 live: Mutex::new(HashMap::new()),
                 peer_uid: Some(foreign),
