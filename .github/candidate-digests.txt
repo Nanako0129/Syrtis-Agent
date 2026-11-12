@@ -71,6 +71,17 @@
 # the runtime's, and status and pendingList leave out offers and pending
 # records past expiresAt. spec/pairing-v1.md changed on purpose: the F-7
 # disable-half non-claim now points at the runtime's entry points.
+#
+# SA-2B3a adds spec/cache-store-v1.md, the on-disk producer and receiver
+# cache contract (flat pcache-/rcache- namespaces, file layout, caps and
+# eviction, the three get reservations, failure semantics, non-claims).
+# spec/state-store-v1.md changed on purpose: it describes the four cache
+# primitives of the secure root (read_file_sized, list, remove_file,
+# remove_stale_temps), lists the cache files in the root, and corrects the
+# umask-evidence wording (storage doc todo d1-d2: the second CI run is now
+# 43016382735 at fe1af3b, and the maintainer's Mac claim names the branch
+# it takes and how that was observed).
+11f1e2b5981484b61b89cc1199c16d3bf47ee031905eeed7a268d6ef0767fd42  spec/cache-store-v1.md
 cb6f2e04a7968c74612fac18fcb9ed0e9e5b1a6d6ce746830463165e77f64e40  spec/control-v1.md
 6ba187336666045a8766cf1a03bad7b17a4133c3b6eb72270fc58f6588d5beff  spec/pairing-v1.md
 12dda449b93bb479bc648b6dd152552702ffb10f465353d287d41c79613a8d8b  spec/runtime-v1.md
@@ -78,7 +89,7 @@ cb6f2e04a7968c74612fac18fcb9ed0e9e5b1a6d6ce746830463165e77f64e40  spec/control-v
 3cce5944bf106ca5e5503505f3b4150f192eead0db3f9b1a3fdaf3617ae1c59b  spec/peer-store-v1.md
 79d1c0363e4576d67827ebfa029fad7e3a5981474f4aafba3bd71e54f1a98172  spec/report-cache-v1.md
 4234cdfdf319cf41907cbd34273067a3895473d84c4ab85d430bc2cbbe8791c0  spec/security-v1.md
-ea302173340ae0dfb6f2a421326e7e178d2454bcab45ac28d74b144c1f17890e  spec/state-store-v1.md
+e4bacecf31da7a8dc58a40b6e2c2360661edfc8a2e199283cce051946803d9ff  spec/state-store-v1.md
 c550bcafe14707a45ad0b661ce1afc7ba383153cbbdede4ff0e839175fa89726  spec/v1.md
 ff21cbcfdd6aedfb68ac1b3cfda056663203f2c7f08fd05a856dc5dbe5e4c25a  src/cache.rs
 8b0add8d4fde2253edebdddd448d381559d63ff630f0e9d2f9faad8d9625567f  src/canonical.rs
