@@ -35,7 +35,8 @@ const DEFAULT_SUFFIX: &[&str] = &[];
 #[derive(Clone)]
 pub struct AgentConfig {
     /// The owner's home: `secure_fs::trusted_home()` in a product, a temp
-    /// directory in a test. Also the engine's home.
+    /// directory in a test. Also the engine's home, and the home whose
+    /// install objects `Agent::uninstall` removes.
     pub trusted_home: PathBuf,
     /// The platform config and data directories the engine resolves
     /// clients against.
@@ -121,7 +122,7 @@ pub use imp::Agent;
 #[cfg(unix)]
 mod imp {
     use std::{
-        path::Path,
+        path::{Path, PathBuf},
         sync::{Arc, Mutex, OnceLock, PoisonError},
         thread,
     };
@@ -130,7 +131,7 @@ mod imp {
     use crate::{
         control::{ScanHook, ScanStatus},
         install::{self, Outcome},
-        merge::{Combined, PeerData, PeerPart, Report, combine},
+        merge::{Combined, FailureClass, PeerData, PeerPart, Report, classify, combine},
         pairing::Clock,
         peer_store::{PeerRecord, usable},
         report::{
@@ -152,8 +153,18 @@ mod imp {
         source: Arc<EngineSource>,
         root: Arc<SecureRoot>,
         clock: Arc<dyn Clock>,
+        /// `AgentConfig::trusted_home`: the home of the install objects
+        /// `uninstall` removes, the same one the secure root is below.
+        trusted_home: PathBuf,
         /// Serializes `approve_scope`.
         approving: Mutex<()>,
+        /// Serializes `pull_all`: the runtime's fetch limiter refuses
+        /// (`TooMany`) rather than waits, so overlapping calls would lose
+        /// pulls.
+        // ponytail: one lock; four endpoint calls wait in line, each
+        // bounded by `FETCH_DEADLINE` per batch. A per-peer limiter if that
+        // ever matters.
+        pulling: Mutex<()>,
     }
 
     impl std::fmt::Debug for Agent {
@@ -187,6 +198,7 @@ mod imp {
                     .map_or_else(ScanStatus::default, |source| source.scan_status())
             });
             let fill = Arc::clone(&slot);
+            let home = trusted_home.clone();
             let runtime = Runtime::start_with(
                 root,
                 move |root| {
@@ -214,7 +226,9 @@ mod imp {
                 runtime,
                 source,
                 clock,
+                trusted_home: home,
                 approving: Mutex::new(()),
+                pulling: Mutex::new(()),
             })
         }
 
@@ -272,10 +286,17 @@ mod imp {
         }
 
         /// Pulls `query` from every usable peer (`Runtime::pull`, at most
-        /// [`MAX_FETCHES`] at once, no retry); a failed pull falls back to
-        /// `Runtime::last_good`. Then [`combine`] with `local`, which the
-        /// caller computes itself.
+        /// [`MAX_FETCHES`] at once, no retry). A pull that failed without
+        /// the producer answering about authorization
+        /// ([`FailureClass::NoAnswer`]) falls back to `Runtime::last_good`;
+        /// a refusal or an invalid reply carries no data. Then [`combine`]
+        /// with `local`, which the caller computes itself. Calls are
+        /// serialized: a second call waits for the first.
+        ///
+        /// A caller's own concurrent `Runtime::pull` still competes for the
+        /// same fetch slots.
         pub fn pull_all(&self, query: &ReportQuery, local: Option<Report>) -> Combined {
+            let _pulling = self.pulling.lock().unwrap_or_else(PoisonError::into_inner);
             let store = self.runtime.store();
             let peers: Vec<PeerRecord> = self
                 .runtime
@@ -316,16 +337,18 @@ mod imp {
                     None,
                 ),
                 Err(error) => {
-                    let cached = self
-                        .runtime
-                        .last_good(&peer.responder_static, query)
-                        .ok()
-                        .flatten()
-                        .and_then(|cached| decode(query.endpoint, cached.body()));
-                    (
-                        cached.map_or(PeerData::None, PeerData::LastGood),
-                        Some(error),
-                    )
+                    let data = match classify(error) {
+                        FailureClass::NoAnswer => self
+                            .runtime
+                            .last_good(&peer.responder_static, query)
+                            .ok()
+                            .flatten()
+                            .and_then(|cached| decode(query.endpoint, cached.body()))
+                            .map_or(PeerData::None, PeerData::LastGood),
+                        FailureClass::Refused => PeerData::Refused,
+                        FailureClass::InvalidReply => PeerData::InvalidReply,
+                    };
+                    (data, Some(error))
                 }
             };
             PeerPart {
@@ -343,22 +366,22 @@ mod imp {
         /// cache is emptied, a failure there only marking `source_cache`
         /// for manual repair; then, if the purge removed the state,
         /// `source-scope.json`.
-        pub fn uninstall(
-            self,
-            purge: bool,
-            trusted_home: &Path,
-        ) -> Result<AgentUninstallReport, AgentError> {
+        ///
+        /// The install objects are looked for below the agent's own
+        /// `trusted_home` (from `AgentConfig`).
+        pub fn uninstall(self, purge: bool) -> Result<AgentUninstallReport, AgentError> {
             let Self {
                 runtime,
                 source,
                 root,
                 clock,
+                trusted_home,
                 ..
             } = self;
             drop(source);
             let store = runtime.into_store().map_err(AgentError::Storage)?;
             let terminal_at_ms = terminal_ms(&store, &*clock).map_err(AgentError::Storage)?;
-            let report = install::uninstall(store, trusted_home, purge, terminal_at_ms)
+            let report = install::uninstall(store, &trusted_home, purge, terminal_at_ms)
                 .map_err(AgentError::Install)?;
             let source_cache = match root.clear_private_subdir(SOURCE_CACHE_DIR) {
                 Ok(()) => Outcome::Removed,

@@ -14,9 +14,46 @@ use crate::{
         validate_agents_records, validate_graph_records, validate_hourly_records,
         validate_models_records,
     },
-    report_peer::Records,
+    report_peer::{FetchError, Records},
     runtime::PullError,
 };
+
+/// What a failed pull says about the producer's authorization of the
+/// cached body (`spec/agent-v1.md`, "Last-good fallback").
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FailureClass {
+    /// No answer about authorization: the cached body may still be used.
+    NoAnswer,
+    /// The producer answered and refused, or this side no longer has a
+    /// usable record: the cached body is not used.
+    Refused,
+    /// The producer's reply broke the protocol or the body failed
+    /// validation: the cached body is not used.
+    InvalidReply,
+}
+
+/// The fixed classification of every [`PullError`].
+pub fn classify(error: PullError) -> FailureClass {
+    match error {
+        PullError::NoPeer => FailureClass::Refused,
+        PullError::Fetch(error) => match error {
+            FetchError::TooMany
+            | FetchError::Busy
+            | FetchError::Timeout
+            | FetchError::Transport(_)
+            | FetchError::TooLarge
+            | FetchError::Memory
+            | FetchError::InvalidQuery => FailureClass::NoAnswer,
+            FetchError::Unusable
+            | FetchError::Expired
+            | FetchError::Revoked
+            | FetchError::CheckGrantStatus
+            | FetchError::Rejected
+            | FetchError::Internal => FailureClass::Refused,
+            FetchError::Protocol | FetchError::Invalid => FailureClass::InvalidReply,
+        },
+    }
+}
 
 /// One endpoint's records and whether their producer saturated a sum.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,8 +69,15 @@ pub enum PeerData {
     Fresh(Report),
     /// The receiver cache: the last successful pull, the pull now failed.
     LastGood(Report),
-    /// Nothing to show.
+    /// Nothing to show: the pull failed without an answer and no cached
+    /// body was found.
     None,
+    /// The pull was refused ([`FailureClass::Refused`]); a cached body is
+    /// not used.
+    Refused,
+    /// The reply was invalid ([`FailureClass::InvalidReply`]); a cached
+    /// body is not used.
+    InvalidReply,
 }
 
 /// One producer's contribution to [`combine`].
@@ -55,6 +99,10 @@ pub enum PartStatus {
     LastGood,
     /// No data; nothing merged.
     Unavailable,
+    /// The producer refused the pull; nothing merged.
+    Refused,
+    /// The producer's reply was invalid; nothing merged.
+    InvalidReply,
     /// Left out: the records are not of the endpoint, or fail the frozen
     /// `validate_*_records`.
     Invalid,
@@ -90,7 +138,7 @@ pub struct Combined {
 
 /// Merges `local` and `peers` for `endpoint`. The result does not depend
 /// on the order of `peers`: they are sorted by producer static, then
-/// `Fresh` before `LastGood` before `None`, then grant ID. Of the parts of
+/// `Fresh` before `LastGood` before the kinds without data, then grant ID. Of the parts of
 /// one producer only the first is considered, the others are
 /// `Duplicate`. A part whose records are not `endpoint`'s or fail the
 /// frozen validation is left out alone; the rest are merged.
@@ -130,6 +178,8 @@ pub fn combine(endpoint: Endpoint, local: Option<Report>, mut peers: Vec<PeerPar
                 PeerData::Fresh(report) => (Some(report), PartStatus::Fresh),
                 PeerData::LastGood(report) => (Some(report), PartStatus::LastGood),
                 PeerData::None => (None, PartStatus::Unavailable),
+                PeerData::Refused => (None, PartStatus::Refused),
+                PeerData::InvalidReply => (None, PartStatus::InvalidReply),
             };
             match report.map(&mut take) {
                 Some(false) => PartStatus::Invalid,
@@ -156,7 +206,7 @@ fn rank(data: &PeerData) -> u8 {
     match data {
         PeerData::Fresh(_) => 0,
         PeerData::LastGood(_) => 1,
-        PeerData::None => 2,
+        PeerData::None | PeerData::Refused | PeerData::InvalidReply => 2,
     }
 }
 

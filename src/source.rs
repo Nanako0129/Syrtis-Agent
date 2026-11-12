@@ -257,9 +257,10 @@ impl EngineSource {
     /// The scan fields of control `status`: when the last successful scan
     /// finished (Unix seconds, OS clock), whether the last scan succeeded,
     /// and the clients of the last successful scan, sorted and unique. A
-    /// scan is every `report` call that passed its first deadline check:
-    /// one refused by the scope check, or that fails or ends late, is
-    /// `error`.
+    /// scan is a `report` call that reached the engine: one that fails
+    /// there or ends late is `error`. A call refused before the engine (a
+    /// passed deadline, an unknown endpoint, a scope denial) is not a scan
+    /// and changes nothing here.
     pub fn scan_status(&self) -> ScanStatus {
         self.scan
             .lock()
@@ -290,12 +291,13 @@ impl EngineSource {
         )
     }
 
-    /// The body, and the clients of the whole bundle.
-    fn body(&self, request: &ReportRequest) -> Result<(Vec<u8>, BTreeSet<String>), SourceError> {
-        let endpoint = Endpoint::try_from(request.endpoint).map_err(|_| SourceError)?;
-        if !self.approved(request) {
-            return Err(SourceError);
-        }
+    /// The engine scan: the body, and the clients of the whole bundle. The
+    /// caller has checked the endpoint and the approved scope.
+    fn scan(
+        &self,
+        request: &ReportRequest,
+        endpoint: Endpoint,
+    ) -> Result<(Vec<u8>, BTreeSet<String>), SourceError> {
         let fingerprint = RemoteSourceContextV1::preview_fingerprint(
             &self.home,
             &self.config_dir,
@@ -362,12 +364,17 @@ impl EngineSource {
 
 impl ReportSource for EngineSource {
     /// Errors carry no path or engine text: every failure is [`SourceError`].
-    /// A deadline already passed is refused before anything is read.
+    /// A deadline already passed, an unknown endpoint or a scope denial is
+    /// refused before the engine runs, and is not recorded as a scan.
     fn report(&self, request: &ReportRequest, deadline: Instant) -> Result<Vec<u8>, SourceError> {
         if Instant::now() > deadline {
             return Err(SourceError);
         }
-        let result = self.body(request).and_then(|done| {
+        let endpoint = Endpoint::try_from(request.endpoint).map_err(|_| SourceError)?;
+        if !self.approved(request) {
+            return Err(SourceError);
+        }
+        let result = self.scan(request, endpoint).and_then(|done| {
             (Instant::now() <= deadline)
                 .then_some(done)
                 .ok_or(SourceError)

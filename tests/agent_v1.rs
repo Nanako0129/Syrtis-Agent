@@ -8,10 +8,47 @@
 //! unit test in `src/secure_fs/unix.rs`.
 
 use syrtis_agent::{
-    merge::{PartStatus, PeerData, PeerPart, Report, combine},
+    merge::{FailureClass, PartStatus, PeerData, PeerPart, Report, classify, combine},
+    noise::NoiseError,
     report::{Endpoint, GraphRecord},
-    report_peer::Records,
+    report_peer::{FetchError, Records},
+    runtime::PullError,
 };
+
+/// Review fix 2: the classification table of `spec/agent-v1.md`, entry
+/// for entry. Only `NoAnswer` falls back to the cached body.
+#[test]
+fn classify_matches_the_spec_table() {
+    use FailureClass::{InvalidReply, NoAnswer, Refused};
+    let table = [
+        (PullError::NoPeer, Refused),
+        (PullError::Fetch(FetchError::InvalidQuery), NoAnswer),
+        (PullError::Fetch(FetchError::Unusable), Refused),
+        (PullError::Fetch(FetchError::TooMany), NoAnswer),
+        (PullError::Fetch(FetchError::Expired), Refused),
+        (PullError::Fetch(FetchError::Revoked), Refused),
+        (PullError::Fetch(FetchError::CheckGrantStatus), Refused),
+        (PullError::Fetch(FetchError::Busy), NoAnswer),
+        (PullError::Fetch(FetchError::Internal), Refused),
+        (PullError::Fetch(FetchError::Rejected), Refused),
+        (
+            PullError::Fetch(FetchError::Transport(NoiseError::Io)),
+            NoAnswer,
+        ),
+        (
+            PullError::Fetch(FetchError::Transport(NoiseError::Crypto)),
+            NoAnswer,
+        ),
+        (PullError::Fetch(FetchError::Timeout), NoAnswer),
+        (PullError::Fetch(FetchError::Protocol), InvalidReply),
+        (PullError::Fetch(FetchError::Invalid), InvalidReply),
+        (PullError::Fetch(FetchError::Memory), NoAnswer),
+        (PullError::Fetch(FetchError::TooLarge), NoAnswer),
+    ];
+    for (error, class) in table {
+        assert_eq!(classify(error), class, "{error:?}");
+    }
+}
 
 fn graph(date: &str, client: &str, input: u64) -> GraphRecord {
     GraphRecord {
@@ -202,7 +239,7 @@ mod live {
     use serde_json::{Value, json};
     use syrtis_agent::{
         agent::{Agent, AgentConfig, AgentError, ScannerSettings},
-        control::{Client, Command, LISTEN_CONFIGURE, OFFER_CREATE, OK, STATUS},
+        control::{Client, Command, LISTEN_CONFIGURE, OFFER_CREATE, OK, REVOKE, STATUS},
         install::{self, Outcome},
         merge::{Combined, PartStatus},
         noise::StaticKey,
@@ -210,14 +247,14 @@ mod live {
         peer_store::PeerRecord,
         report::{
             AgentsRecord, Endpoint, GraphRecord, HourlyRecord, ModelsRecord, ReportRecord,
-            ReportRequest, decode_response,
+            ReportRequest, ReportResponse, decode_response, encode_response,
         },
-        report_peer::{FetchError, ReportQuery, ReportSource},
-        runtime::{Options, PullError, RuntimeError},
-        secure_fs::StorageError,
+        report_peer::{FetchError, ReportQuery, ReportSource, SourceError},
+        runtime::{Options, PullError, Runtime, RuntimeError},
+        secure_fs::{SecureRoot, StorageError},
         security::{
             AGGREGATION_REVISION, GrantState, MemoryLedger, PEER_PROTOCOL_VERSION,
-            REPORT_SCHEMA_VERSION, TZDB_REVISION,
+            REPORT_SCHEMA_VERSION, TZDB_REVISION, hex_encode,
         },
         source::{SCOPE_FILE, SOURCE_CACHE_DIR},
         state_store::Secret32,
@@ -381,20 +418,11 @@ mod live {
             .port()
     }
 
-    fn call(agent: &Agent, id: u16, body: Value) -> Value {
-        let token = *agent
-            .runtime()
-            .store()
-            .state()
-            .unwrap()
-            .control_token
-            .expose();
-        let reply = Client::new(
-            Secret32::new(token),
-            agent.runtime().socket_path().to_path_buf(),
-        )
-        .call(&Command { id, body })
-        .unwrap();
+    fn call(runtime: &Runtime, id: u16, body: Value) -> Value {
+        let token = *runtime.store().state().unwrap().control_token.expose();
+        let reply = Client::new(Secret32::new(token), runtime.socket_path().to_path_buf())
+            .call(&Command { id, body })
+            .unwrap();
         assert_eq!(reply.code, OK);
         reply.data
     }
@@ -404,7 +432,7 @@ mod live {
         write_sessions(&home.0);
         let agent = start(home, clock, ScannerSettings::default());
         call(
-            &agent,
+            agent.runtime(),
             LISTEN_CONFIGURE,
             json!({"bindHost": LOOPBACK, "bindPort": free_port()}),
         );
@@ -413,8 +441,8 @@ mod live {
 
     /// Pairs `receiver` with `producer` (sharing turned on first if off);
     /// returns the producer's static key.
-    fn pair(producer: &Agent, receiver: &Agent, clock: &TestClock) -> [u8; 32] {
-        let _ = producer.runtime().enable_sharing();
+    fn pair(producer: &Runtime, receiver: &Agent, clock: &TestClock) -> [u8; 32] {
+        let _ = producer.enable_sharing();
         let url = call(producer, OFFER_CREATE, json!({"ttlSeconds": 600}))["pairUrl"]
             .as_str()
             .unwrap()
@@ -430,7 +458,7 @@ mod live {
         let claimed = client
             .claim(&url, now * 1_000, &mut ClaimAttempts::default())
             .unwrap();
-        approve(producer.runtime().store(), claimed.pending_id, 1, true, now).unwrap();
+        approve(producer.store(), claimed.pending_id, 1, true, now).unwrap();
         let confirmed = client.poll(&claimed).unwrap();
         receiver
             .runtime()
@@ -561,7 +589,7 @@ mod live {
         let producer = producer(&producer_home, &clock);
         producer.approve_scope().unwrap();
         let receiver = start(&receiver_home, &clock, ScannerSettings::default());
-        let producer_static = pair(&producer, &receiver, &clock);
+        let producer_static = pair(producer.runtime(), &receiver, &clock);
 
         for endpoint in ENDPOINTS {
             let combined = pull_all(&receiver, &clock, endpoint);
@@ -588,13 +616,10 @@ mod live {
         );
         assert!(graph.iter().any(|r| r.client == "codex"));
 
-        producer.uninstall(false, &producer_home.0).unwrap();
+        producer.uninstall(false).unwrap();
         let producer = start(&producer_home, &clock, ScannerSettings::default());
         let combined = pull_all(&receiver, &clock, Endpoint::Graph);
-        assert_eq!(
-            status_of(&combined, &producer_static),
-            PartStatus::Unavailable
-        );
+        assert_eq!(status_of(&combined, &producer_static), PartStatus::Refused);
         assert!(is_empty(&combined));
         assert_eq!(
             combined.peers[0].error,
@@ -625,7 +650,7 @@ mod live {
         let producer = producer(&producer_home, &clock);
         producer.approve_scope().unwrap();
         let receiver = start(&receiver_home, &clock, ScannerSettings::default());
-        let producer_static = pair(&producer, &receiver, &clock);
+        let producer_static = pair(producer.runtime(), &receiver, &clock);
         let fresh = pull_all(&receiver, &clock, Endpoint::Models);
         assert_eq!(status_of(&fresh, &producer_static), PartStatus::Fresh);
         drop(producer);
@@ -647,12 +672,9 @@ mod live {
         let producer = producer(&producer_home, &clock);
         let receiver = start(&receiver_home, &clock, ScannerSettings::default());
         assert!(!producer.scope_approved());
-        let producer_static = pair(&producer, &receiver, &clock);
+        let producer_static = pair(producer.runtime(), &receiver, &clock);
         let refused = pull_all(&receiver, &clock, Endpoint::Graph);
-        assert_eq!(
-            status_of(&refused, &producer_static),
-            PartStatus::Unavailable
-        );
+        assert_eq!(status_of(&refused, &producer_static), PartStatus::Refused);
         assert!(is_empty(&refused));
 
         let before = generation(&producer);
@@ -662,12 +684,12 @@ mod live {
         let old_grant = pull_all(&receiver, &clock, Endpoint::Graph);
         assert_eq!(
             status_of(&old_grant, &producer_static),
-            PartStatus::Unavailable,
+            PartStatus::Refused,
             "a grant made before the first approval still reads"
         );
         assert!(is_empty(&old_grant));
 
-        pair(&producer, &receiver, &clock);
+        pair(producer.runtime(), &receiver, &clock);
         let paired = pull_all(&receiver, &clock, Endpoint::Graph);
         assert_eq!(status_of(&paired, &producer_static), PartStatus::Fresh);
         assert!(!is_empty(&paired));
@@ -684,7 +706,7 @@ mod live {
         let producer = producer(&producer_home, &clock);
         producer.approve_scope().unwrap();
         let receiver = start(&receiver_home, &clock, ScannerSettings::default());
-        let producer_static = pair(&producer, &receiver, &clock);
+        let producer_static = pair(producer.runtime(), &receiver, &clock);
         assert_eq!(
             status_of(
                 &pull_all(&receiver, &clock, Endpoint::Graph),
@@ -702,12 +724,21 @@ mod live {
         };
         let producer = start(&producer_home, &clock, settings);
         assert!(!producer.scope_approved());
-        assert_ne!(
-            status_of(
-                &pull_all(&receiver, &clock, Endpoint::Graph),
-                &producer_static
-            ),
-            PartStatus::Fresh
+        // The producer answers `internal` (its source denies): a refusal,
+        // so the cached body that is still there is not used.
+        let denied = pull_all(&receiver, &clock, Endpoint::Graph);
+        assert_eq!(status_of(&denied, &producer_static), PartStatus::Refused);
+        assert_eq!(
+            denied.peers[0].error,
+            Some(PullError::Fetch(FetchError::Internal))
+        );
+        assert!(is_empty(&denied));
+        assert!(
+            receiver
+                .runtime()
+                .last_good(&producer_static, &query(Endpoint::Graph))
+                .unwrap()
+                .is_some()
         );
         assert!(
             producer
@@ -729,7 +760,7 @@ mod live {
             "the grant from before the change still reads"
         );
 
-        pair(&producer, &receiver, &clock);
+        pair(producer.runtime(), &receiver, &clock);
         assert_eq!(
             status_of(
                 &pull_all(&receiver, &clock, Endpoint::Graph),
@@ -781,41 +812,184 @@ mod live {
         assert!(producer.scope_approved());
         assert_eq!(generation(&producer), after_reset);
         let receiver = start(&receiver_home, &clock, ScannerSettings::default());
-        let producer_static = pair(&producer, &receiver, &clock);
+        let producer_static = pair(producer.runtime(), &receiver, &clock);
         let pulled = pull_all(&receiver, &clock, Endpoint::Graph);
         assert_eq!(status_of(&pulled, &producer_static), PartStatus::Fresh);
         assert!(!is_empty(&pulled));
     }
 
-    /// Acceptance (7): control `status` reports `never` before any scan,
-    /// `ok` with `lastScanAt` and the fixture's client families after one,
-    /// `error` after a refused one (keeping the last success's fields).
+    /// Acceptance (7) and review fix 3: control `status` reports `never`
+    /// before any scan, also after pulls refused by the scope check; `ok`
+    /// with `lastScanAt` and the fixture's client families after a scan;
+    /// a later denial leaves `ok`; an engine failure is `error`, keeping
+    /// the last success's fields.
     #[test]
     fn status_reports_never_then_ok_then_error() {
         let clock = TestClock::new();
         let (producer_home, receiver_home) = (TempHome::new(), TempHome::new());
         let producer = producer(&producer_home, &clock);
-        let status = call(&producer, STATUS, json!({}));
-        assert_eq!(status["scanStatus"], "never");
-        assert_eq!(status["lastScanAt"], Value::Null);
-        assert_eq!(status["sourceFamilies"], json!([]));
+        let never = |producer: &Agent| {
+            let status = call(producer.runtime(), STATUS, json!({}));
+            assert_eq!(status["scanStatus"], "never");
+            assert_eq!(status["lastScanAt"], Value::Null);
+            assert_eq!(status["sourceFamilies"], json!([]));
+        };
+        never(&producer);
+        // A pull before the owner approved is a scope denial, not a scan.
+        let receiver = start(&receiver_home, &clock, ScannerSettings::default());
+        pair(producer.runtime(), &receiver, &clock);
+        let denied = pull_all(&receiver, &clock, Endpoint::Agents);
+        assert_eq!(denied.peers[0].status, PartStatus::Refused);
+        never(&producer);
 
         producer.approve_scope().unwrap();
-        let receiver = start(&receiver_home, &clock, ScannerSettings::default());
-        pair(&producer, &receiver, &clock);
+        pair(producer.runtime(), &receiver, &clock);
         pull_all(&receiver, &clock, Endpoint::Agents);
-        let status = call(&producer, STATUS, json!({}));
+        let status = call(producer.runtime(), STATUS, json!({}));
         assert_eq!(status["scanStatus"], "ok");
         let at = status["lastScanAt"].as_i64().unwrap();
         assert!(at >= 1_700_000_000, "{at}");
         assert_eq!(status["sourceFamilies"], json!(["claude", "codex"]));
 
+        // A denial after a success leaves `ok` too.
         let wrong = request(Endpoint::Graph, generation(&producer) + 7);
         assert!(producer.source().report(&wrong, far()).is_err());
-        let status = call(&producer, STATUS, json!({}));
+        assert_eq!(
+            call(producer.runtime(), STATUS, json!({}))["scanStatus"],
+            "ok"
+        );
+
+        // An engine call that fails (a timezone the engine does not know)
+        // is a failed scan.
+        let mut unknown_zone = request(Endpoint::Graph, generation(&producer));
+        unknown_zone.timezone = "Nowhere/Atlantis".into();
+        assert!(producer.source().report(&unknown_zone, far()).is_err());
+        let status = call(producer.runtime(), STATUS, json!({}));
         assert_eq!(status["scanStatus"], "error");
         assert_eq!(status["lastScanAt"].as_i64(), Some(at));
         assert_eq!(status["sourceFamilies"], json!(["claude", "codex"]));
+    }
+
+    /// Review fix 2: a producer that answers and refuses is not covered by
+    /// the cached body, which is still there. Here the refusal is
+    /// `unauthorized` (`CheckGrantStatus`): revoking another receiver's
+    /// grant renumbered this grant's `authEpoch`, so this record is stale.
+    #[test]
+    fn a_refused_pull_does_not_fall_back_to_the_cached_body() {
+        let clock = TestClock::new();
+        let (producer_home, receiver_home, other_home) =
+            (TempHome::new(), TempHome::new(), TempHome::new());
+        let producer = producer(&producer_home, &clock);
+        producer.approve_scope().unwrap();
+        let receiver = start(&receiver_home, &clock, ScannerSettings::default());
+        let producer_static = pair(producer.runtime(), &receiver, &clock);
+        let fresh = pull_all(&receiver, &clock, Endpoint::Hourly);
+        assert_eq!(status_of(&fresh, &producer_static), PartStatus::Fresh);
+
+        let other = start(&other_home, &clock, ScannerSettings::default());
+        pair(producer.runtime(), &other, &clock);
+        let other_grant = other.runtime().peers().peers().unwrap()[0].grant_id;
+        call(
+            producer.runtime(),
+            REVOKE,
+            json!({"grantId": hex_encode(&other_grant)}),
+        );
+
+        let refused = pull_all(&receiver, &clock, Endpoint::Hourly);
+        assert_eq!(status_of(&refused, &producer_static), PartStatus::Refused);
+        assert_eq!(
+            refused.peers[0].error,
+            Some(PullError::Fetch(FetchError::CheckGrantStatus))
+        );
+        assert!(is_empty(&refused));
+        assert!(
+            receiver
+                .runtime()
+                .last_good(&producer_static, &query(Endpoint::Hourly))
+                .unwrap()
+                .is_some(),
+            "the cached body is still there"
+        );
+    }
+
+    /// A source that answers each request with an empty report of its
+    /// endpoint after 200 ms, then moves the clock 61 s on, so the grant's
+    /// rate tokens refill for the next request.
+    struct Slow(Arc<TestClock>);
+
+    impl ReportSource for Slow {
+        fn report(&self, request: &ReportRequest, _: Instant) -> Result<Vec<u8>, SourceError> {
+            thread::sleep(Duration::from_millis(200));
+            self.0.advance(61);
+            fn empty<R: ReportRecord>(request: &ReportRequest) -> Result<Vec<u8>, SourceError> {
+                encode_response(&ReportResponse::<R>::from_request(
+                    request,
+                    Vec::new(),
+                    false,
+                ))
+                .map_err(|_| SourceError)
+            }
+            match Endpoint::try_from(request.endpoint).map_err(|_| SourceError)? {
+                Endpoint::Graph => empty::<GraphRecord>(request),
+                Endpoint::Models => empty::<ModelsRecord>(request),
+                Endpoint::Hourly => empty::<HourlyRecord>(request),
+                Endpoint::Agents => empty::<AgentsRecord>(request),
+            }
+        }
+    }
+
+    /// Review fix 1: four `pull_all` calls at once, one per endpoint, all
+    /// get a fresh part: they queue instead of competing for the
+    /// runtime's two fetch slots (`TooMany`).
+    #[test]
+    fn concurrent_pull_all_calls_queue_and_all_get_fresh_parts() {
+        let clock = TestClock::new();
+        let (producer_home, receiver_home) = (TempHome::new(), TempHome::new());
+        let options = Options {
+            clock: Arc::clone(&clock) as Arc<dyn Clock>,
+            housekeeping_period: Duration::from_secs(60),
+        };
+        let mut tries = 0;
+        let producer = loop {
+            let started = SecureRoot::open_under(&producer_home.0, SUFFIX)
+                .map_err(RuntimeError::Store)
+                .and_then(|root| {
+                    Runtime::start(root, Arc::new(Slow(Arc::clone(&clock))), options.clone())
+                });
+            match started {
+                Err(RuntimeError::Store(StorageError::Busy)) if tries < 200 => {
+                    tries += 1;
+                    thread::sleep(Duration::from_millis(10));
+                }
+                other => break other.unwrap(),
+            }
+        };
+        call(
+            &producer,
+            LISTEN_CONFIGURE,
+            json!({"bindHost": LOOPBACK, "bindPort": free_port()}),
+        );
+        let receiver = start(&receiver_home, &clock, ScannerSettings::default());
+        let producer_static = pair(&producer, &receiver, &clock);
+
+        let barrier = std::sync::Barrier::new(ENDPOINTS.len());
+        let results: Vec<Combined> = thread::scope(|scope| {
+            let running: Vec<_> = ENDPOINTS
+                .iter()
+                .map(|endpoint| {
+                    let (receiver, barrier) = (&receiver, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        receiver.pull_all(&query(*endpoint), None)
+                    })
+                })
+                .collect();
+            running.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for combined in &results {
+            assert_eq!(combined.peers[0].error, None);
+            assert_eq!(status_of(combined, &producer_static), PartStatus::Fresh);
+        }
     }
 
     /// The installed stand-in for the running binary.
@@ -831,7 +1005,7 @@ mod live {
         let producer = producer(producer_home, clock);
         producer.approve_scope().unwrap();
         let receiver = start(receiver_home, clock, ScannerSettings::default());
-        pair(&producer, &receiver, clock);
+        pair(producer.runtime(), &receiver, clock);
         pull_all(&receiver, clock, Endpoint::Graph);
         fs::create_dir_all(producer_home.source_cache().join("nested")).unwrap();
         fs::write(
@@ -853,7 +1027,7 @@ mod live {
         let clock = TestClock::new();
         let (producer_home, receiver_home) = (TempHome::new(), TempHome::new());
         let producer = served(&producer_home, &receiver_home, &clock);
-        let report = producer.uninstall(false, &producer_home.0).unwrap();
+        let report = producer.uninstall(false).unwrap();
         assert_eq!(report.install.binary, Outcome::Removed);
         assert_eq!(report.install.autostart, Outcome::Removed);
         assert_eq!(report.source_cache, Outcome::Removed);
@@ -881,7 +1055,7 @@ mod live {
             .unwrap()
             .identity_public()
             .unwrap();
-        let report = producer.uninstall(true, &producer_home.0).unwrap();
+        let report = producer.uninstall(true).unwrap();
         assert!(report.install.purged && report.scope_removed);
         assert!(!report.manual_repair());
         assert!(!producer_home.root().join(SCOPE_FILE).exists());
@@ -909,7 +1083,7 @@ mod live {
         let producer = served(&producer_home, &receiver_home, &clock);
         let handle = Arc::clone(producer.runtime().store());
         assert_eq!(
-            producer.uninstall(true, &producer_home.0).err(),
+            producer.uninstall(true).err(),
             Some(AgentError::Storage(StorageError::Busy))
         );
         assert!(producer_home.root().join(SCOPE_FILE).exists());
@@ -943,7 +1117,7 @@ mod live {
         fs::rename(&cache, producer_home.0.join("moved-cache")).unwrap();
         symlink(&decoy, &cache).unwrap();
 
-        let report = producer.uninstall(false, &producer_home.0).unwrap();
+        let report = producer.uninstall(false).unwrap();
         assert_eq!(report.source_cache, Outcome::ManualRepair);
         assert!(report.manual_repair());
         assert_eq!(fs::read(decoy.join("keep")).unwrap(), b"decoy");
