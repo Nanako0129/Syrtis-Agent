@@ -17,7 +17,7 @@ This document records deterministic SA-0 security reference behavior. All random
 | Unicode normalization | `0.1.25`; checksum `5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8`; MIT OR Apache-2.0; MSRV 1.36 |
 | Independent oracle | `x25519-dalek 2.0.1`, `chacha20poly1305 0.10.1`, and `blake2 0.10.6`; default features off; test-only |
 | Official vector | Snow crate `tests/vectors/snow.txt`, protocol `Noise_IK_25519_ChaChaPoly_BLAKE2s` |
-| Formatted test module SHA-256 | `ebd252b480cbe30406708823f175be036929903282101ab044bc95cfdaa7347d` |
+| Formatted test module SHA-256 | `b6cc125da6f193188e02b44046eade512787ccbdd978addce5fbd8eacb07a7fa` |
 | Oracle golden | `tests/fixtures/v1/security/noise_ik_oracle.hex` |
 
 The independent `tests/security_contract_v1.rs::independent_noise_ik_oracle` implements IK symmetric-state hashing, BLAKE2s HMAC/HKDF, X25519, and ChaCha20Poly1305 directly. It does not call `snow`. The test first reproduces the official Snow vector, then compares both implementations under the Syrtis prologue through exact message 1, message 2, and `hFinal` bytes.
