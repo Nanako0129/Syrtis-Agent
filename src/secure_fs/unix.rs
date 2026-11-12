@@ -42,6 +42,10 @@ use super::seams;
 pub struct SecureRoot {
     dir: File,
     _lock: File,
+    /// `home/suffix…` as passed to [`SecureRoot::open_under`]. Recorded for
+    /// one use only, the control socket (`spec/control-v1.md`); nothing in
+    /// this module ever reopens anything by it.
+    path: PathBuf,
 }
 
 /// A temp file written and synced, not yet renamed over its target.
@@ -110,6 +114,9 @@ impl SecureRoot {
     /// and not group- or other-writable; the last one, the agent root, must be
     /// exactly `0700` on a local filesystem.
     pub fn open_under(home: &Path, suffix: &[&str]) -> Result<Self, StorageError> {
+        let path = suffix
+            .iter()
+            .fold(home.to_path_buf(), |path, part| path.join(part));
         let home = home.as_os_str().as_bytes();
         if !absolute(home) || suffix.is_empty() {
             return Err(StorageError::UnsafeState);
@@ -194,7 +201,17 @@ impl SecureRoot {
         #[cfg(target_os = "macos")]
         set_backup_exclude(&dir)?;
         let lock = acquire_lock(&dir)?;
-        Ok(Self { dir, _lock: lock })
+        Ok(Self {
+            dir,
+            _lock: lock,
+            path,
+        })
+    }
+
+    /// The root's path as opened. Read-only; for the control socket, the
+    /// one sanctioned pathname use after the checks (`spec/control-v1.md`).
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Reads an agent-owned file: no-follow, regular, owned by the effective
