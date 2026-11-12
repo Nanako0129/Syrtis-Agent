@@ -52,17 +52,22 @@
 # receiver acceptance map. spec/peer-store-v1.md changed on purpose: the
 # grant guards (set_state and update_grant name the grantId, upsert refuses
 # a lower authEpoch) and from_confirmed taking host and port from the grant.
+#
+# SA-0F amended the SA-0 contract on purpose: the control `status` success
+# data may carry `null` for `bindHost` and `nodeLabel` (not configured yet),
+# so a fresh install can answer `status`. spec/v1.md, src/security.rs,
+# tests/security_contract_v1.rs and spec/security-v1.md carry new digests.
 7fcd1eefd06566e9de262fa2645f289025cac7e52a0b050fa12c7533d12281ea  spec/pairing-v1.md
 686951d4a0d463d5a29d5d3e9d2be97198211cba3ab81202da66643c1c79e6bc  spec/report-peer-v1.md
 3cce5944bf106ca5e5503505f3b4150f192eead0db3f9b1a3fdaf3617ae1c59b  spec/peer-store-v1.md
 79d1c0363e4576d67827ebfa029fad7e3a5981474f4aafba3bd71e54f1a98172  spec/report-cache-v1.md
-3e0b75e33fd362eab1040254de8f656e3a1bf855e0f3c008915b33e3ec2ee523  spec/security-v1.md
+4234cdfdf319cf41907cbd34273067a3895473d84c4ab85d430bc2cbbe8791c0  spec/security-v1.md
 ea302173340ae0dfb6f2a421326e7e178d2454bcab45ac28d74b144c1f17890e  spec/state-store-v1.md
-f5b4d69266081285fe32b1eccb754715ebe89446f5af902c99b6bbada3309510  spec/v1.md
+3cf43045cdc3ff2f6989a479ecc6f84a8de0e9568e221bd00ce74454345fcde2  spec/v1.md
 ff21cbcfdd6aedfb68ac1b3cfda056663203f2c7f08fd05a856dc5dbe5e4c25a  src/cache.rs
 8b0add8d4fde2253edebdddd448d381559d63ff630f0e9d2f9faad8d9625567f  src/canonical.rs
 e3f35e33b4b26bab06e243d14eb087b5b2405a3b093a6a744cc84a5a36573ab0  src/report.rs
-5a93a71c1728ad9f6562e89a8187da08d34a09721d7f814e4d564670747de74e  src/security.rs
+3960f1c52ce6edb2409aa4b370649b4d2f8ed4b74396a028ac1798b1e9eb6434  src/security.rs
 80b495608d9c3add30cae81454f32bb66459f652d2a039c5d5c9d99dac10955d  tests/dependency_provenance_v1.rs
 e01e9d55a26fb4f807ff0baea4a9681b0cbbb86b61f6b00fe5c49d919a2ebb10  tests/fixtures/v1/cache/body.sha256
 edb92226baac009e4c7779cb2c7a7369049e0ea97615945f8e64378322785b19  tests/fixtures/v1/cache/filename.txt
@@ -86,4 +91,4 @@ cd289e2421e745c59b5798ffc29fcecb02836444f77e816794d62e6f4a2a688e  tests/fixtures
 94653acee749d3612203b35dc400df8d7c4a93272af47f2cdeb10d2f6e14cb00  tests/fixtures/v1/security/state_transitions.json
 cbd942c4fd168b5d78fbfc469acd06cb62f77c026fcbc256285c6c7d9680fdd1  tests/fixtures/v1/security/uninstall.json
 39c2823d68bf6de7854574899b606167897c21292037b8ed359b19fe2e08062c  tests/report_cache_v1.rs
-b6cc125da6f193188e02b44046eade512787ccbdd978addce5fbd8eacb07a7fa  tests/security_contract_v1.rs
+b5d5ed7cab7e0046e7ec82e1c4825f1ddac075b3b6bd18aab69f323e69e45c89  tests/security_contract_v1.rs

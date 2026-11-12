@@ -626,9 +626,20 @@ fn validate_status_data(data: &Value) -> Result<(), SecurityError> {
         integer(object, key)?;
     }
     let port = integer(object, "bindPort")?;
+    // `null` means "not configured yet"; a string keeps the original rule.
+    let host_ok = match object.get("bindHost") {
+        Some(Value::Null) => true,
+        Some(Value::String(host)) => canonical_host(host),
+        _ => false,
+    };
+    let label_ok = match object.get("nodeLabel") {
+        Some(Value::Null) => true,
+        Some(Value::String(label)) => label.len() <= 128,
+        _ => false,
+    };
     if !(1024..=65535).contains(&port)
-        || !canonical_host(string(object, "bindHost")?)
-        || string(object, "nodeLabel")?.len() > 128
+        || !host_ok
+        || !label_ok
         || !matches!(string(object, "scanStatus")?, "never" | "ok" | "error")
         || object
             .get("sharingEnabled")
