@@ -431,6 +431,34 @@ mod disk {
         assert_eq!(last_good(), None);
     }
 
+    /// A clock anomaly (here a jump far past the entry's expiry) neither
+    /// reads nor deletes the entry: `last_good` is `None` while it lasts and
+    /// the same body is back once the clock is sane again.
+    #[test]
+    fn a_clock_anomaly_does_not_read_or_delete_the_cache() {
+        let pair = pair(Some(NOW_MS + 120_000), SLOW);
+        let body = pair.pull().unwrap();
+        let Pair {
+            receiver,
+            producer,
+            producer_static,
+            ..
+        } = pair;
+        drop(producer);
+        let last_good = || {
+            receiver
+                .runtime
+                .last_good(&producer_static, &query())
+                .unwrap()
+                .map(|cached| cached.body().to_vec())
+        };
+        receiver.clock.set_os(NOW + 10 * 86_400);
+        assert_eq!(last_good(), None);
+        assert_eq!(receiver.home.rcache().len(), 1);
+        receiver.clock.set_os(NOW + 100);
+        assert_eq!(last_good(), Some(body));
+    }
+
     /// Acceptance (4): `Busy` (the grant's rate tokens spent) and a
     /// connect failure (the producer gone) leave the cache alone.
     #[test]

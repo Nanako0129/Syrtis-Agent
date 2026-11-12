@@ -566,7 +566,9 @@ fn cache_key(record: &PeerRecord, query: &ReportQuery) -> CacheKey {
 }
 
 /// `max(osNow, lastAcceptedWall)` in ms; `None` when the clock or the
-/// state is unreadable.
+/// state is unreadable, or while the clock is anomalous: a cache read at a
+/// wrong time would delete entries that are still valid, and a write would
+/// stamp them with it. Housekeeping skips such a round for the same reason.
 fn effective_now_ms(inner: &Inner) -> Option<i64> {
     let os_now = inner.clock.os_now_seconds().ok()?;
     let wall = inner
@@ -575,7 +577,11 @@ fn effective_now_ms(inner: &Inner) -> Option<i64> {
         .ok()?
         .reference
         .last_accepted_wall_unix_seconds();
-    clock_status(os_now, wall).effective_now.checked_mul(1_000)
+    let status = clock_status(os_now, wall);
+    if status.anomaly {
+        return None;
+    }
+    status.effective_now.checked_mul(1_000)
 }
 
 /// A terminal record's timestamp: the effective now, or the durable wall
