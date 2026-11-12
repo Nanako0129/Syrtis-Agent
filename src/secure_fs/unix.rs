@@ -283,6 +283,170 @@ impl SecureRoot {
         }
     }
 
+    /// Reads an agent-owned file under the checks of [`Self::read_file`]
+    /// into one buffer of exactly `size + 1` bytes, allocated before the
+    /// first read and never grown, so the buffer's capacity is the
+    /// `size + 1` the caller reserved. More than `size` bytes is `Corrupt`;
+    /// a failed allocation is `Unavailable`. `Ok(None)` when absent.
+    pub(crate) fn read_file_sized(
+        &self,
+        name: &str,
+        size: usize,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let name = file_name(name)?;
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK | nofollow();
+        let fd = unsafe { libc::openat(self.dir.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+            return Ok(None);
+        }
+        let file = file_from(fd)?;
+        check_private_file(&file)?;
+        let capacity = size.checked_add(1).ok_or(StorageError::Corrupt)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| StorageError::Unavailable)?;
+        bytes.resize(capacity, 0);
+        let mut filled = 0;
+        while filled < capacity {
+            match (&file).read(&mut bytes[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return Err(StorageError::UnsafeState),
+            }
+        }
+        bytes.truncate(filled);
+        guard(filled <= size, BYTE_CAP, StorageError::Corrupt)?;
+        Ok(Some(bytes))
+    }
+
+    /// The entries whose name starts with `prefix` (one of
+    /// [`CACHE_PREFIXES`](super::CACHE_PREFIXES), else `Refused(Invalid)`),
+    /// with their sizes, sorted by name. Every such entry is checked with a
+    /// no-follow `fstatat` on the root descriptor: a regular file owned by
+    /// the effective UID, mode `0600`, one link, and a valid agent file
+    /// name. One that fails makes the whole call `UnsafeState`; nothing is
+    /// opened, followed or removed. Other entries are only counted: more
+    /// than [`LIST_ENTRIES_MAX`](super::LIST_ENTRIES_MAX) is `UnsafeState`.
+    /// Temp files (`.<name>.tmp`) never carry the prefix, so never appear.
+    pub(crate) fn list(&self, prefix: &str) -> Result<Vec<(String, u64)>, StorageError> {
+        super::cache_prefix(prefix)?;
+        let mut listed = Vec::new();
+        for name in self.entries()? {
+            if !name.starts_with(prefix.as_bytes()) {
+                continue;
+            }
+            let path = CString::new(name.clone()).map_err(|_| StorageError::UnsafeState)?;
+            let stat = stat_at(&self.dir, &path)?;
+            guard(
+                (stat.st_mode & libc::S_IFMT) == libc::S_IFREG,
+                0,
+                StorageError::UnsafeState,
+            )?;
+            #[cfg(test)]
+            let forced = seams::forced_foreign(seams::FILE);
+            #[cfg(not(test))]
+            let forced = false;
+            guard(
+                stat.st_uid == unsafe { libc::geteuid() } && !forced,
+                OWNER,
+                StorageError::UnsafeState,
+            )?;
+            guard(
+                (stat.st_mode & 0o7777) == 0o600,
+                MODE,
+                StorageError::UnsafeState,
+            )?;
+            guard(stat.st_nlink == 1, NLINK, StorageError::UnsafeState)?;
+            let text = String::from_utf8(name).map_err(|_| StorageError::UnsafeState)?;
+            file_name(&text)?;
+            let size = u64::try_from(stat.st_size).map_err(|_| StorageError::UnsafeState)?;
+            listed.push((text, size));
+        }
+        listed.sort();
+        Ok(listed)
+    }
+
+    /// `unlinkat` of one agent file (never follows a link), then a sync of
+    /// the root directory. An absent file is success. Either step failing
+    /// is `Unknown`. Both run through `shim` (`Step::Unlink`,
+    /// `Step::SyncDir`).
+    pub(crate) fn remove_file(&self, name: &str) -> Result<(), StorageError> {
+        let name = file_name(name)?;
+        let dir = self.dir.as_raw_fd();
+        shim(Step::Unlink, || {
+            cvt(unsafe { libc::unlinkat(dir, name.as_ptr(), 0) }).or_else(|error| {
+                if error.raw_os_error() == Some(libc::ENOENT) {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            })
+        })
+        .map_err(|_| StorageError::Unknown)?;
+        shim(Step::SyncDir, || full_sync(&self.dir)).map_err(|_| StorageError::Unknown)
+    }
+
+    /// Removes every temp file `.<prefix>….tmp` left by a crash, `prefix`
+    /// one of [`CACHE_PREFIXES`](super::CACHE_PREFIXES) (else
+    /// `Refused(Invalid)`). `unlinkat` only, which never follows a link; a
+    /// removal failing for any reason other than `ENOENT` is `UnsafeState`.
+    pub(crate) fn remove_stale_temps(&self, prefix: &str) -> Result<(), StorageError> {
+        super::cache_prefix(prefix)?;
+        let lead = format!(".{prefix}");
+        for name in self.entries()? {
+            if !(name.starts_with(lead.as_bytes()) && name.ends_with(b".tmp")) {
+                continue;
+            }
+            let temp = CString::new(name).map_err(|_| StorageError::UnsafeState)?;
+            if unsafe { libc::unlinkat(self.dir.as_raw_fd(), temp.as_ptr(), 0) } != 0
+                && io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT)
+            {
+                return Err(StorageError::UnsafeState);
+            }
+        }
+        Ok(())
+    }
+
+    /// Every entry name of the root except `.` and `..`, read through a
+    /// fresh descriptor of the root (`openat(dir, ".")`), so concurrent
+    /// listings never share a directory offset. More than
+    /// [`LIST_ENTRIES_MAX`](super::LIST_ENTRIES_MAX) is `UnsafeState`.
+    fn entries(&self) -> Result<Vec<Vec<u8>>, StorageError> {
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+        let fd = unsafe { libc::openat(self.dir.as_raw_fd(), c".".as_ptr(), flags) };
+        let fd = file_from(fd)?;
+        let stream = unsafe { libc::fdopendir(fd.as_raw_fd()) };
+        if stream.is_null() {
+            return Err(StorageError::UnsafeState);
+        }
+        // `closedir` now owns the descriptor.
+        std::mem::forget(fd);
+        let mut names = Vec::new();
+        let result = loop {
+            unsafe { *errno_location() = 0 };
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                break if io::Error::last_os_error().raw_os_error() == Some(0) {
+                    Ok(names)
+                } else {
+                    Err(StorageError::UnsafeState)
+                };
+            }
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            if names.len() == super::LIST_ENTRIES_MAX {
+                break Err(StorageError::UnsafeState);
+            }
+            names.push(name.to_vec());
+        };
+        unsafe { libc::closedir(stream) };
+        result
+    }
+
     #[cfg(test)]
     pub(crate) fn dir_metadata(&self) -> Metadata {
         self.dir.metadata().unwrap()
@@ -741,6 +905,30 @@ fn full_sync(file: &File) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 fn full_sync(file: &File) -> io::Result<()> {
     cvt(unsafe { libc::fsync(file.as_raw_fd()) })
+}
+
+/// `fstatat(dir, name)` without following a final link (unless a test
+/// bypasses `NOFOLLOW`).
+fn stat_at(dir: &File, name: &CStr) -> Result<libc::stat, StorageError> {
+    let follow = if nofollow() == 0 {
+        0
+    } else {
+        libc::AT_SYMLINK_NOFOLLOW
+    };
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    cvt(unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), &mut stat, follow) })
+        .map_err(|_| StorageError::UnsafeState)?;
+    Ok(stat)
+}
+
+#[cfg(target_os = "macos")]
+fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+#[cfg(target_os = "linux")]
+fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
 }
 
 fn metadata(file: &File) -> Result<Metadata, StorageError> {
@@ -1639,6 +1827,192 @@ mod tests {
                 Step::SyncParent(2),
             ]
         );
+    }
+
+    // SA-2B3a acceptance (9): the cache primitives.
+
+    const CACHED: &str = "pcache-00";
+
+    fn write_cached(root: &SecureRoot, name: &str, bytes: &[u8]) {
+        root.stage(name, bytes).unwrap().publish().unwrap();
+    }
+
+    /// A file just over a power of two: `read_to_end` growth would double
+    /// the capacity to 8,192; the sized read allocates `size + 1` once.
+    #[test]
+    fn read_file_sized_allocates_size_plus_one_and_never_grows() {
+        let home = TempHome::new();
+        let root = open(&home).unwrap();
+        let bytes = vec![b'x'; 4_097];
+        write_cached(&root, CACHED, &bytes);
+        let read = root.read_file_sized(CACHED, 4_097).unwrap().unwrap();
+        assert_eq!(read, bytes);
+        assert!(read.capacity() <= 4_098, "{}", read.capacity());
+        // Control: the growing read of the same file does exceed it.
+        let grown = root.read_file(CACHED, 4_097).unwrap().unwrap();
+        assert!(grown.capacity() > 4_098, "{}", grown.capacity());
+        // A file larger than `size` is `Corrupt`, and the read stopped at
+        // `size + 1`.
+        let over = fails_closed_only_by(BYTE_CAP, StorageError::Corrupt, || {
+            root.read_file_sized(CACHED, 4_000)
+        });
+        assert_eq!(over.unwrap().len(), 4_001);
+        assert_eq!(root.read_file_sized("pcache-01", 10), Ok(None));
+    }
+
+    #[test]
+    fn list_and_remove_stale_temps_accept_only_the_cache_prefixes() {
+        let home = TempHome::new();
+        let root = open(&home).unwrap();
+        let refused = Some(StorageError::Refused(
+            crate::security::SecurityError::Invalid,
+        ));
+        for prefix in ["", "state", "peers.json", "pcache", "xcache-", "."] {
+            assert_eq!(root.list(prefix).err(), refused, "{prefix:?}");
+            assert_eq!(root.remove_stale_temps(prefix).err(), refused, "{prefix:?}");
+        }
+        write_cached(&root, CACHED, b"p");
+        write_cached(&root, "rcache-00", b"rr");
+        write_state(&root, b"{}");
+        assert_eq!(root.list("pcache-").unwrap(), [(CACHED.to_owned(), 1)]);
+        assert_eq!(root.list("rcache-").unwrap(), [("rcache-00".to_owned(), 2)]);
+    }
+
+    /// Each attack on a prefixed entry makes the whole `list` fail closed
+    /// with the target untouched; bypassing only the named guard admits it.
+    #[test]
+    fn list_fails_closed_on_a_symlink_hard_link_wrong_mode_or_foreign_entry() {
+        let home = TempHome::new();
+        let root = open(&home).unwrap();
+        let outside = home.path.join("outside");
+        std::fs::write(&outside, b"keep").unwrap();
+        chmod(&outside, 0o600);
+        let entry = home.root().join(CACHED);
+        let untouched = |entry: &Path| {
+            assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+            assert!(std::fs::symlink_metadata(entry).is_ok());
+        };
+
+        symlink(&outside, &entry).unwrap();
+        let listed = fails_closed_only_by(seams::NOFOLLOW, StorageError::UnsafeState, || {
+            root.list("pcache-")
+        });
+        assert_eq!(listed, [(CACHED.to_owned(), 4)]);
+        untouched(&entry);
+        std::fs::remove_file(&entry).unwrap();
+
+        std::fs::hard_link(&outside, &entry).unwrap();
+        fails_closed_only_by(NLINK, StorageError::UnsafeState, || root.list("pcache-"));
+        untouched(&entry);
+        std::fs::remove_file(&entry).unwrap();
+
+        write_cached(&root, CACHED, b"p");
+        chmod(&entry, 0o644);
+        fails_closed_only_by(MODE, StorageError::UnsafeState, || root.list("pcache-"));
+        untouched(&entry);
+        chmod(&entry, 0o600);
+
+        let _reset = Reset;
+        seams::force_foreign(seams::FILE);
+        fails_closed_only_by(OWNER, StorageError::UnsafeState, || root.list("pcache-"));
+        seams::force_foreign(0);
+        untouched(&entry);
+        std::fs::remove_file(&entry).unwrap();
+
+        // A FIFO with the right owner, mode and link count: only the
+        // regular-file check refuses it (that guard has no bypass).
+        let fifo = CString::new(entry.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        chmod(&entry, 0o600);
+        assert_eq!(root.list("pcache-"), Err(StorageError::UnsafeState));
+        untouched(&entry);
+        std::fs::remove_file(&entry).unwrap();
+
+        // Entries without the prefix are not checked.
+        symlink(&outside, home.root().join("rcache-00")).unwrap();
+        assert_eq!(root.list("pcache-").unwrap(), []);
+    }
+
+    #[test]
+    fn list_fails_closed_past_4096_entries() {
+        let home = TempHome::new();
+        let root = open(&home).unwrap();
+        // `owner.lock` is one entry; fill to exactly the cap.
+        for n in 0..crate::secure_fs::LIST_ENTRIES_MAX - 1 {
+            std::fs::write(home.root().join(format!("junk-{n}")), b"").unwrap();
+        }
+        assert_eq!(root.list("pcache-").unwrap(), []);
+        std::fs::write(home.root().join("junk-last"), b"").unwrap();
+        assert_eq!(root.list("pcache-"), Err(StorageError::UnsafeState));
+    }
+
+    #[test]
+    fn remove_file_never_follows_and_absent_is_success() {
+        let home = TempHome::new();
+        let root = open(&home).unwrap();
+        let outside = home.path.join("outside");
+        std::fs::write(&outside, b"keep").unwrap();
+        let entry = home.root().join(CACHED);
+        symlink(&outside, &entry).unwrap();
+        root.remove_file(CACHED).unwrap();
+        assert!(std::fs::symlink_metadata(&entry).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+        root.remove_file(CACHED).unwrap();
+        assert_eq!(
+            root.remove_file("../outside"),
+            Err(StorageError::UnsafeState)
+        );
+    }
+
+    #[test]
+    fn remove_file_failures_are_unknown() {
+        for step in [Step::Unlink, Step::SyncDir] {
+            let home = TempHome::new();
+            let root = open(&home).unwrap();
+            write_cached(&root, CACHED, b"p");
+            let _reset = Reset;
+            seams::set_hook(Some(Box::new(move |at| {
+                if at == step {
+                    Err(io::Error::other("injected"))
+                } else {
+                    Ok(())
+                }
+            })));
+            assert_eq!(
+                root.remove_file(CACHED),
+                Err(StorageError::Unknown),
+                "{step:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remove_stale_temps_removes_only_the_prefixed_temps_and_never_follows() {
+        let home = TempHome::new();
+        let root = open(&home).unwrap();
+        let outside = home.path.join("outside");
+        std::fs::write(&outside, b"keep").unwrap();
+        let dir = home.root();
+        symlink(&outside, dir.join(".pcache-00.tmp")).unwrap();
+        std::fs::write(dir.join(".pcache-01.tmp"), b"x").unwrap();
+        for keep in [".rcache-00.tmp", ".state.json.tmp", ".pcache-00.tmpx"] {
+            std::fs::write(dir.join(keep), b"x").unwrap();
+        }
+        // Not `CACHED`: its own temp name is planted above.
+        write_cached(&root, "pcache-02", b"p");
+        root.remove_stale_temps("pcache-").unwrap();
+        for gone in [".pcache-00.tmp", ".pcache-01.tmp"] {
+            assert!(std::fs::symlink_metadata(dir.join(gone)).is_err(), "{gone}");
+        }
+        for keep in [
+            ".rcache-00.tmp",
+            ".state.json.tmp",
+            ".pcache-00.tmpx",
+            "pcache-02",
+        ] {
+            assert!(dir.join(keep).exists(), "{keep}");
+        }
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
     }
 
     #[test]

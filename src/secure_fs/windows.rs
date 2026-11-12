@@ -41,6 +41,26 @@ impl SecureRoot {
     pub(crate) fn remove_stale_temp(&self, _: &str) -> Result<(), StorageError> {
         match self.0 {}
     }
+
+    pub(crate) fn read_file_sized(
+        &self,
+        _: &str,
+        _: usize,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        match self.0 {}
+    }
+
+    pub(crate) fn list(&self, _: &str) -> Result<Vec<(String, u64)>, StorageError> {
+        match self.0 {}
+    }
+
+    pub(crate) fn remove_file(&self, _: &str) -> Result<(), StorageError> {
+        match self.0 {}
+    }
+
+    pub(crate) fn remove_stale_temps(&self, _: &str) -> Result<(), StorageError> {
+        match self.0 {}
+    }
 }
 
 impl Staged<'_> {
