@@ -557,6 +557,13 @@ mod imp {
         if !verify_mac(&expected, mac.try_into().ok()?) {
             return None;
         }
+        // The key was read at the hello, up to two deadlines ago. A reset
+        // since then issued a new token: a command authenticated under the
+        // old one must not run against the new state.
+        let current = control_key(shared.store.state().ok()?.control_token.expose());
+        if !verify_mac(&key, &current) {
+            return None;
+        }
 
         let (code, data) = match verify_control_command(json, &request_id, command_id) {
             Ok(()) => {

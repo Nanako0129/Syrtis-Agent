@@ -969,6 +969,26 @@ mod disk {
         assert_eq!(node.client_with(new).call(&command).unwrap().code, OK);
     }
 
+    /// A reset between the server proof and the command: the command is
+    /// authenticated under the token read at the hello, but it must not
+    /// run against the state the reset produced.
+    #[test]
+    fn a_command_authenticated_before_a_reset_does_not_run_after_it() {
+        let node = Node::new(true);
+        let old = node.token();
+        let mut raw = Raw::open(node.server.socket_path(), &old);
+        node.store.reset(NOW + 10, (NOW + 10) * 1_000).unwrap();
+        let before = node.state_bytes();
+        let frame = raw.frame(
+            LISTEN_CONFIGURE,
+            json!({"bindHost": LOOPBACK, "bindPort": free_port()}),
+            false,
+        );
+        raw.send(&frame);
+        assert!(closed_within(&mut raw.stream, Duration::from_secs(1)));
+        assert_eq!(node.state_bytes(), before);
+    }
+
     /// Acceptance (13): `localhost` and `0x0` pass the frozen validator but
     /// not the listener's bind rule: `invalid`, state unchanged.
     #[test]

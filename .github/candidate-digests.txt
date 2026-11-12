@@ -62,7 +62,7 @@
 # control.sock admission rules and pathname exception, the handshake
 # framing over the frozen control MACs, deadlines, the nine commands, the
 # client). No existing line changed.
-46cf7b217617b150797863f44b344025058cd687d84b1f74aec59cbed98a83cb  spec/control-v1.md
+e39b19cca9d5c24ea9e8a296c241f1f14dc1934e52dc4d0a5645639a959bb19a  spec/control-v1.md
 7fcd1eefd06566e9de262fa2645f289025cac7e52a0b050fa12c7533d12281ea  spec/pairing-v1.md
 686951d4a0d463d5a29d5d3e9d2be97198211cba3ab81202da66643c1c79e6bc  spec/report-peer-v1.md
 3cce5944bf106ca5e5503505f3b4150f192eead0db3f9b1a3fdaf3617ae1c59b  spec/peer-store-v1.md

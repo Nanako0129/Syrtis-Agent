@@ -47,7 +47,7 @@ One command per connection. All integers are big-endian.
 | 6 | server → client | `u16(code) ‖ u32(len) ‖ responseJson[len] ‖ responseMac[32]`, `responseMac = control_response_mac(key, 1, clientNonce, serverNonce, requestId, code, responseJson)`; `responseJson` is the CanonicalJsonV1 envelope `{code, controlVersion, data, requestId}`. |
 | 7 | client | `len ≤ 65,536`, `verify_mac` of `responseMac`, then the frozen `verify_control_response(responseJson, requestId, commandId, code)`, which checks the request ID and the code against the transcript and the success data shape for the command sent. |
 
-**Key.** The server derives `control_key(controlToken)` per connection from the `controlToken` of one `store.state()` snapshot, taken after the owner check and the slot and before the server proof, and never caches it. A sticky-unknown store closes the connection without a proof. After a reset the old token fails at the very next server proof.
+**Key.** The server derives `control_key(controlToken)` per connection from the `controlToken` of one `store.state()` snapshot, taken after the owner check and the slot and before the server proof, and never caches it. After the command MAC verifies, the server reads the token again; if it differs from the one read at the hello, the connection is closed without a reply and nothing runs, so a command authenticated before a reset does not act on the state after it. A sticky-unknown store closes the connection without a proof. After a reset the old token fails at the very next server proof.
 
 **Deadlines.** Absolute, on the monotonic clock; partial bytes never extend them. Accept → complete hello: 2 s. Server proof written → complete command: 2 s. Response write: 2 s. A timeout, EOF or MAC failure returns the slot and the memory. The client has one 10 s deadline for the whole call. Both sides wait with non-blocking sockets and `poll(2)`, not socket timeouts (macOS refuses `setsockopt` with `EINVAL` once the peer has closed, even while its last bytes are unread).
 
@@ -67,7 +67,7 @@ Bodies arrive already checked by the frozen validator. Every state change goes t
 | `reject{pendingId, sasGeneration}` | Frozen `reject_pending`. |
 | `revoke{grantId}` | Frozen `revoke_commit`; the terminal record's ID is the `grantId`. |
 | `listenConfigure{bindHost, bindPort}` | `listener::bind_address(bindHost, bindPort)` first; a refusal is `invalid` and nothing is written. Then `set_listen_config`, keeping the stored `nodeLabel`. The running peer listener is not restarted (`SA-2B2c2`). |
-| `shutdown` | Answered `ok`; then, on the serving thread, the hook the server was started with is called. The hook must not stop the server synchronously (stopping joins that thread). It is not called for a refused body. |
+| `shutdown` | Answered `ok`; then, on the serving thread, the hook the server was started with is called, whether or not the reply could be written: the command was authenticated, so a client that disconnects still shuts the agent down. The hook must not stop the server synchronously (stopping joins that thread). It is not called for a refused body. |
 
 | Store error | Code |
 |---|---|
