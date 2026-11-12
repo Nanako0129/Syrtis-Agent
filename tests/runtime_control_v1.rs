@@ -32,9 +32,10 @@ mod disk {
     use syrtis_agent::{
         canonical::CanonicalJsonV1,
         control::{
-            APPROVE, Client, Command, ControlError, INVALID, LISTEN_CONFIGURE, OFFER_CANCEL,
-            OFFER_CREATE, OK, PENDING_LIST, PRE_AUTH_CONNECTIONS, REJECT, REVOKE, Response,
-            SHUTDOWN, SOCKET_NAME, STATUS, Server, UNAUTHORIZED,
+            APPROVE, Client, Command, ControlError, INTERNAL, INVALID, LISTEN_CONFIGURE,
+            OFFER_CANCEL, OFFER_CREATE, OK, PENDING_LIST, PRE_AUTH_CONNECTIONS, REJECT, REVOKE,
+            Response, SCOPE_APPROVE, SHARING_SET, SHUTDOWN, SOCKET_NAME, STATUS, ScanStatus,
+            Server, UNAUTHORIZED,
         },
         listener::Listener,
         pairing::{ClaimAttempts, Clock, PairingClient, RateLimiter},
@@ -706,6 +707,75 @@ mod disk {
         );
         assert_eq!(node.call(SHUTDOWN, json!({})).code, OK);
         assert_eq!(node.shutdowns.load(Ordering::SeqCst), 1);
+    }
+
+    /// SA-0G acceptance (d): `sharingSet` and `scopeApprove` with bodies the
+    /// frozen validator accepts are answered `internal` with `null` data and
+    /// write nothing; a refused body is still `invalid`.
+    #[test]
+    fn sharing_set_and_scope_approve_are_internal_and_change_nothing() {
+        for sharing in [false, true] {
+            let node = Node::new(sharing);
+            let before = node.state_bytes();
+            for (id, body) in [
+                (SHARING_SET, json!({"enabled": true})),
+                (SHARING_SET, json!({"enabled": false})),
+                (
+                    SCOPE_APPROVE,
+                    json!({"ownerInputsSha256": "0123456789abcdef".repeat(4)}),
+                ),
+            ] {
+                let response = node.call(id, body.clone());
+                assert_eq!(response.code, INTERNAL, "{id}: {body}");
+                assert_eq!(response.data, Value::Null);
+                assert_eq!(node.state_bytes(), before, "{id}: {body}");
+            }
+            for (id, body) in [
+                (SHARING_SET, json!({"enabled": 1})),
+                (SCOPE_APPROVE, json!({"ownerInputsSha256": "AB".repeat(32)})),
+            ] {
+                assert_eq!(node.call(id, body.clone()).code, INVALID, "{id}: {body}");
+            }
+            assert_eq!(node.state_bytes(), before);
+            let status = node.call(STATUS, json!({}));
+            assert_eq!(status.data["sharingEnabled"], sharing);
+            assert_eq!(status.data["scopeApproved"], false);
+        }
+    }
+
+    /// SA-0G acceptance (d): `status` carries `scopeApproved`, `false`
+    /// without a provider and the provider's answer with one. Each reply
+    /// passed the frozen `verify_control_response` inside `call`.
+    #[test]
+    fn status_reports_scope_approved_from_its_provider() {
+        let node = Node::new(true);
+        let status = node.call(STATUS, json!({}));
+        assert_eq!(status.code, OK);
+        assert_eq!(status.data["scopeApproved"], false);
+
+        for approved in [true, false] {
+            let home = TempHome::new();
+            let store = open_store(&home);
+            let mut server = Server::start_with_scope_hook(
+                Arc::clone(&store),
+                Arc::new(TestClock::default()),
+                Arc::new(|| {}),
+                Arc::new(|| {}),
+                Arc::new(ScanStatus::default),
+                Arc::new(move || approved),
+            )
+            .unwrap();
+            let token = *store.state().unwrap().control_token.expose();
+            let response = Client::new(Secret32::new(token), server.socket_path().to_path_buf())
+                .call(&Command {
+                    id: STATUS,
+                    body: json!({}),
+                })
+                .unwrap();
+            assert_eq!(response.code, OK);
+            assert_eq!(response.data["scopeApproved"], approved);
+            server.stop();
+        }
     }
 
     /// Acceptance (6): with 4 connections stalled before their hello, a
