@@ -5,6 +5,7 @@ pub mod noise;
 pub mod pairing;
 pub mod peer_store;
 pub mod report;
+pub mod report_peer;
 pub mod secure_fs;
 pub mod security;
 pub mod state_store;

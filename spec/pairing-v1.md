@@ -4,7 +4,7 @@
 
 This document fixes how two agents pair over the peer wire: the Noise transport, the derivation of pairing IDs, how the producer answers Pair claim, Pair status and Grant status, how the owner approves, and how the receiver claims, polls and confirms a grant. Field sets, value rules and obligations (i)–(iii) are frozen by `spec/v1.md` ("Surface field registry" and "Peer wire obligations"); this document adds none. Implementation: `src/noise.rs`, `src/pairing.rs` and `src/listener.rs`; acceptance: `tests/runtime_pairing_v1.rs`, `tests/runtime_listener_v1.rs` and the unit tests in those files.
 
-Not in this slice: the peer report path (`SA-2B2b`); the control command that calls approval, and the disable half of F-7 (`SA-2B2c`). The receiver client returns what it confirmed and stores nothing; its caller stores a confirmed grant in the receiver peer store (`spec/peer-store-v1.md`).
+The peer report path (the Peer request) shares the connection, the listener and the dispatch in step 2 below, and is specified in `spec/report-peer-v1.md`. Not in this slice: the control command that calls approval, and the disable half of F-7 (`SA-2B2c`). The receiver client returns what it confirmed and stores nothing; its caller stores a confirmed grant in the receiver peer store (`spec/peer-store-v1.md`).
 
 > Grant status is advisory. It releases no byte, and no admission decision may be taken from it: the report path authorizes through `StateStore::authorize` only.
 
@@ -39,7 +39,7 @@ Every read and write runs against an absolute monotonic deadline. Each system ca
 
 ## Listener
 
-`Listener::start(store, ledger, limiter, clock)` is the producer's product TCP listener (`src/listener.rs`).
+`Listener::start(store, ledger, limiter, clock, reports)` is the producer's product TCP listener (`src/listener.rs`). `reports` is the report path's shared state (its source, per-grant limit and compute slot; `spec/report-peer-v1.md`); the listener passes it to `Producer::serve`, which serves the pairing surfaces and the Peer request.
 
 | Item | Rule |
 |---|---|
@@ -92,7 +92,7 @@ Non-claims:
 | Step | Check | Failure |
 |---|---|---|
 | 1 | Handshake and frame (above) | Close, no frame |
-| 2 | Frame kind is Request; payload ≤ 4,096 bytes; CanonicalJsonV1; exact key set dispatches to Pair claim, Pair status or Grant status; `protocol` is an integer equal to `1`; typed decode | `invalid`; an integer `protocol` other than `1` is `incompatible`. The Peer request key set is `invalid` here (F-10) |
+| 2 | Frame kind is Request; CanonicalJsonV1; exact key set dispatches to Pair claim, Pair status, Grant status or the Peer request; for the three pairing surfaces, payload ≤ 4,096 bytes; `protocol` is an integer equal to `1`; typed decode | `invalid`; an integer `protocol` other than `1` is `incompatible`. The Peer request key set (F-10) leaves this table here: it goes to the report path (`spec/report-peer-v1.md`), which does not use steps 3–5 |
 | 3 | Rate limit keyed by the Noise remote static | `busy` |
 | 4 | The remote static is not this agent's own | `unauthorized` |
 | 5 | The surface (below), including sharing and the static binding | Per surface |

@@ -27,11 +27,13 @@ use crate::{
         self, Deadline, INITIATOR_READ_TIMEOUT, INITIATOR_WRITE_TIMEOUT, NoiseError,
         RESPONDER_READ_TIMEOUT, RESPONDER_WRITE_TIMEOUT, Received, Session, StaticKey,
     },
+    report::ReportRequest,
+    report_peer::{self, Reports},
     secure_fs::StorageError,
     security::{
-        ClockStatus, Frame, FrameKind, GrantState, MemoryLedger, OfferClaim, PEER_PROTOCOL_VERSION,
-        PendingApproval, PendingState, ReferenceState, SecurityError, clock_status,
-        decode_fixed_hex, hex_encode, offer_secret_hash, pair_sas, parse_pair_url,
+        ClockStatus, Frame, FrameKind, Grant, GrantState, MemoryLedger, OfferClaim,
+        PEER_PROTOCOL_VERSION, PendingApproval, PendingState, ReferenceState, SecurityError,
+        clock_status, decode_fixed_hex, hex_encode, offer_secret_hash, pair_sas, parse_pair_url,
     },
     state_store::{StateStore, random},
 };
@@ -39,7 +41,9 @@ use crate::{
 /// v1 never re-issues a SAS, so every pending claim has generation 1.
 pub const SAS_GENERATION: u64 = 1;
 pub const GRANT_LIFETIME_MS: i64 = 30 * 86_400_000;
-/// Largest Pair claim, Pair status or Grant status request payload.
+/// Largest Pair claim, Pair status or Grant status request payload,
+/// applied after the key-set dispatch. A Peer request is bounded only by
+/// the frame (`FRAME_PAYLOAD_MAX`).
 pub const PAIRING_PAYLOAD_MAX: usize = 4_096;
 pub const RATE_INTERVAL: Duration = Duration::from_secs(1);
 pub const RATE_TABLE_MAX: usize = 256;
@@ -273,7 +277,14 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, PeerCode> {
     CanonicalJsonV1::encode(value).map_err(|_| PeerCode::Internal)
 }
 
-/// A dispatched request. Holds the secret only as [`Secret32`].
+/// A dispatched request: a pairing surface or the report path.
+#[derive(Debug)]
+enum Parsed {
+    Pairing(Request),
+    Report(Box<ReportRequest>),
+}
+
+/// A dispatched pairing request. Holds the secret only as [`Secret32`].
 ///
 /// [`Secret32`]: crate::state_store::Secret32
 #[derive(Debug)]
@@ -286,28 +297,62 @@ enum Request {
     GrantStatus([u8; 16]),
 }
 
-/// Producer step (2): size, CanonicalJsonV1, exact key-set dispatch,
-/// `protocol`, typed decode. Reads no state and depends on no ID.
-fn parse_request(payload: &[u8]) -> Result<Request, PeerCode> {
-    #[derive(Clone, Copy)]
+/// Producer step (2) for one request frame: the kind, then
+/// [`parse_request`]; for a Peer request, the payload `requestId` must be
+/// the frame header's.
+fn parse_frame(frame: &Frame) -> Result<Parsed, PeerCode> {
+    if frame.kind != FrameKind::Request {
+        return Err(PeerCode::Invalid);
+    }
+    let parsed = parse_request(&frame.payload)?;
+    if let Parsed::Report(request) = &parsed {
+        if request.request_id != hex_encode(&frame.request_id) {
+            return Err(PeerCode::Invalid);
+        }
+    }
+    Ok(parsed)
+}
+
+/// CanonicalJsonV1, exact key-set dispatch, the 4,096-byte cap for the
+/// three pairing surfaces, `protocol`, typed decode. Reads no state and
+/// depends on no ID. The frame bounds every payload to `FRAME_PAYLOAD_MAX`
+/// before this runs.
+fn parse_request(payload: &[u8]) -> Result<Parsed, PeerCode> {
+    #[derive(Clone, Copy, Eq, PartialEq)]
     enum Surface {
         Claim,
         PairStatus,
         GrantStatus,
-    }
-    if payload.len() > PAIRING_PAYLOAD_MAX {
-        return Err(PeerCode::Invalid);
+        Report,
     }
     let value = CanonicalJsonV1::decode_value(payload).map_err(|_| PeerCode::Invalid)?;
     let object = value.as_object().ok_or(PeerCode::Invalid)?;
     let keys: Vec<&str> = object.keys().map(String::as_str).collect();
-    // The Peer request key set falls through to `invalid` here (F-10).
     let surface = match keys.as_slice() {
         ["offerId", "protocol", "secret"] => Surface::Claim,
         ["pendingId", "protocol"] => Surface::PairStatus,
         ["grantId", "protocol"] => Surface::GrantStatus,
+        // The Peer request (`spec/v1.md`), served by `report_peer`.
+        [
+            "aggregationRevision",
+            "authEpoch",
+            "clients",
+            "endDateExclusive",
+            "endpoint",
+            "grantId",
+            "protocol",
+            "reportSchema",
+            "requestId",
+            "sourceScopeGeneration",
+            "startDate",
+            "timezone",
+            "tzdbRevision",
+        ] => Surface::Report,
         _ => return Err(PeerCode::Invalid),
     };
+    if surface != Surface::Report && payload.len() > PAIRING_PAYLOAD_MAX {
+        return Err(PeerCode::Invalid);
+    }
     let protocol = &object["protocol"];
     if !(protocol.is_u64() || protocol.is_i64()) {
         return Err(PeerCode::Invalid);
@@ -316,7 +361,12 @@ fn parse_request(payload: &[u8]) -> Result<Request, PeerCode> {
         return Err(PeerCode::Incompatible);
     }
     let id = |text: &str| decode_fixed_hex::<16>(text).map_err(|_| PeerCode::Invalid);
-    Ok(match surface {
+    Ok(Parsed::Pairing(match surface {
+        Surface::Report => {
+            return CanonicalJsonV1::decode(payload)
+                .map(|request| Parsed::Report(Box::new(request)))
+                .map_err(|_| PeerCode::Invalid);
+        }
         Surface::Claim => {
             let request: PairClaimRequest =
                 CanonicalJsonV1::decode(payload).map_err(|_| PeerCode::Invalid)?;
@@ -335,7 +385,7 @@ fn parse_request(payload: &[u8]) -> Result<Request, PeerCode> {
                 CanonicalJsonV1::decode(payload).map_err(|_| PeerCode::Invalid)?;
             Request::GrantStatus(id(&request.grant_id)?)
         }
-    })
+    }))
 }
 
 // ---------------------------------------------------------------- clock ---
@@ -390,15 +440,19 @@ impl RateLimiter {
 
 // ------------------------------------------------------------- producer ---
 
-/// The producer side of the pairing wire for one agent.
+/// The producer side of the peer wire for one agent: the pairing surfaces
+/// and the report path.
 pub struct Producer<'a> {
     pub store: &'a StateStore,
     /// The agent identity, read from the store once by the caller, so a
     /// handshake touches no state.
     pub identity: &'a StaticKey,
     pub ledger: &'a MemoryLedger,
+    /// The pairing limiter; the report path does not use it.
     pub limiter: &'a RateLimiter,
     pub clock: &'a dyn Clock,
+    /// The report path's source, per-grant limit and compute slot.
+    pub reports: &'a Reports,
 }
 
 impl fmt::Debug for Producer<'_> {
@@ -408,9 +462,10 @@ impl fmt::Debug for Producer<'_> {
 }
 
 impl Producer<'_> {
-    /// Serves one accepted connection: handshake, one request, one
-    /// response or error frame, close. A handshake or frame failure closes
-    /// without sending anything: there is no request ID to answer.
+    /// Serves one accepted connection: handshake, one request, then one
+    /// response or error frame (a Peer request: the report path's chunks or
+    /// error frame), close. A handshake or frame failure closes without
+    /// sending anything: there is no request ID to answer.
     pub fn serve(&self, stream: TcpStream) {
         let Ok(mut session) = noise::accept(stream, self.identity) else {
             return;
@@ -420,8 +475,17 @@ impl Producer<'_> {
             return;
         };
         let request_id = received.frame().request_id;
-        let answer = self.answer(received.frame(), session.remote_static(), session.h_final());
+        let parsed = parse_frame(received.frame());
         drop(received);
+        let answer = match parsed {
+            Ok(Parsed::Report(request)) => {
+                return report_peer::serve(self, session, request_id, &request);
+            }
+            Ok(Parsed::Pairing(request)) => {
+                self.answer(request, session.remote_static(), session.h_final())
+            }
+            Err(code) => Err(code),
+        };
         let frame = match answer {
             Ok(payload) => Frame {
                 kind: FrameKind::Response,
@@ -431,22 +495,18 @@ impl Producer<'_> {
                 chunk_count: 1,
                 payload,
             },
-            Err(code) => error_frame(request_id, code),
+            Err(code) => error_frame(request_id, code.wire()),
         };
         let _ = session.send(&frame, Deadline::after(RESPONDER_WRITE_TIMEOUT));
     }
 
-    /// Steps (2)–(5) for one decoded frame.
+    /// Steps (3)–(5) for one parsed pairing request.
     fn answer(
         &self,
-        frame: &Frame,
+        request: Request,
         remote_static: &[u8; 32],
         h_final: &[u8; 32],
     ) -> Result<Vec<u8>, PeerCode> {
-        if frame.kind != FrameKind::Request {
-            return Err(PeerCode::Invalid);
-        }
-        let request = parse_request(&frame.payload)?;
         if !self.limiter.admit(remote_static, self.clock.monotonic()) {
             return Err(PeerCode::Busy);
         }
@@ -595,29 +655,7 @@ impl Producer<'_> {
             .find(|grant| grant.grant_id == grant_id)
             .filter(|grant| constant_time_eq(&grant.initiator_static, initiator))
             .ok_or(PeerCode::Unauthorized)?;
-        let clock = self.clock_of(reference);
-        // None of these needs a clock.
-        let revoked = grant.state == GrantState::Revoked
-            || !reference.sharing_enabled
-            || grant.auth_epoch <= reference.deny_floor
-            || grant.source_scope_generation != reference.source_scope_generation;
-        let expired = grant.state == GrantState::Expired;
-        let status = match clock {
-            // Expiry first, deliberately (`spec/pairing-v1.md`).
-            Ok(clock) if !clock.anomaly => {
-                if expired || effective_ms(clock)? >= grant.expires_at_ms {
-                    GrantStatus::Expired
-                } else if revoked {
-                    GrantStatus::Revoked
-                } else {
-                    GrantStatus::Active
-                }
-            }
-            _ if revoked => GrantStatus::Revoked,
-            _ if expired => GrantStatus::Expired,
-            Ok(_) => return Err(PeerCode::Busy),
-            Err(error) => return Err(storage_error_code(error)),
-        };
+        let status = grant_status_of(grant, reference, self.clock_of(reference))?;
         encode(&GrantStatusResponse {
             auth_epoch: grant.auth_epoch,
             expires_at: grant.expires_at_ms,
@@ -630,11 +668,44 @@ impl Producer<'_> {
 
     /// The frozen clock status, or the OS clock error for the caller to
     /// weigh against answers that need no clock.
-    fn clock_of(&self, reference: &ReferenceState) -> Result<ClockStatus, StorageError> {
+    pub(crate) fn clock_of(&self, reference: &ReferenceState) -> Result<ClockStatus, StorageError> {
         self.clock
             .os_now_seconds()
             .map(|os_now| clock_status(os_now, reference.last_accepted_wall_unix_seconds()))
     }
+}
+
+/// The Grant status `state` of `grant`, from the grant's own fields and the
+/// state's counters, never from a request's fields. The report path decides
+/// its codes 3 and 4 with this same function. `Err` is `busy` (clock
+/// anomaly) or the OS clock error, when no clock-free answer applies.
+pub(crate) fn grant_status_of(
+    grant: &Grant,
+    reference: &ReferenceState,
+    clock: Result<ClockStatus, StorageError>,
+) -> Result<GrantStatus, PeerCode> {
+    // None of these needs a clock.
+    let revoked = grant.state == GrantState::Revoked
+        || !reference.sharing_enabled
+        || grant.auth_epoch <= reference.deny_floor
+        || grant.source_scope_generation != reference.source_scope_generation;
+    let expired = grant.state == GrantState::Expired;
+    Ok(match clock {
+        // Expiry first, deliberately (`spec/pairing-v1.md`).
+        Ok(clock) if !clock.anomaly => {
+            if expired || effective_ms(clock)? >= grant.expires_at_ms {
+                GrantStatus::Expired
+            } else if revoked {
+                GrantStatus::Revoked
+            } else {
+                GrantStatus::Active
+            }
+        }
+        _ if revoked => GrantStatus::Revoked,
+        _ if expired => GrantStatus::Expired,
+        Ok(_) => return Err(PeerCode::Busy),
+        Err(error) => return Err(storage_error_code(error)),
+    })
 }
 
 fn effective_ms(clock: ClockStatus) -> Result<i64, PeerCode> {
@@ -644,9 +715,10 @@ fn effective_ms(clock: ClockStatus) -> Result<i64, PeerCode> {
         .ok_or(PeerCode::Internal)
 }
 
-fn error_frame(request_id: [u8; 16], code: PeerCode) -> Frame {
+/// One error frame; `code` is a pairing [`PeerCode`] or a report-path code.
+pub(crate) fn error_frame(request_id: [u8; 16], code: u16) -> Frame {
     let payload = CanonicalJsonV1::encode(&PeerErrorPayload {
-        code: code.wire(),
+        code,
         protocol: PROTOCOL,
     })
     .unwrap_or_default();
@@ -1306,6 +1378,7 @@ mod tests {
         );
         let decoded: PairClaimRequest = CanonicalJsonV1::decode(&payload).unwrap();
         let request = parse_request(&payload).unwrap();
+        assert!(matches!(request, Parsed::Pairing(Request::Claim { .. })));
         for shown in [format!("{decoded:?}"), format!("{request:?}")] {
             assert!(shown.contains("Secret32(redacted)"), "{shown}");
             assert!(!shown.contains(&hex_encode(&secret)), "{shown}");
@@ -1361,6 +1434,7 @@ mod tests {
             ledger: MemoryLedger,
             limiter: RateLimiter,
             clock: FixedClock,
+            reports: Reports,
         }
 
         const OFFER: [u8; 16] = [0x0f; 16];
@@ -1395,6 +1469,7 @@ mod tests {
                 ledger: MemoryLedger::default(),
                 limiter: RateLimiter::default(),
                 clock: FixedClock(AtomicI64::new(NOW)),
+                reports: Reports::new(Arc::new(crate::report_peer::NoSource)),
             }
         }
 
@@ -1406,14 +1481,22 @@ mod tests {
                     ledger: &self.ledger,
                     limiter: &self.limiter,
                     clock: &self.clock,
+                    reports: &self.reports,
                 }
             }
 
             /// A claim answered in this thread, so thread-local seams apply.
             fn claim(&self) -> Result<Vec<u8>, PeerCode> {
                 self.clock.sleep(RATE_INTERVAL);
-                self.producer()
-                    .answer(&claim_frame(), &INITIATOR, &[0x44; 32])
+                answer_claim(&self.producer())
+            }
+        }
+
+        /// Producer steps (2)–(5) for [`claim_frame`].
+        fn answer_claim(producer: &Producer<'_>) -> Result<Vec<u8>, PeerCode> {
+            match parse_frame(&claim_frame())? {
+                Parsed::Pairing(request) => producer.answer(request, &INITIATOR, &[0x44; 32]),
+                Parsed::Report(_) => panic!("a claim frame parsed as a Peer request"),
             }
         }
 
@@ -1454,10 +1537,7 @@ mod tests {
                 clock: &BusyClock,
                 ..node.producer()
             };
-            assert_eq!(
-                producer.answer(&claim_frame(), &INITIATOR, &[0x44; 32]),
-                Err(PeerCode::Internal)
-            );
+            assert_eq!(answer_claim(&producer), Err(PeerCode::Internal));
             assert!(node.store.state().unwrap().reference.pending.is_empty());
         }
 

@@ -27,6 +27,7 @@ mod disk {
         listener::{Listener, ListenerError, MAX_CONNECTIONS},
         noise::{self, StaticKey},
         pairing::{ClaimAttempts, Clock, PairingClient, RateLimiter, approve},
+        report_peer::{NoSource, Reports},
         secure_fs::{SecureRoot, StorageError},
         security::{
             MemoryLedger, Offer, OfferState, PairOffer, hex_encode, offer_secret_hash, pair_url,
@@ -115,6 +116,7 @@ mod disk {
                 MemoryLedger::default(),
                 Arc::new(RateLimiter::default()),
                 clock,
+                Arc::new(Reports::new(Arc::new(NoSource))),
             )
         }
 

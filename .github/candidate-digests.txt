@@ -38,7 +38,15 @@
 # identity, stop), and the low-order remote static non-claim became a
 # rule: both handshake sides refuse an all-zero X25519 with the remote
 # static.
-4744e8ea3728d8ac967f70b268fce09d380c259aab72b0f18d506e79a414ca1b  spec/pairing-v1.md
+#
+# SA-2B2b1 adds spec/report-peer-v1.md, the producer side of the peer
+# report path (static binding, refusal codes, limits, source seam, memory
+# accounting, per-chunk authorization under the store turnstile).
+# spec/pairing-v1.md changed on purpose: the Peer request key set now
+# dispatches to the report path (F-10), the 4,096-byte cap applies to the
+# three pairing surfaces only, and Listener::start takes the report state.
+7fcd1eefd06566e9de262fa2645f289025cac7e52a0b050fa12c7533d12281ea  spec/pairing-v1.md
+c91ade311123eef3e4765de0406519895f155cb82f7b88594dd327d1b2e25c97  spec/report-peer-v1.md
 1d982b186a00e4ddaaa8b47f6569cd3c68bcc170b17a74044ed3ed515ea5b83f  spec/peer-store-v1.md
 79d1c0363e4576d67827ebfa029fad7e3a5981474f4aafba3bd71e54f1a98172  spec/report-cache-v1.md
 3e0b75e33fd362eab1040254de8f656e3a1bf855e0f3c008915b33e3ec2ee523  spec/security-v1.md

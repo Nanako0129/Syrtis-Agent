@@ -335,7 +335,7 @@ mod disk {
         path::{Path, PathBuf},
         process::Command,
         sync::{
-            Mutex,
+            Arc, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         thread,
@@ -348,6 +348,7 @@ mod disk {
             ClaimAttempts, Clock, ConfirmedGrant, PairingClient, Producer, RateLimiter, approve,
         },
         peer_store::{PeerStore, usable},
+        report_peer::{NoSource, Reports},
         secure_fs::SecureRoot,
         security::{
             MemoryLedger, Offer, OfferState, PairOffer, hex_encode, offer_secret_hash, pair_url,
@@ -521,12 +522,14 @@ mod disk {
         let clock = FakeClock(Mutex::new(Duration::ZERO));
         let (ledger, receiver_ledger) = (MemoryLedger::default(), MemoryLedger::default());
         let limiter = RateLimiter::default();
+        let reports = Reports::new(Arc::new(NoSource));
         let producer = Producer {
             store: &producer_store,
             identity: &producer_key,
             ledger: &ledger,
             limiter: &limiter,
             clock: &clock,
+            reports: &reports,
         };
         let receiver_key = StaticKey::from_state(&receiver.state().unwrap()).unwrap();
         let client = PairingClient {

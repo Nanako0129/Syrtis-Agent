@@ -118,6 +118,14 @@ pub struct StateStore {
     root: Arc<SecureRoot>,
     /// Serializes writers.
     commit: Mutex<()>,
+    /// Writer preference, on every platform: a commit holds it from before
+    /// it asks for `current` exclusively until the in-memory swap, and
+    /// `authorize_then` passes through it before taking `current` shared,
+    /// so once a commit waits no new authorization gets in. `std`'s
+    /// `RwLock` does not guarantee this (on macOS its queue lock lets
+    /// readers slip past a waiting writer). Lock order: `commit`, then
+    /// `turnstile`, then `current`; nothing takes them in another order.
+    turnstile: Mutex<()>,
     /// `None` is the sticky unknown state. Writers hold this exclusively from
     /// before the rename until the in-memory swap; authorization reads it.
     current: RwLock<Option<StoredState>>,
@@ -141,6 +149,7 @@ impl StateStore {
         Ok(Self {
             root: Arc::new(root),
             commit: Mutex::new(()),
+            turnstile: Mutex::new(()),
             current: RwLock::new(Some(state)),
         })
     }
@@ -163,20 +172,39 @@ impl StateStore {
     /// The frozen nine-conjunct predicate, evaluated against the current
     /// durable state under the shared guard. False while sticky-unknown.
     pub fn authorize(&self, query: &AuthorizationQuery) -> bool {
-        let Ok(current) = self.current.read() else {
-            return false;
+        self.authorize_then(query, || ()).is_some()
+    }
+
+    /// [`authorize`](Self::authorize), then, only if it holds, `f` while the
+    /// same shared guard is still held: a commit, which takes the guard
+    /// exclusively, can neither start while `f` runs nor finish between the
+    /// check and `f`. `None` when the predicate is false; `f` is not called.
+    ///
+    /// The shared guard is taken through the turnstile, which is released
+    /// before `f` runs: a commit that is waiting holds the turnstile, so no
+    /// new authorization starts until it is done, and it waits only for the
+    /// `f` calls already running.
+    ///
+    /// `f` must not take any lock of this store, `state()` included: a
+    /// waiting commit holds the turnstile and waits for `f` to finish, so
+    /// `f` waiting on the store could deadlock.
+    pub fn authorize_then<T>(
+        &self,
+        query: &AuthorizationQuery,
+        f: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let current = {
+            let _turnstile = self
+                .turnstile
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.current.read().ok()?
         };
-        let Some(state) = current.as_ref() else {
-            return false;
-        };
-        let reference = &state.reference;
-        let Some(grant) = reference
+        let reference = &current.as_ref()?.reference;
+        let grant = reference
             .grants
             .iter()
-            .find(|grant| grant.grant_id == query.grant_id)
-        else {
-            return false;
-        };
+            .find(|grant| grant.grant_id == query.grant_id)?;
         authorize(
             grant,
             &AuthorizationRequest {
@@ -190,6 +218,7 @@ impl StateStore {
                 endpoint: query.endpoint,
             },
         )
+        .then(f)
     }
 
     /// Commits one [`ReferenceState`] transition durably.
@@ -309,22 +338,35 @@ impl StateStore {
         let staged = match self.root.stage(STATE_FILE, &bytes) {
             Ok(staged) => staged,
             Err(_) => {
+                let _turnstile = self
+                    .turnstile
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
                 stick(&mut *self.write()?);
                 return Err(StorageError::Unknown);
             }
         };
         // Exclusive from before the rename until the in-memory swap, so no
         // authorization can read the pre-commit state once the new file may
-        // be visible.
+        // be visible. The turnstile is held until this function returns,
+        // after the swap, so no new authorization starts while this waits.
+        let turnstile = self
+            .turnstile
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let current = self.write()?;
         #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
         if seams::bypassed(seams::EXCLUSIVE_GUARD) {
+            // The negative control removes all exclusion: the turnstile too.
+            drop(turnstile);
             drop(current);
             let published = staged.publish();
             return finish(self.write()?, published, next);
         }
         let published = staged.publish();
-        finish(current, published, next)
+        let finished = finish(current, published, next);
+        drop(turnstile);
+        finished
     }
 
     fn write(&self) -> Result<Current<'_>, StorageError> {
@@ -1524,6 +1566,49 @@ mod tests {
                     }
                 }
             }
+        }
+
+        /// The turnstile, white-box. A commit holds it inside its exclusive
+        /// section (checked at the rename), and `authorize_then` does not
+        /// take the shared guard while it is held. Deterministic, unlike
+        /// the timing test of SA-2B2b1 acceptance (12), which depends on
+        /// how `std`'s lock happens to schedule a waiting writer.
+        #[test]
+        fn a_commit_holds_the_turnstile_and_authorize_then_waits_for_it() {
+            let home = TempHome::new();
+            let store = Arc::new(store_with_grant(&home));
+            let held = Arc::new(StdMutex::new(None));
+            {
+                let (probe, seen) = (Arc::clone(&store), Arc::clone(&held));
+                let _reset = FsReset;
+                fs_seams::set_hook(Some(Box::new(move |step| {
+                    if step == Step::Rename {
+                        *seen.lock().unwrap() = Some(probe.turnstile.try_lock().is_err());
+                    }
+                    Ok(())
+                })));
+                store.checkpoint(NOW).unwrap();
+                fs_seams::set_hook(None);
+            }
+            assert_eq!(
+                *held.lock().unwrap(),
+                Some(true),
+                "commit without the turnstile"
+            );
+
+            let turnstile = store.turnstile.lock().unwrap();
+            let (tx, rx) = mpsc::channel();
+            let reader = {
+                let store = Arc::clone(&store);
+                thread::spawn(move || tx.send(store.authorize_then(&query(1, 1), || 7)).unwrap())
+            };
+            assert!(
+                rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "authorize_then passed a held turnstile"
+            );
+            drop(turnstile);
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Some(7));
+            reader.join().unwrap();
         }
 
         /// A panic inside a caller's closure must not leave revoke blocked

@@ -1353,6 +1353,7 @@ mod disk {
 
     use syrtis_agent::{
         pairing::{ConfirmedGrant, GrantStatus, PairStatus, Producer, approve},
+        report_peer::{NoSource, Reports},
         secure_fs::SecureRoot,
         security::{NOISE_PROLOGUE, NOISE_SUITE, Offer, OfferState, PendingState},
         state_store::StateStore,
@@ -1415,6 +1416,7 @@ mod disk {
         key: StaticKey,
         ledger: MemoryLedger,
         limiter: RateLimiter,
+        reports: Reports,
     }
 
     impl Node {
@@ -1431,6 +1433,7 @@ mod disk {
                 key,
                 ledger: MemoryLedger::default(),
                 limiter: RateLimiter::default(),
+                reports: Reports::new(Arc::new(NoSource)),
             }
         }
 
@@ -1441,6 +1444,7 @@ mod disk {
                 ledger: &self.ledger,
                 limiter: &self.limiter,
                 clock,
+                reports: &self.reports,
             }
         }
 
@@ -2265,11 +2269,13 @@ mod disk {
         });
     }
 
-    /// Acceptance (9): unknown key set, the Peer request key set, a frame
-    /// that is not a request and a 4,097-byte payload are `invalid`;
-    /// `protocol: 2` is `incompatible`. The 4,097-byte payload is canonical
-    /// with the Pair status key set and `protocol: 2` (B8), so only the size
-    /// cap makes it `invalid`; without the cap it would be `incompatible`.
+    /// Acceptance (9): unknown key set, a frame that is not a request and
+    /// a 4,097-byte payload are `invalid`; `protocol: 2` is `incompatible`.
+    /// The 4,097-byte payload is canonical with the Pair status key set and
+    /// `protocol: 2` (B8), so only the size cap makes it `invalid`; without
+    /// the cap it would be `incompatible`. Since SA-2B2b1 the Peer request
+    /// key set (F-10) dispatches to the report path, where an unknown grant
+    /// is `unauthorized` (`spec/report-peer-v1.md`).
     #[test]
     fn malformed_requests_are_invalid_and_another_protocol_is_incompatible() {
         let node = Node::new();
@@ -2287,7 +2293,7 @@ mod disk {
         let peer_request = json!({
             "aggregationRevision": 1, "authEpoch": 1, "clients": [],
             "endDateExclusive": "2026-01-02", "endpoint": 1, "grantId": id,
-            "protocol": 1, "reportSchema": 1, "requestId": id,
+            "protocol": 1, "reportSchema": 1, "requestId": hex_encode(&REQUEST_ID),
             "sourceScopeGeneration": 1, "startDate": "2026-01-01",
             "timezone": "UTC", "tzdbRevision": "2026c",
         });
@@ -2303,7 +2309,6 @@ mod disk {
                     request,
                     json_bytes(json!({"pendingId": id, "protocol": 1, "x": 1})),
                 ),
-                ("peer request", request, json_bytes(peer_request)),
                 (
                     "response kind",
                     FrameKind::Response,
@@ -2322,6 +2327,8 @@ mod disk {
             // Control for the cap: at 4,096 bytes the same payload passes
             // every other check and reaches `incompatible`.
             assert_eq!(ask(request, padded(4_096)), error_payload(6));
+            // F-10: the Peer request reaches the report path.
+            assert_eq!(ask(request, json_bytes(peer_request)), error_payload(2));
             // Control: protocol 1 reaches the surface.
             assert_eq!(
                 ask(request, json_bytes(json!({"pendingId": id, "protocol": 1}))),

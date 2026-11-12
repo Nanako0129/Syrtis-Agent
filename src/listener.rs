@@ -20,6 +20,7 @@ use std::{
 use crate::{
     noise::StaticKey,
     pairing::{Clock, Producer, RateLimiter},
+    report_peer::Reports,
     secure_fs::StorageError,
     security::MemoryLedger,
     state_store::StateStore,
@@ -79,6 +80,7 @@ struct Shared {
     ledger: MemoryLedger,
     limiter: Arc<RateLimiter>,
     clock: Arc<dyn Clock>,
+    reports: Arc<Reports>,
     /// A `try_clone` of each in-flight connection, so `stop` can shut it
     /// down; its size is the number of connections being served.
     live: Mutex<HashMap<u64, TcpStream>>,
@@ -86,11 +88,13 @@ struct Shared {
 
 impl Listener {
     /// Binds `bindHost:bindPort` from `store.state()` and starts accepting.
+    /// `reports` is the report path's shared state (`spec/report-peer-v1.md`).
     pub fn start(
         store: Arc<StateStore>,
         ledger: MemoryLedger,
         limiter: Arc<RateLimiter>,
         clock: Arc<dyn Clock>,
+        reports: Arc<Reports>,
     ) -> Result<Self, ListenerError> {
         let config = store.state().map_err(ListenerError::Store)?.config;
         let host = config.bind_host.ok_or(ListenerError::NotConfigured)?;
@@ -107,6 +111,7 @@ impl Listener {
             ledger,
             limiter,
             clock,
+            reports,
             live: Mutex::new(HashMap::new()),
         });
         let flag = Arc::clone(&stop);
@@ -209,6 +214,7 @@ fn serve(shared: &Shared, stream: TcpStream) {
         ledger: &shared.ledger,
         limiter: &shared.limiter,
         clock: &*shared.clock,
+        reports: &shared.reports,
     }
     .serve(stream);
 }
