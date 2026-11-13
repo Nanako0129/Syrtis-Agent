@@ -31,7 +31,7 @@ Every read and write runs against an absolute monotonic deadline. Each system ca
 
 | Deadline | Initiator (receiver) | Responder (producer) |
 |---|---:|---:|
-| Connect plus handshake | 10 s | 10 s (handshake) |
+| Resolve, connect and handshake | 10 s | 10 s (handshake) |
 | Write the request | 10 s | — |
 | Read the request | — | 10 s |
 | Write the reply | — | 15 s |

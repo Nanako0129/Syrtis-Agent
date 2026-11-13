@@ -108,7 +108,7 @@ A client that stops reading makes a chunk's write time out after at most 2 s; th
 | 1 | `ReportRequest::validate` on the request built from the record and the query, and its canonical encoding fits one request frame (61,402 bytes) | `InvalidQuery`; nothing is sent |
 | 2 | `peer_store::usable(record, stateStore)`, and the identity read again for the handshake equals the record's `initiatorStatic` (a reset between the two reads must not send under an identity the record is not bound to) | `Unusable`; nothing is sent |
 | 3 | A slot of the `FetchLimiter`: at most 2 fetches at once per limiter, no queue. The agent shares one per process | `TooMany`; nothing is sent |
-| 4 | Connect and handshake, `responderStatic` pinned (`noise::connect`) | `Transport` |
+| 4 | Resolve the host, connect and handshake, `responderStatic` pinned (`noise::connect`); one 10 s deadline covers all three, and a resolution that outlasts it fails here like any other connect failure | `Transport` |
 | 5 | Send the request, then read the reply. One absolute deadline covers both: 135 s (the producer's 120 s compute deadline plus its 15 s response deadline) from the end of the handshake, never extended by progress | `Timeout` |
 | 6 | First frame: its `requestId` is the one sent; kind Error is mapped below; kind Request is a violation; kind Response must have `chunkIndex` 0. The frozen `Frame::decode` already holds every Response frame to `chunkCount` 1..=274 and `final` to the last index | `Protocol` |
 | 7 | Reserve `chunkCount × 61,402` on the ledger before keeping any chunk; the body is then allocated once at that capacity and never grows | `Memory`, and no later chunk is read |

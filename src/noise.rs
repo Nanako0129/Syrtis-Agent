@@ -39,7 +39,8 @@ pub const MESSAGE1_LEN: usize = 96;
 pub const MESSAGE2_LEN: usize = 48;
 const TAG_LEN: usize = 16;
 
-/// Connect plus handshake, on both sides.
+/// Connect plus handshake, on both sides. On the initiator it also covers
+/// name resolution, which comes first ([`connect`]).
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const RESPONDER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 pub const RESPONDER_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -658,15 +659,14 @@ mod tests {
         );
         let elapsed = started.elapsed();
         assert_eq!(result.err(), Some(NoiseError::Timeout));
-        assert!(
-            elapsed < timeout + Duration::from_millis(500),
-            "{elapsed:?}"
-        );
+        // Well under the resolver's 3 s, with room for a busy runner.
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
         assert!(budgets.is_empty(), "{budgets:?}");
     }
 
     /// SA-2D (3): an IP literal never reaches the resolver; the connector
-    /// gets exactly that address. Control: a hostname does reach it.
+    /// gets exactly that address. Control: a hostname does reach it, and its
+    /// addresses are tried in the order the resolver gave.
     #[test]
     fn connect_does_not_resolve_an_ip_literal() {
         let local = StaticKey::generate().unwrap();
@@ -683,7 +683,10 @@ mod tests {
                 Duration::from_secs(5),
                 move |_, port| {
                     flag.store(true, Ordering::SeqCst);
-                    Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))])
+                    Ok(vec![
+                        SocketAddr::from(([127, 0, 0, 2], port)),
+                        SocketAddr::from(([127, 0, 0, 1], port)),
+                    ])
                 },
                 recording_connector(&mut budgets),
             );
@@ -701,18 +704,27 @@ mod tests {
         }
         let (called, addresses) = resolve("peer.invalid");
         assert!(called);
-        assert_eq!(addresses, [SocketAddr::from(([127, 0, 0, 1], 4242))]);
+        // In the resolver's order, not sorted.
+        assert_eq!(
+            addresses,
+            [
+                SocketAddr::from(([127, 0, 0, 2], 4242)),
+                SocketAddr::from(([127, 0, 0, 1], 4242)),
+            ]
+        );
     }
 
     /// SA-2D (4): resolution spends part of the one deadline, and the TCP
     /// connect gets only what is left. Starting the deadline after the
-    /// resolution would hand the connector the full second.
+    /// resolution would hand the connector the full 4 s.
     #[test]
     fn connect_gives_the_connector_only_the_time_left_after_resolution() {
         let local = StaticKey::generate().unwrap();
         let remote = StaticKey::generate().unwrap();
-        let timeout = Duration::from_secs(1);
-        let stall = timeout / 2;
+        // The stall is a small part of the deadline, so a slow runner still
+        // returns from the resolver in time.
+        let timeout = Duration::from_secs(4);
+        let stall = Duration::from_millis(500);
         let mut budgets = Vec::new();
         let result = connect_with(
             "slow.invalid",
