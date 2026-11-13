@@ -11,7 +11,9 @@
 use std::{
     fmt,
     io::{ErrorKind, Read, Write},
-    net::{SocketAddr, TcpStream, ToSocketAddrs},
+    net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs},
+    sync::mpsc::{self, RecvTimeoutError},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -162,10 +164,11 @@ impl fmt::Debug for Received {
     }
 }
 
-/// Initiator: connects and runs IK with `remote_static` pinned, all within
-/// one [`HANDSHAKE_TIMEOUT`]. Name resolution (`getaddrinfo`) runs first and
-/// is not bounded by that deadline: std offers no way to bound it. Once a
-/// TCP connection is up, a handshake failure ends the call: no other
+/// Initiator: resolves `host`, connects and runs IK with `remote_static`
+/// pinned, all within one [`HANDSHAKE_TIMEOUT`]. An IP literal is used as
+/// is; a hostname is resolved (`getaddrinfo`) on a helper thread that the
+/// call stops waiting for when the deadline passes ([`NoiseError::Timeout`]).
+/// Once a TCP connection is up, a handshake failure ends the call: no other
 /// address is tried.
 pub fn connect(
     host: &str,
@@ -173,16 +176,42 @@ pub fn connect(
     local: &StaticKey,
     remote_static: &[u8; 32],
 ) -> Result<Session, NoiseError> {
+    connect_with(
+        host,
+        port,
+        local,
+        remote_static,
+        HANDSHAKE_TIMEOUT,
+        system_resolve,
+        TcpStream::connect_timeout,
+    )
+}
+
+fn system_resolve(host: String, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+    Ok((host.as_str(), port).to_socket_addrs()?.collect())
+}
+
+/// [`connect`] with the resolver, the deadline length and the TCP connector
+/// injected, so tests need not wait out [`HANDSHAKE_TIMEOUT`].
+fn connect_with<R>(
+    host: &str,
+    port: u16,
+    local: &StaticKey,
+    remote_static: &[u8; 32],
+    timeout: Duration,
+    resolve: R,
+    connector: impl FnMut(&SocketAddr, Duration) -> std::io::Result<TcpStream>,
+) -> Result<Session, NoiseError>
+where
+    R: FnOnce(String, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
+{
     // The pinned static is known before anything is sent. With a low-order
     // one, message 1 would encrypt this side's static under a key an
     // observer can compute, so refuse before connecting.
     refuse_low_order(local, remote_static)?;
-    let addresses: Vec<SocketAddr> = (host, port)
-        .to_socket_addrs()
-        .map_err(|_| NoiseError::Io)?
-        .collect();
-    let deadline = Deadline::after(HANDSHAKE_TIMEOUT);
-    let mut stream = connect_addrs(&addresses, deadline, TcpStream::connect_timeout)?;
+    let deadline = Deadline::after(timeout);
+    let addresses = resolve_within(host, port, deadline, resolve)?;
+    let mut stream = connect_addrs(&addresses, deadline, connector)?;
     let mut state = Builder::new(params()?)
         .local_private_key(local.private.expose())
         .and_then(|builder| builder.remote_public_key(remote_static))
@@ -276,6 +305,40 @@ impl Session {
             frame,
             _reservation: reservation,
         })
+    }
+}
+
+/// Resolves `host` under `deadline`. An IP literal skips the resolver, as
+/// std's own `(&str, u16)` lookup does. A hostname is resolved on a named
+/// helper thread; the order and count of its addresses are kept.
+fn resolve_within<R>(
+    host: &str,
+    port: u16,
+    deadline: Deadline,
+    resolve: R,
+) -> Result<Vec<SocketAddr>, NoiseError>
+where
+    R: FnOnce(String, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
+{
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    let (sender, receiver) = mpsc::channel();
+    let host = host.to_owned();
+    // ponytail: on timeout the helper thread is not joined. A stalled
+    // resolution leaves one thread waiting on the resolver, so the ceiling
+    // is call rate x resolver timeout; removing it needs an async resolver.
+    thread::Builder::new()
+        .name("noise-resolve".to_owned())
+        .spawn(move || {
+            // The receiver is gone after a timeout; nothing is waiting.
+            let _ = sender.send(resolve(host, port));
+        })
+        .map_err(|_| NoiseError::Io)?;
+    match receiver.recv_timeout(deadline.remaining()?) {
+        Ok(Ok(addresses)) => Ok(addresses),
+        Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => Err(NoiseError::Io),
+        Err(RecvTimeoutError::Timeout) => Err(NoiseError::Timeout),
     }
 }
 
@@ -440,7 +503,14 @@ fn retry(kind: ErrorKind) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, net::TcpListener};
+    use std::{
+        cell::Cell,
+        net::TcpListener,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
     use super::*;
 
@@ -552,6 +622,115 @@ mod tests {
             budgets.iter().all(|budget| !budget.is_zero()),
             "{budgets:?}"
         );
+    }
+
+    /// A connector that records each budget it is given and refuses.
+    fn recording_connector(
+        budgets: &mut Vec<(SocketAddr, Duration)>,
+    ) -> impl FnMut(&SocketAddr, Duration) -> std::io::Result<TcpStream> + '_ {
+        |address, budget| {
+            budgets.push((*address, budget));
+            Err(std::io::ErrorKind::ConnectionRefused.into())
+        }
+    }
+
+    /// SA-2D (2): a resolution that stalls past the deadline ends the call
+    /// at the deadline, as a timeout. Resolving before the deadline starts
+    /// would wait out the whole 3 s sleep.
+    #[test]
+    fn connect_bounds_a_stalled_resolution_by_the_deadline() {
+        let local = StaticKey::generate().unwrap();
+        let remote = StaticKey::generate().unwrap();
+        let timeout = Duration::from_millis(200);
+        let mut budgets = Vec::new();
+        let started = Instant::now();
+        let result = connect_with(
+            "stalled.invalid",
+            9,
+            &local,
+            remote.public(),
+            timeout,
+            |_, _| {
+                thread::sleep(Duration::from_secs(3));
+                Ok(vec![SocketAddr::from(([127, 0, 0, 1], 9))])
+            },
+            recording_connector(&mut budgets),
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(result.err(), Some(NoiseError::Timeout));
+        assert!(
+            elapsed < timeout + Duration::from_millis(500),
+            "{elapsed:?}"
+        );
+        assert!(budgets.is_empty(), "{budgets:?}");
+    }
+
+    /// SA-2D (3): an IP literal never reaches the resolver; the connector
+    /// gets exactly that address. Control: a hostname does reach it.
+    #[test]
+    fn connect_does_not_resolve_an_ip_literal() {
+        let local = StaticKey::generate().unwrap();
+        let remote = StaticKey::generate().unwrap();
+        let resolve = |host: &str| {
+            let called = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&called);
+            let mut budgets = Vec::new();
+            let result = connect_with(
+                host,
+                4242,
+                &local,
+                remote.public(),
+                Duration::from_secs(5),
+                move |_, port| {
+                    flag.store(true, Ordering::SeqCst);
+                    Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))])
+                },
+                recording_connector(&mut budgets),
+            );
+            assert_eq!(result.err(), Some(NoiseError::Io));
+            let addresses: Vec<SocketAddr> = budgets.iter().map(|(a, _)| *a).collect();
+            (called.load(Ordering::SeqCst), addresses)
+        };
+        for (literal, ip) in [
+            ("127.0.0.1", IpAddr::from([127, 0, 0, 1])),
+            ("::1", IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1_u16])),
+        ] {
+            let (called, addresses) = resolve(literal);
+            assert!(!called, "{literal} went to the resolver");
+            assert_eq!(addresses, [SocketAddr::new(ip, 4242)]);
+        }
+        let (called, addresses) = resolve("peer.invalid");
+        assert!(called);
+        assert_eq!(addresses, [SocketAddr::from(([127, 0, 0, 1], 4242))]);
+    }
+
+    /// SA-2D (4): resolution spends part of the one deadline, and the TCP
+    /// connect gets only what is left. Starting the deadline after the
+    /// resolution would hand the connector the full second.
+    #[test]
+    fn connect_gives_the_connector_only_the_time_left_after_resolution() {
+        let local = StaticKey::generate().unwrap();
+        let remote = StaticKey::generate().unwrap();
+        let timeout = Duration::from_secs(1);
+        let stall = timeout / 2;
+        let mut budgets = Vec::new();
+        let result = connect_with(
+            "slow.invalid",
+            9,
+            &local,
+            remote.public(),
+            timeout,
+            move |_, port| {
+                thread::sleep(stall);
+                Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))])
+            },
+            recording_connector(&mut budgets),
+        );
+        assert_eq!(result.err(), Some(NoiseError::Io));
+        assert_eq!(budgets.len(), 1, "{budgets:?}");
+        let budget = budgets[0].1;
+        assert!(budget <= timeout - stall, "{budget:?}");
+        assert!(!budget.is_zero());
     }
 
     fn pair() -> (HandshakeState, HandshakeState, StaticKey) {
