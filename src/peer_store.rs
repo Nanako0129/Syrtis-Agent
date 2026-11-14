@@ -333,6 +333,8 @@ impl PeerStore {
     }
 
     /// Removes the producer's record; an absent one is not an error.
+    /// The record only: `Runtime::remove_peer` also deletes the producer's
+    /// receiver cache entries, and is what an owner's removal should call.
     pub fn remove(&self, responder_static: &[u8; 32]) -> Result<(), StorageError> {
         self.commit(|peers| {
             Ok(peers
