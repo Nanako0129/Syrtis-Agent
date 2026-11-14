@@ -350,6 +350,48 @@ mod disk {
         assert_eq!(cached.body(), body.as_slice());
     }
 
+    /// `SA-3e`: `remove_peer` deletes the producer's record and its cache
+    /// file at once, not at expiry.
+    #[test]
+    fn remove_peer_deletes_the_record_and_its_cache() {
+        let pair = pair(None, SLOW);
+        pair.pull().unwrap();
+        assert_eq!(pair.receiver.home.rcache().len(), 1);
+        pair.receiver
+            .runtime
+            .remove_peer(&pair.producer_static)
+            .unwrap();
+        assert!(pair.receiver.home.rcache().is_empty());
+        assert!(pair.receiver.runtime.peers().peers().unwrap().is_empty());
+        assert_eq!(pair.last_good(), None);
+    }
+
+    /// `SA-3e`: removing a producer that is not there is `Ok` and leaves
+    /// another producer's entry; entries left under a key whose record is
+    /// already gone are still deleted.
+    #[test]
+    fn removing_an_absent_peer_leaves_other_entries() {
+        let pair = pair(None, SLOW);
+        pair.pull().unwrap();
+        let files = pair.receiver.home.rcache();
+        assert_eq!(files.len(), 1);
+        pair.receiver.runtime.remove_peer(&[0x5a; 32]).unwrap();
+        assert_eq!(pair.receiver.home.rcache(), files);
+        assert_eq!(pair.receiver.runtime.peers().peers().unwrap().len(), 1);
+        // Orphan: the record goes through `PeerStore` alone, the file stays.
+        pair.receiver
+            .runtime
+            .peers()
+            .remove(&pair.producer_static)
+            .unwrap();
+        assert_eq!(pair.receiver.home.rcache(), files);
+        pair.receiver
+            .runtime
+            .remove_peer(&pair.producer_static)
+            .unwrap();
+        assert!(pair.receiver.home.rcache().is_empty());
+    }
+
     /// Acceptance (2): after the producer revokes the grant, `pull` is
     /// `Revoked`, every cache file of that producer is gone, `peers.json`
     /// says `revoked`, and `last_good` is `None`.

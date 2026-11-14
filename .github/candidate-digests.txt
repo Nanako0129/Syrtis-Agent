@@ -143,12 +143,20 @@
 # stops waiting for at the deadline.
 # The deadline table row there and step 4 of spec/report-peer-v1.md said
 # "connect plus handshake"; both now name resolution too.
+#
+# SA-3e changed spec/runtime-v1.md on purpose: Runtime::remove_peer
+# (PeerStore::remove first, durable, its error returned with the cache
+# untouched; then CacheStore::remove_peer with its result ignored, as in
+# pull's revoked or expired step) and its acceptance row. It deletes the
+# entries that exist when it runs; a pull running at the same time may
+# still write one entry afterwards, which no record can read and which
+# expiry deletes. pull itself is unchanged.
 4eb5d2ca0aa2906676095dd4d2450d142f15fd6e8cdfbff774ee9d7cbf2e9373  spec/cache-store-v1.md
 055a5c81aade6aec75c8f43bccb8128ab22ca1691b15b690ca833d0005176a2f  spec/install-v1.md
 39d9df6c5dd97bae15550e3c185232f2add94f55954f2830de1cae67c3a19fb2  spec/cli-v1.md
 5b1db7ec2cbcdb80479f7edd75e8c82a016c321c9726832af868f6e1c5a6da8e  spec/control-v1.md
 fa83df962309c42614f7fb4a557f601b862c988d90343b06bb1d16fc46aa9ba8  spec/pairing-v1.md
-b4d09dae1fbaa799380d66505ff3d69fb623732d955ff6007be06ac78bd9c398  spec/runtime-v1.md
+56214544143069c4f75680254fc749d120555fdb511fdbe826f608a5afeea94c  spec/runtime-v1.md
 178f632d3cf46503f390f0efffebe1ab441e06b93642b2fd69d6f611c72c2e1b  spec/report-peer-v1.md
 3cce5944bf106ca5e5503505f3b4150f192eead0db3f9b1a3fdaf3617ae1c59b  spec/peer-store-v1.md
 79d1c0363e4576d67827ebfa029fad7e3a5981474f4aafba3bd71e54f1a98172  spec/report-cache-v1.md

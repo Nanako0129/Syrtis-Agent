@@ -382,6 +382,25 @@ impl Runtime {
         cache.get(&cache_key(&record, query), now_ms)
     }
 
+    /// Removes the producer `responder_static`: first its record with
+    /// `PeerStore::remove` (durable; an error is returned and the cache is
+    /// not touched), then every receiver cache entry of that producer. An
+    /// absent producer is `Ok`, and its leftover entries are still deleted.
+    ///
+    /// No cache, or a cache removal that fails, does not change the result:
+    /// once the record is gone no usable record can name those files, and
+    /// expiry or eviction deletes them. Only entries that exist when this
+    /// runs are deleted: a `pull` running at the same time took its record
+    /// before the removal and may still write one entry afterwards, which
+    /// no record can read and which expiry deletes.
+    pub fn remove_peer(&self, responder_static: &[u8; 32]) -> Result<(), StorageError> {
+        self.peers.remove(responder_static)?;
+        if let Some(cache) = &self.inner.cache {
+            let _ = cache.remove_peer(&hex_encode(responder_static));
+        }
+        Ok(())
+    }
+
     fn peer(&self, responder_static: &[u8; 32]) -> Option<PeerRecord> {
         self.peers
             .peers()

@@ -99,6 +99,8 @@ Nothing depends on the sweep for authority: claim, approval, Pair and Grant stat
 
 `Runtime::last_good(responderStatic, query) -> Result<Option<CachedBody>, StorageError>`: `None` without a cache, without a readable record, when that record is not `usable`, when the OS clock or the state cannot be read, or while the clock is anomalous (a read at a wrong time would delete entries that are still valid; `pull` does not write the cache then either); otherwise `CacheStore::get` under the key built from that same record, at the effective now in ms. A revoked or expired record, or one bound to an identity from before a reset, therefore reads nothing, whatever is still on disk. A record removed or replaced by a new pairing (another `grantId`) builds another key; the old entries are left to expiry and eviction.
 
+`Runtime::remove_peer(responderStatic) -> Result<(), StorageError>` (`SA-3e`): first `PeerStore::remove(responderStatic)`, durable; its error is returned and the cache is not touched. Then `CacheStore::remove_peer(peerStatic)` (lowercase hex), every entry of that producer; no cache, or a removal that fails, does not change the result, for the reason in step 4: once the record is gone no usable record names those files, and expiry or eviction deletes them. An absent producer is `Ok`, and entries left under its key are still deleted. What is deleted is the entries that exist when the removal runs. A `pull` of the same producer running at the same time took its record snapshot before the removal (step 1) and writes only after a successful fetch, so it may still write one entry afterwards; no record can read that entry, and expiry deletes it. `pull` is unchanged.
+
 ## Acceptance map (`tests/runtime_lifecycle_v1.rs` unless noted)
 
 | # | Test |
@@ -132,6 +134,7 @@ Nothing depends on the sweep for authority: claim, approval, Pair and Grant stat
 | 6 | `housekeeping_purges_expired_entries` |
 | 7 | `listen_configure_to_the_bound_address_keeps_the_listener` |
 | 8 | `housekeeping_retries_a_listener_that_did_not_bind` |
+| `SA-3e` `remove_peer` | `remove_peer_deletes_the_record_and_its_cache`, `removing_an_absent_peer_leaves_other_entries` |
 
 **Record table fixture (5).** One `StateStore::transition` whose closure pushes filler terminal records onto `terminal` until offers + pending + grants + terminal = 256 (`MAX_RECORDS`). Each filler has a unique ID, `cleanupComplete: true` and `terminalAt` = a chosen instant minus 90 days, so the frozen `compact_terminals` (the checkpoint) removes them all exactly when the effective now reaches that instant, and none before. That lets one test hold the table full through the disable and the gated enable, then free it to show that the later claim refusal is the offer's expiry, not the table.
 
