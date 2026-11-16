@@ -155,9 +155,11 @@
 # through PeerStore::remove alone.
 #
 # Engine pin moved to tokscale-core b0e2e5f4 (the streaming source fold no
-# longer refuses on local history size). Changed on purpose, the 40-hex pin
-# only: spec/source-v1.md, the lock baseline fixture, and the two D1
-# fixtures' engineSha.
+# longer refuses on local history size). Changed on purpose: the 40-hex pin
+# in spec/source-v1.md, the lock baseline fixture and the two D1 fixtures'
+# engineSha, and the spec sentence saying where that SHA comes from. The D1
+# fixtures' cited engine line numbers still hold: src/clients.rs,
+# src/scanner.rs and src/source_context.rs are identical at both pins.
 4eb5d2ca0aa2906676095dd4d2450d142f15fd6e8cdfbff774ee9d7cbf2e9373  spec/cache-store-v1.md
 055a5c81aade6aec75c8f43bccb8128ab22ca1691b15b690ca833d0005176a2f  spec/install-v1.md
 39d9df6c5dd97bae15550e3c185232f2add94f55954f2830de1cae67c3a19fb2  spec/cli-v1.md
@@ -170,7 +172,7 @@ ee750e1996a12ada3e565139d547cfa4a12dcf9997aea095b4e2a436241f6b92  spec/runtime-v
 910fbb67d3d7b464863f4ad525e803f61e80b8e13d7ef4eba347d135c6616265  spec/security-v1.md
 1b125846c4aa9f5d70bd7c4ab4f07f99decd5087a20f4a9f3e7e900c524202f5  spec/state-store-v1.md
 8bc39c0eb646a39c500aa2efbb39ae9ca4d065365e4ad2388f931e0b2d7e9827  spec/v1.md
-ba764152461bb3e657a5fa46e1559b5e8046e6a87a335fe86450c62e1f28f040  spec/source-v1.md
+0e488c18c85e7341f51f9b430e768ec08df2bd714515457390b64095e00df94e  spec/source-v1.md
 6f17681e22cc9ed39ee510ea7a7f055139edaaec1f975395c1262eae0b0d8934  spec/agent-v1.md
 ff21cbcfdd6aedfb68ac1b3cfda056663203f2c7f08fd05a856dc5dbe5e4c25a  src/cache.rs
 8b0add8d4fde2253edebdddd448d381559d63ff630f0e9d2f9faad8d9625567f  src/canonical.rs
