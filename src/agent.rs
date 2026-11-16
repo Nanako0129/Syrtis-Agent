@@ -38,8 +38,10 @@ pub struct AgentConfig {
     /// directory in a test. Also the engine's home, and the home whose
     /// install objects `Agent::uninstall` removes.
     pub trusted_home: PathBuf,
-    /// The platform config and data directories the engine resolves
-    /// clients against.
+    /// The config and data directories the engine resolves clients
+    /// against: it uses `data_dir` as the XDG data root and
+    /// `config_dir/tokscale` as its config root. Not the OS "application
+    /// support" directories; use `cli::default_dirs`.
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
     pub settings: ScannerSettings,

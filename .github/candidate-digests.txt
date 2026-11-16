@@ -170,9 +170,20 @@
 # app keep pricing the standalone agent. The D1 fixtures' cited engine line
 # numbers still hold: the engine delta touches src/pricing/mod.rs and
 # tests/remote_source_report.rs only.
+#
+# DR-1e changed spec/cli-v1.md and spec/source-v1.md on purpose. The
+# standalone binary's config and data dirs (cli::default_dirs) are now
+# home/.config and home/.local/share on macOS as on Linux, instead of
+# Library/Application Support for both: the engine's remote context
+# substitutes them for the XDG data root and the TOKSCALE_CONFIG_DIR base,
+# so the old dirs missed every client the engine's local report lane finds
+# under .local/share or .config/tokscale (OpenCode, Muse, Antigravity and
+# others). spec/cli-v1.md states the new dirs; spec/source-v1.md now says a
+# change to an assembler's default roots changes the owner inputs and is a
+# consent change (re-approval, old grants stop authorizing), not a D1 case.
 4eb5d2ca0aa2906676095dd4d2450d142f15fd6e8cdfbff774ee9d7cbf2e9373  spec/cache-store-v1.md
 055a5c81aade6aec75c8f43bccb8128ab22ca1691b15b690ca833d0005176a2f  spec/install-v1.md
-eeb3d42536217648d6ce8fd82aae15eb1713c40f730b2f78e8bd912e38f43738  spec/cli-v1.md
+14448b1b0ca3be54b08c8c13f0e267eaa12058bcd571d678a481e574d2d7859a  spec/cli-v1.md
 5b1db7ec2cbcdb80479f7edd75e8c82a016c321c9726832af868f6e1c5a6da8e  spec/control-v1.md
 fa83df962309c42614f7fb4a557f601b862c988d90343b06bb1d16fc46aa9ba8  spec/pairing-v1.md
 ee750e1996a12ada3e565139d547cfa4a12dcf9997aea095b4e2a436241f6b92  spec/runtime-v1.md
@@ -182,7 +193,7 @@ ee750e1996a12ada3e565139d547cfa4a12dcf9997aea095b4e2a436241f6b92  spec/runtime-v
 910fbb67d3d7b464863f4ad525e803f61e80b8e13d7ef4eba347d135c6616265  spec/security-v1.md
 1b125846c4aa9f5d70bd7c4ab4f07f99decd5087a20f4a9f3e7e900c524202f5  spec/state-store-v1.md
 8bc39c0eb646a39c500aa2efbb39ae9ca4d065365e4ad2388f931e0b2d7e9827  spec/v1.md
-3aa30131c764596ab2df24544def5ff61cedf28f3897597bf5b7288c91320b77  spec/source-v1.md
+22c5d2ca7a60c2ae44bebdfb36b4fe36731cca1bbeb6f7d4cb7ae88c77bb0aa9  spec/source-v1.md
 6f17681e22cc9ed39ee510ea7a7f055139edaaec1f975395c1262eae0b0d8934  spec/agent-v1.md
 ff21cbcfdd6aedfb68ac1b3cfda056663203f2c7f08fd05a856dc5dbe5e4c25a  src/cache.rs
 8b0add8d4fde2253edebdddd448d381559d63ff630f0e9d2f9faad8d9625567f  src/canonical.rs
