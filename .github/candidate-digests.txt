@@ -160,9 +160,19 @@
 # engineSha, and the spec sentence saying where that SHA comes from. The D1
 # fixtures' cited engine line numbers still hold: src/clients.rs,
 # src/scanner.rs and src/source_context.rs are identical at both pins.
+#
+# Engine pin moved to tokscale-core 51047602 (a stale price table prices a
+# shared report instead of zeroing its cost). Changed on purpose: the 40-hex
+# pin in spec/source-v1.md, the lock baseline fixture and the two D1
+# fixtures' engineSha; the PR number in the spec's provenance sentence; the
+# spec's "nothing writes pricing files" sentence, now scoped to this crate; and
+# spec/cli-v1.md, which now says pricing files left in the shared root by an
+# app keep pricing the standalone agent. The D1 fixtures' cited engine line
+# numbers still hold: the engine delta touches src/pricing/mod.rs and
+# tests/remote_source_report.rs only.
 4eb5d2ca0aa2906676095dd4d2450d142f15fd6e8cdfbff774ee9d7cbf2e9373  spec/cache-store-v1.md
 055a5c81aade6aec75c8f43bccb8128ab22ca1691b15b690ca833d0005176a2f  spec/install-v1.md
-39d9df6c5dd97bae15550e3c185232f2add94f55954f2830de1cae67c3a19fb2  spec/cli-v1.md
+eeb3d42536217648d6ce8fd82aae15eb1713c40f730b2f78e8bd912e38f43738  spec/cli-v1.md
 5b1db7ec2cbcdb80479f7edd75e8c82a016c321c9726832af868f6e1c5a6da8e  spec/control-v1.md
 fa83df962309c42614f7fb4a557f601b862c988d90343b06bb1d16fc46aa9ba8  spec/pairing-v1.md
 ee750e1996a12ada3e565139d547cfa4a12dcf9997aea095b4e2a436241f6b92  spec/runtime-v1.md
@@ -172,7 +182,7 @@ ee750e1996a12ada3e565139d547cfa4a12dcf9997aea095b4e2a436241f6b92  spec/runtime-v
 910fbb67d3d7b464863f4ad525e803f61e80b8e13d7ef4eba347d135c6616265  spec/security-v1.md
 1b125846c4aa9f5d70bd7c4ab4f07f99decd5087a20f4a9f3e7e900c524202f5  spec/state-store-v1.md
 8bc39c0eb646a39c500aa2efbb39ae9ca4d065365e4ad2388f931e0b2d7e9827  spec/v1.md
-0e488c18c85e7341f51f9b430e768ec08df2bd714515457390b64095e00df94e  spec/source-v1.md
+3aa30131c764596ab2df24544def5ff61cedf28f3897597bf5b7288c91320b77  spec/source-v1.md
 6f17681e22cc9ed39ee510ea7a7f055139edaaec1f975395c1262eae0b0d8934  spec/agent-v1.md
 ff21cbcfdd6aedfb68ac1b3cfda056663203f2c7f08fd05a856dc5dbe5e4c25a  src/cache.rs
 8b0add8d4fde2253edebdddd448d381559d63ff630f0e9d2f9faad8d9625567f  src/canonical.rs
@@ -187,7 +197,7 @@ e3437af54f3292180d1510ca274cc445d243d777188f1e441dec50a9d1450ffc  tests/fixtures
 e222989ac752a128717fc37b48e8f5c625d5883c0be98d761c3ac19d298a2b72  tests/fixtures/v1/report/graph.json
 c02dccddf2ffbb5c86f0a0230db59e59276efece0970aad85252d78af6d31d05  tests/fixtures/v1/report/hourly.json
 60c2996518decd1ec26e810df8b92a32298530947e3df5eb59db1aaa4294d07c  tests/fixtures/v1/report/models.json
-1f3ecf854ff85d7a0d2daadfd7105d48c5e2a65f2118282abe285b92399547f8  tests/fixtures/v1/runtime/storage/cargo-lock-baseline.json
+e339b9a73b92d9ca2288a8ab03de8d7742db31cff81ed64731f694c5e16738bc  tests/fixtures/v1/runtime/storage/cargo-lock-baseline.json
 f8326f22b3df9d37df1ec1eea8dd6b4a160de6022b3a226a35bb618c4345f4e0  tests/fixtures/v1/runtime/storage/state-golden.json
 1687926712daab8925fcaa639ebb687fd3b397bf6a296dbbe31f7a225b1c9669  tests/fixtures/v1/security/consent.json
 a58bdd593173195fa9042f6c0e4065a11d553fcc88d4ae79bfc1a5e31f16692e  tests/fixtures/v1/security/control_mac.hex
@@ -201,7 +211,7 @@ cd289e2421e745c59b5798ffc29fcecb02836444f77e816794d62e6f4a2a688e  tests/fixtures
 94653acee749d3612203b35dc400df8d7c4a93272af47f2cdeb10d2f6e14cb00  tests/fixtures/v1/security/state_transitions.json
 cbd942c4fd168b5d78fbfc469acd06cb62f77c026fcbc256285c6c7d9680fdd1  tests/fixtures/v1/security/uninstall.json
 212a6d74e16ee8b4a5f92414d0894fb9334eb40041ed9cc0b78c5962391cbf77  tests/fixtures/v1/source/codex-duration-timing.jsonl
-395b26222567946edbfaafd25b1ad281f71431d9a119453c174a24f2a0821928  tests/fixtures/v1/source/default-roots.json
-00208ca3945ca449d2fd9a1ab8b52ee6effcd06d8271efb82fd0db93fe8b4738  tests/fixtures/v1/source/environment-keys.json
+3442574c566e7a932f6aa28c42f2159b04fa1bbb28e84658634b62c15047fd26  tests/fixtures/v1/source/default-roots.json
+e8e7dc707bb657c1e55bb24d12f5dc9ec1963c3bfae68e694b5c4b3ddb8d092d  tests/fixtures/v1/source/environment-keys.json
 39c2823d68bf6de7854574899b606167897c21292037b8ed359b19fe2e08062c  tests/report_cache_v1.rs
 34c2a335cc9bc3cb3e4af5e6f7bbefd153b5dcef4896cba3dc161f1ad2abdb02  tests/security_contract_v1.rs

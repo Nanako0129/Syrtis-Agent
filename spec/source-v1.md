@@ -12,9 +12,9 @@ Not in this slice: wiring the source into `Runtime` (the assembler injects it, `
 
 `Cargo.toml` declares, under `[target.'cfg(unix)'.dependencies]`:
 
-`tokscale-core = { git = "https://github.com/Nanako0129/tokscale-core", rev = "b0e2e5f43254d8c2c78f07ed9ca23096c4ed8249" }`
+`tokscale-core = { git = "https://github.com/Nanako0129/tokscale-core", rev = "51047602c7052f4c7a2ec0fc96967958e79aa829" }`
 
-The SHA is `Nanako0129/tokscale-core` `main` on 2026-11-16, the merge of its PR 89; the Syrtis macOS app moves its `vendor/tokscale-core` to the same commit when it takes this crate's new revision, and its build checks that the two agree. A pin change is a reviewed change: SEC-R4 (the engine's remote tests at the new SHA, and a security review of the engine's `src/` diff) and the D1 list below are redone for it.
+The SHA is `Nanako0129/tokscale-core` `main` on 2026-11-16, the merge of its PR 90; the Syrtis macOS app moves its `vendor/tokscale-core` to the same commit when it takes this crate's new revision, and its build checks that the two agree. A pin change is a reviewed change: SEC-R4 (the engine's remote tests at the new SHA, and a security review of the engine's `src/` diff) and the D1 list below are redone for it.
 
 Provenance (`tests/dependency_provenance_v1.rs`): `tokscale-core` is the only dependency that may come from git, and only as exactly `{ git = "https://github.com/Nanako0129/tokscale-core", rev = "<40 lowercase hex>" }` (no `version`, `branch`, `tag` or other key). Every other dependency is still refused a `git` or `rev` key and needs an exact `=x.y.z` registry pin. The lock must hold exactly one `tokscale-core`, with source `git+https://github.com/Nanako0129/tokscale-core?rev=<SHA>#<SHA>` and the manifest's SHA in both places. Every package the engine brings is in `tests/fixtures/v1/runtime/storage/cargo-lock-baseline.json` with name, version, source and checksum; `NEW_PACKAGE_ALLOWLIST` stays empty, so a later `rev` change fails as a changed baseline package. (`spec/state-store-v1.md`, in its provenance paragraph, names this `tokscale-core` exception to the exact-pin rule and points here.)
 
@@ -33,7 +33,7 @@ The engine's `reqwest`, `tokio`, `rusqlite` (bundled SQLite) and `zstd` are not 
 
 `SecureRoot::clear_private_subdir(name)` (`SA-2C2a`; called only by `Agent::uninstall` with `source-cache`) opens `name` the same way and with the same checks, but never creates or chmods it; absent is success. It empties the directory and keeps it: each entry is classified by a no-follow `fstatat` on its parent's descriptor; a directory is opened `O_DIRECTORY|O_NOFOLLOW` relative to that descriptor, emptied the same way and removed with `unlinkat(AT_REMOVEDIR)`; every other entry, a symlink included, is removed with `unlinkat`, which removes the link, never its target. More than 32 nested levels, or any failed call, is `UnsafeState`, and what was removed before it stays removed. The entry list is not capped (a same-UID process can grow it; same-UID non-claim). The stub on other platforms is uncallable.
 
-Nothing writes pricing files yet. With `pricing/` empty the engine prices every record at zero cost (the engine's fail-soft rule, its test `pricing_snapshot_absence_zeroes_cost_and_changes_nothing_else`, which passed at the pin; this crate's tests observe zero cost only for a model missing from a non-empty pricing root); filling it is out of this slice. One `EngineSource` per root.
+Nothing in this crate writes pricing files; an embedding app does (`spec/agent-v1.md`). With `pricing/` empty the engine prices every record at zero cost (the engine's fail-soft rule, its test `pricing_snapshot_absence_zeroes_cost_and_changes_nothing_else`, which passed at the pin; this crate's tests observe zero cost only for a model missing from a non-empty pricing root); filling it is out of this slice. One `EngineSource` per root.
 
 ## Owner inputs and the approved scope
 

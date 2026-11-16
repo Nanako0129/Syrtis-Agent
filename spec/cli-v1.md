@@ -22,7 +22,7 @@ The secure root is the frozen `secure_fs::STATE_SUFFIX` below that home. The eng
 
 `Agent::start` with that home, those directories, the frozen suffix and empty `ScannerSettings`: **the standalone agent scans default roots only.** It has no setting for extra scan paths, exclusions or database paths; adding one needs a new persisted file and a frozen-contract amendment. It then blocks in `Runtime::wait` until control `shutdown`, calls `Runtime::stop` and exits 0. Another process holding the owner lock (`Busy`): `syrtis-agent: another syrtis-agent is already running for this user.` on stderr, exit 1. Any other start failure prints the stable error class (for example `Storage(UnsafeState)`), no path, exit 1. It does not daemonize and writes no pid file: launchd or systemd manages it (`spec/install-v1.md`).
 
-The standalone agent never fetches pricing and puts nothing in `Agent::pricing_dir()`; its costs are what the engine computes without a pricing dataset (`spec/source-v1.md`, `spec/agent-v1.md`).
+The standalone agent never fetches pricing and puts nothing in `Agent::pricing_dir()`. With that directory empty its costs are what the engine computes without a pricing dataset (`spec/source-v1.md`, `spec/agent-v1.md`). The directory is shared with an app that used the same secure root and is not cleared when the app stops: pricing files the app left there keep pricing the standalone agent's reports at any age, since the engine uses a stale table rather than dropping it.
 
 ## The menu
 
