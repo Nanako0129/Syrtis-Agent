@@ -132,7 +132,7 @@ Enum values are camelCase variant names, matching the existing `GrantState` seri
 | Record IDs | Offer, pending and grant IDs unique across all three |
 | Terminal IDs | `recordId` unique within `terminal`; a terminal may share the ID of the record it ended |
 | Listen host | When `bindHost` is not `null`: `{bindHost,bindPort}` passes the frozen `listenConfigure` validator (`verify_control_command`, command 8: canonical host, port 1024–65535), and, if it parses as an IP address, `to_canonical()` of it is not unspecified (refuses `0.0.0.0`, `::`, `::ffff:0.0.0.0`). Hostnames are not resolved; a hostname that resolves to the wildcard is refused at bind time (SA-2B2) |
-| Node label | When not `null`: at most 128 bytes of UTF-8 |
+| Node label | When not `null`: at most 128 bytes of UTF-8 (and NFC, as every string). Load checks only this: a stored label that fails the node-label rule of `spec/report-cache-v1.md` still loads (the producer sends it as `null`) |
 
 There is no record-count check: revoke, disable, reset, uninstall and reject never fail on record count (`spec/security-v1.md`), so a valid state may hold more than 256 records.
 
@@ -166,7 +166,7 @@ directory sync     macOS fcntl(F_FULLFSYNC) on the root; Linux fsync on the root
 
 ## Listen config
 
-`set_listen_config(bindHost, bindPort, nodeLabel)` replaces `config` except `sharingEnabled` through the same commit path, so the load rules above apply: a non-null host must pass the frozen validator (port 1024–65535) and must not be an unspecified address; with a null host any `u16` port is stored; a label is at most 128 bytes and NFC. Counters, records and secrets are unchanged. A refused value returns `refused(invalid)` with nothing written.
+`set_listen_config(bindHost, bindPort, nodeLabel)` replaces `config` except `sharingEnabled` through the same commit path, so the load rules above apply: a non-null host must pass the frozen validator (port 1024–65535) and must not be an unspecified address; with a null host any `u16` port is stored. The label is normalized to NFC first; a label that differs from the stored one must then pass the node-label rule of `spec/report-cache-v1.md` (`security::valid_node_label`), and an unchanged stored label is written back without that check, so a label stored before the rule never blocks a listen change (`DR-2b`). Counters, records and secrets are unchanged. A refused value returns `refused(invalid)` with nothing written.
 
 A panic inside a caller's transition closure does not poison the store: the commit mutex guards no data, so its poison is ignored and the next commit (for example a revoke) proceeds. The state lock is only written after a successful durable commit, and a poisoned state lock still reads as sticky unknown (authorization false).
 

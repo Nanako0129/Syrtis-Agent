@@ -7,7 +7,7 @@ use crate::{
     canonical::{CanonicalError, CanonicalJsonV1},
     security::{
         AGGREGATION_REVISION, PEER_PROTOCOL_VERSION, REPORT_SCHEMA_VERSION, TZDB_REVISION,
-        decode_fixed_hex,
+        decode_fixed_hex, valid_node_label,
     },
 };
 
@@ -219,9 +219,21 @@ pub struct ReportResponse<R> {
     pub tzdb_revision: String,
     pub records: Vec<R>,
     pub saturated: bool,
+    /// DR-2b: the producer's `config.nodeLabel`, or `null` when it has none
+    /// or it fails `security::valid_node_label`. Required on the wire.
+    /// [`decode_response`] reads a decodable label failing that rule as
+    /// `None` and keeps the rest of the body; a non-NFC label fails the
+    /// whole body, as any non-canonical string does.
+    pub node_label: Option<String>,
+    /// DR-2b: the pricing table the producer used was missing or corrupt
+    /// (the engine's `RemotePricingDiagnostic::Missing` or `Corrupt`), so
+    /// some costs may be zero. A stale table is `false`.
+    pub cost_incomplete: bool,
 }
 
 impl<R: ReportRecord> ReportResponse<R> {
+    /// The response echoing `request`, with no node label and
+    /// `costIncomplete` false; the producer sets those two itself.
     pub fn from_request(request: &ReportRequest, records: Vec<R>, saturated: bool) -> Self {
         Self {
             aggregation_revision: request.aggregation_revision,
@@ -239,6 +251,8 @@ impl<R: ReportRecord> ReportResponse<R> {
             tzdb_revision: request.tzdb_revision.clone(),
             records,
             saturated,
+            node_label: None,
+            cost_incomplete: false,
         }
     }
 
@@ -294,8 +308,15 @@ pub fn decode_response<R: ReportRecord>(
     bytes: &[u8],
     expected: Option<&ReportRequest>,
 ) -> Result<ReportResponse<R>, ReportError> {
-    let response: ReportResponse<R> = CanonicalJsonV1::decode(bytes)?;
+    let mut response: ReportResponse<R> = CanonicalJsonV1::decode(bytes)?;
     response.validate(expected)?;
+    // DR-2b: a label that decoded but fails the label rule costs the label,
+    // not the report. A label that does not decode (not NFC, so not
+    // canonical) fails the whole body above, and over the receiver's 255-byte
+    // string maximum the shape gate refuses the body before this decoder.
+    if !response.node_label.as_deref().is_some_and(valid_node_label) {
+        response.node_label = None;
+    }
     Ok(response)
 }
 

@@ -42,7 +42,7 @@ use crate::{
         AGGREGATION_REVISION, FRAME_PAYLOAD_MAX, Frame, FrameKind, Grant, GrantState,
         LOGICAL_BODY_MAX, MemoryLedger, MemoryReservation, PEER_PROTOCOL_VERSION,
         REPORT_SCHEMA_VERSION, ReferenceState, TZDB_REVISION, clock_status, decode_fixed_hex,
-        hex_encode,
+        hex_encode, valid_node_label,
     },
     state_store::{AuthorizationQuery, StateStore, random},
 };
@@ -97,10 +97,17 @@ pub struct SourceError;
 
 /// Where report bodies come from (the real source is `SA-2B3`).
 pub trait ReportSource: Send + Sync {
-    /// The canonical `ReportResponse` body for `request`'s endpoint. The
-    /// producer checks only its length. The source should return by
+    /// The canonical `ReportResponse` body for `request`'s endpoint, with
+    /// `nodeLabel` set to `node_label` (DR-2b: the producer's stored label,
+    /// already `None` when it fails `security::valid_node_label`). The
+    /// producer checks only the body's length. The source should return by
     /// `deadline`; nothing interrupts it if it does not.
-    fn report(&self, request: &ReportRequest, deadline: Instant) -> Result<Vec<u8>, SourceError>;
+    fn report(
+        &self,
+        request: &ReportRequest,
+        node_label: Option<&str>,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, SourceError>;
 }
 
 /// No source yet: every authorized report request is answered `internal`.
@@ -108,7 +115,12 @@ pub trait ReportSource: Send + Sync {
 pub struct NoSource;
 
 impl ReportSource for NoSource {
-    fn report(&self, _: &ReportRequest, _: Instant) -> Result<Vec<u8>, SourceError> {
+    fn report(
+        &self,
+        _: &ReportRequest,
+        _: Option<&str>,
+        _: Instant,
+    ) -> Result<Vec<u8>, SourceError> {
         Err(SourceError)
     }
 }
@@ -263,8 +275,19 @@ fn admit<'a>(
     if !authorized {
         return Err(refusal(producer, grant, reference, os_now));
     }
-    // (4)
+    // (4) One report schema only (DR-2b): another one is `incompatible`,
+    // not `invalid`, so the receiver can tell a version skew apart.
+    if request.report_schema != REPORT_SCHEMA_VERSION {
+        return Err(ReportCode::Incompatible);
+    }
     request.validate().map_err(|_| ReportCode::Invalid)?;
+    // The label from the same snapshot as the binding; one that fails the
+    // label rule (stored before it existed) is sent as `null`.
+    let node_label = state
+        .config
+        .node_label
+        .as_deref()
+        .filter(|label| valid_node_label(label));
     // (5)
     let reports = producer.reports;
     let in_flight = reports
@@ -275,7 +298,7 @@ fn admit<'a>(
     let started = producer.clock.monotonic();
     let body = reports
         .source
-        .report(request, Instant::now() + COMPUTE_DEADLINE);
+        .report(request, node_label, Instant::now() + COMPUTE_DEADLINE);
     let late = producer.clock.monotonic().saturating_sub(started) >= COMPUTE_DEADLINE;
     drop(slot);
     let body = body
@@ -438,6 +461,12 @@ pub struct Fetched {
     pub body: Vec<u8>,
     pub records: Records,
     pub saturated: bool,
+    /// DR-2b: the producer's label from this body; `None` when it sent
+    /// none or one failing `security::valid_node_label`.
+    pub node_label: Option<String>,
+    /// DR-2b: the producer priced this body with a missing or corrupt
+    /// pricing table.
+    pub cost_incomplete: bool,
 }
 
 /// Why a fetch failed. None carries bytes from the producer.
@@ -462,8 +491,11 @@ pub enum FetchError {
     Busy,
     /// Error code 8.
     Internal,
-    /// Error code 1 or 6.
+    /// Error code 1.
     Rejected,
+    /// Error code 6: the producer speaks another report schema
+    /// (`REPORT_SCHEMA_VERSION`). Not retried with another version.
+    Incompatible,
     /// Connect, handshake or transport failure.
     Transport(NoiseError),
     /// [`FETCH_DEADLINE`] passed.
@@ -642,7 +674,7 @@ fn exchange(
     let _decode_reservation = ledger.reserve(cost).ok_or(FetchError::Memory)?;
     #[cfg(test)]
     receive_seams::before_decode();
-    let (records, saturated) = match endpoint {
+    let mut fetched = match endpoint {
         Endpoint::Graph => decode::<GraphRecord>(&body, request, Records::Graph),
         Endpoint::Models => decode::<ModelsRecord>(&body, request, Records::Models),
         Endpoint::Hourly => decode::<HourlyRecord>(&body, request, Records::Hourly),
@@ -651,21 +683,25 @@ fn exchange(
     // The buffer was sized for `chunkCount` full chunks; the caller gets
     // one sized for the body.
     body.shrink_to_fit();
-    Ok(Fetched {
-        body,
-        records,
-        saturated,
-    })
+    fetched.body = body;
+    Ok(fetched)
 }
 
 /// The frozen decoder and `validate`, against the request that was sent.
+/// The body is left for the caller to fill in.
 fn decode<R: ReportRecord>(
     body: &[u8],
     request: &ReportRequest,
     wrap: fn(Vec<R>) -> Records,
-) -> Result<(Records, bool), FetchError> {
+) -> Result<Fetched, FetchError> {
     let response = decode_response::<R>(body, Some(request)).map_err(|_| FetchError::Invalid)?;
-    Ok((wrap(response.records), response.saturated))
+    Ok(Fetched {
+        body: Vec::new(),
+        records: wrap(response.records),
+        saturated: response.saturated,
+        node_label: response.node_label,
+        cost_incomplete: response.cost_incomplete,
+    })
 }
 
 fn transport(error: NoiseError) -> FetchError {
@@ -691,7 +727,8 @@ fn error_code(payload: &[u8]) -> FetchError {
             code,
             protocol: PEER_PROTOCOL_VERSION,
         }) => match code {
-            1 | 6 => FetchError::Rejected,
+            1 => FetchError::Rejected,
+            6 => FetchError::Incompatible,
             2 => FetchError::CheckGrantStatus,
             3 => FetchError::Expired,
             4 => FetchError::Revoked,
@@ -706,13 +743,15 @@ fn error_code(payload: &[u8]) -> FetchError {
 // ------------------------------------------------- receiver: before decode ---
 
 /// The response keys, in CanonicalJsonV1 order.
-const RESPONSE_KEYS: [&str; 15] = [
+const RESPONSE_KEYS: [&str; 17] = [
     "aggregationRevision",
     "authEpoch",
     "clients",
+    "costIncomplete",
     "endDateExclusive",
     "endpoint",
     "grantId",
+    "nodeLabel",
     "protocol",
     "records",
     "reportSchema",
@@ -899,7 +938,8 @@ const fn round_up(bytes: usize) -> usize {
 /// neither leaf can split again before 18 entries (each holds at least 5
 /// after the split and at most 11), whether the map is built by insertion
 /// (the decoder's second DOM) or in bulk (its first). The gate admits only
-/// 13 to 15.
+/// 13 to 17: the response object (17 keys since DR-2b) is at the top of
+/// that range, so another response key needs this model redone.
 fn object_nodes(entries: usize) -> Option<usize> {
     match entries {
         0 => Some(0),
@@ -1285,7 +1325,12 @@ mod tests {
 
         struct Fixed(Vec<u8>);
         impl ReportSource for Fixed {
-            fn report(&self, _: &ReportRequest, _: Instant) -> Result<Vec<u8>, SourceError> {
+            fn report(
+                &self,
+                _: &ReportRequest,
+                _: Option<&str>,
+                _: Instant,
+            ) -> Result<Vec<u8>, SourceError> {
                 Ok(self.0.clone())
             }
         }
@@ -1374,7 +1419,7 @@ mod tests {
             endpoint: Endpoint::Graph as u16,
             grant_id: hex_encode(&grant_id),
             protocol: 1,
-            report_schema: 1,
+            report_schema: REPORT_SCHEMA_VERSION,
             request_id: hex_encode(&REQUEST_ID),
             source_scope_generation: 1,
             start_date: "2025-01-01".into(),
@@ -1554,7 +1599,7 @@ mod receiver_tests {
             endpoint: endpoint.into(),
             grant_id: hex_encode(&[0x11; 16]),
             protocol: 1,
-            report_schema: 1,
+            report_schema: REPORT_SCHEMA_VERSION,
             request_id: hex_encode(&REQUEST_ID),
             source_scope_generation: 1,
             start_date: "2025-01-01".into(),
@@ -1855,7 +1900,7 @@ mod receiver_tests {
             (3, FetchError::Expired),
             (4, FetchError::Revoked),
             (5, FetchError::Busy),
-            (6, FetchError::Rejected),
+            (6, FetchError::Incompatible),
             (8, FetchError::Internal),
         ] {
             let script: Script = Box::new(move |producer, id, _| {
@@ -1867,6 +1912,65 @@ mod receiver_tests {
                 "{code}"
             );
         }
+        assert_eq!(ledger.used(), 0);
+    }
+
+    /// DR-2b (c), the receiver's use point: the body's `nodeLabel` and
+    /// `costIncomplete` reach `Fetched`; a label failing the label rule
+    /// (a bidi override, only whitespace) is read as `None` and the records
+    /// are still accepted.
+    #[test]
+    fn the_label_and_cost_flag_reach_fetched_and_a_bad_label_is_dropped() {
+        let ledger = MemoryLedger::default();
+        let records = || (0..3).map(graph).collect::<Vec<_>>();
+        for (sent, kept, incomplete) in [
+            (Some("Studio Mac"), Some("Studio Mac"), true),
+            (Some("Studio Mac"), Some("Studio Mac"), false),
+            (Some("Mac\u{202E}cod.exe"), None, true),
+            (Some(" \u{3000}"), None, false),
+            (None, None, true),
+        ] {
+            let body = encode_response(&ReportResponse {
+                node_label: sent.map(str::to_owned),
+                cost_incomplete: incomplete,
+                ..ReportResponse::from_request(&request(Endpoint::Graph), records(), false)
+            })
+            .unwrap();
+            let fetched = run(Endpoint::Graph, &ledger, serve(body.clone())).unwrap();
+            assert_eq!(fetched.node_label.as_deref(), kept, "{sent:?}");
+            assert_eq!(fetched.cost_incomplete, incomplete, "{sent:?}");
+            assert_eq!(fetched.records, Records::Graph(records()), "{sent:?}");
+            // The body is kept as received (the cache stores these bytes).
+            assert_eq!(fetched.body, body, "{sent:?}");
+        }
+        assert_eq!(ledger.used(), 0);
+    }
+
+    /// DR-2b review: a label costs only the label when it decodes. One over
+    /// the shape gate's 255-byte string maximum (300 bytes) and one that is
+    /// not NFC (so not canonical) refuse the whole body as `Invalid`.
+    /// Control: the same body with a valid label decodes.
+    #[test]
+    fn a_label_over_the_string_maximum_or_not_nfc_refuses_the_body() {
+        let ledger = MemoryLedger::default();
+        let labeled = |label: &str| {
+            String::from_utf8(graph_body(&request(Endpoint::Graph), 3))
+                .unwrap()
+                .replace(r#""nodeLabel":null"#, &format!(r#""nodeLabel":"{label}""#))
+                .into_bytes()
+        };
+        for (what, label) in [
+            ("300 bytes", "x".repeat(300)),
+            ("not NFC", "e\u{301}".to_owned()),
+        ] {
+            assert_eq!(
+                run(Endpoint::Graph, &ledger, serve(labeled(&label))).err(),
+                Some(FetchError::Invalid),
+                "{what}"
+            );
+        }
+        let fetched = run(Endpoint::Graph, &ledger, serve(labeled("Studio Mac"))).unwrap();
+        assert_eq!(fetched.node_label.as_deref(), Some("Studio Mac"));
         assert_eq!(ledger.used(), 0);
     }
 

@@ -49,6 +49,7 @@ pub fn classify(error: PullError) -> FailureClass {
             | FetchError::Revoked
             | FetchError::CheckGrantStatus
             | FetchError::Rejected
+            | FetchError::Incompatible
             | FetchError::Internal => FailureClass::Refused,
             FetchError::Protocol | FetchError::Invalid => FailureClass::InvalidReply,
         },

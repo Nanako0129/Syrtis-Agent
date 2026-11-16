@@ -225,8 +225,14 @@ fn report_golden_bytes_and_identity_order() {
         agents("alpha", "claude", Some("opus"), Some("anthropic"), 10),
     ])
     .unwrap();
+    // DR-2b: the agents golden also pins a label and `costIncomplete: true`;
+    // the other three pin the defaults (`null`, `false`).
     assert_golden(
-        &AgentsResponse::from_request(&request(4), agents_rows.records, agents_rows.saturated),
+        &AgentsResponse {
+            node_label: Some("Studio Mac".into()),
+            cost_incomplete: true,
+            ..AgentsResponse::from_request(&request(4), agents_rows.records, agents_rows.saturated)
+        },
         include_bytes!("fixtures/v1/report/agents.json"),
     );
 }
@@ -267,10 +273,37 @@ fn strict_report_echo_and_field_validation() {
     let unknown = CanonicalJsonV1::encode(&value).unwrap();
     assert!(syrtis_agent::report::decode_response::<GraphRecord>(&unknown, None).is_err());
 
-    let mut missing = serde_json::from_slice::<Value>(&bytes).unwrap();
-    missing.as_object_mut().unwrap().remove("records");
-    let missing = CanonicalJsonV1::encode(&missing).unwrap();
-    assert!(syrtis_agent::report::decode_response::<GraphRecord>(&missing, None).is_err());
+    // DR-2b: `nodeLabel` and `costIncomplete` are required like `records`.
+    for key in ["records", "nodeLabel", "costIncomplete"] {
+        let mut missing = serde_json::from_slice::<Value>(&bytes).unwrap();
+        missing.as_object_mut().unwrap().remove(key);
+        let missing = CanonicalJsonV1::encode(&missing).unwrap();
+        assert!(
+            syrtis_agent::report::decode_response::<GraphRecord>(&missing, None).is_err(),
+            "{key}"
+        );
+    }
+    // DR-2b: a label failing the label rule is read as `None`; the body is
+    // still accepted. A valid one is kept.
+    for (sent, kept) in [
+        ("Studio Mac", Some("Studio Mac")),
+        ("a\u{200F}b", None),
+        ("x\u{2029}", None),
+        ("   ", None),
+        ("", None),
+    ] {
+        let labeled = GraphResponse {
+            node_label: Some(sent.into()),
+            ..response.clone()
+        };
+        let decoded = syrtis_agent::report::decode_response::<GraphRecord>(
+            &encode_response(&labeled).unwrap(),
+            Some(&response.request()),
+        )
+        .unwrap();
+        assert_eq!(decoded.node_label.as_deref(), kept, "{sent:?}");
+        assert_eq!(decoded.records, response.records, "{sent:?}");
+    }
 
     let mut wrong_echo = response.clone();
     wrong_echo.timezone = "UTC".into();

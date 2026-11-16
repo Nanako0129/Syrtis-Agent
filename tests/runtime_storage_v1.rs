@@ -806,7 +806,7 @@ mod disk {
 
         let on_disk = std::fs::read(home.state_file()).unwrap();
         let refused = StorageError::Refused(syrtis_agent::security::SecurityError::Invalid);
-        let invalid: [(Option<&str>, u16, Option<String>); 10] = [
+        let invalid: [(Option<&str>, u16, Option<String>); 9] = [
             (Some("Bad_Host"), 49_200, None),
             (Some("192.168.1.20"), 80, None),
             (Some("192.168.1.20"), 1_023, None),
@@ -816,7 +816,6 @@ mod disk {
             (Some("0:0:0:0:0:0:0:0"), 49_200, None),
             (Some("e\u{301}xample"), 49_200, None),
             (None, 49_200, Some("n".repeat(129))),
-            (None, 49_200, Some("e\u{301}".into())),
         ];
         for (host, port, label) in invalid {
             let result = store.set_listen_config(host.map(str::to_owned), port, label.clone());
@@ -837,6 +836,106 @@ mod disk {
             .set_listen_config(None, 80, Some("n".repeat(128)))
             .unwrap();
         assert_eq!(store.state().unwrap().reference, before.reference);
+    }
+
+    /// DR-2b (b) and the config use point of (c): the label rule refuses
+    /// one example of every class (`Refused(Invalid)`, nothing written),
+    /// takes 128 bytes and refuses 129, and a decomposed (NFD) label is
+    /// stored in NFC. A label already stored that fails the rule (written
+    /// before it existed) is kept and does not block a listen change.
+    #[test]
+    fn the_node_label_rule_refuses_each_class_and_stores_nfc() {
+        use syrtis_agent::security::valid_node_label;
+        let refused = Err(StorageError::Refused(
+            syrtis_agent::security::SecurityError::Invalid,
+        ));
+        let bad: Vec<(&str, String)> = vec![
+            ("empty", String::new()),
+            ("129 bytes", "n".repeat(129)),
+            ("129 bytes, multi-byte", format!("{}n", "é".repeat(64))),
+            ("only whitespace", " \u{3000}\u{2003}".into()),
+            ("only a zero-width space", "\u{200B}".into()),
+            ("only ZWJ and BOM", "\u{200D}\u{FEFF}".into()),
+            (
+                "only fillers and a blank pattern",
+                "\u{3164} \u{2800}\u{AD}".into(),
+            ),
+            ("Cc NUL", "a\u{0}b".into()),
+            ("Cc BEL", "a\u{7}b".into()),
+            ("Cc LF", "a\nb".into()),
+            ("Cc DEL", "a\u{7f}b".into()),
+            ("Cc NEL", "a\u{85}b".into()),
+            ("Zl", "a\u{2028}b".into()),
+            ("Zp", "a\u{2029}b".into()),
+            ("ALM", "a\u{61c}b".into()),
+            ("LRM", "a\u{200e}b".into()),
+            ("RLM", "a\u{200f}b".into()),
+            ("LRE", "a\u{202a}b".into()),
+            ("RLE", "a\u{202b}b".into()),
+            ("PDF", "a\u{202c}b".into()),
+            ("LRO", "a\u{202d}b".into()),
+            ("RLO", "a\u{202e}b".into()),
+            ("LRI", "a\u{2066}b".into()),
+            ("RLI", "a\u{2067}b".into()),
+            ("FSI", "a\u{2068}b".into()),
+            ("PDI", "a\u{2069}b".into()),
+        ];
+        for (class, label) in &bad {
+            assert!(!valid_node_label(label), "{class}");
+        }
+        assert!(!valid_node_label("e\u{301}"), "not NFC");
+        let good = [
+            "n".repeat(128),
+            format!("{}n", "é".repeat(63)),
+            "Studio Mac".into(),
+            "書房的 Mac".into(),
+            " padded ".into(),
+            "a\u{200d}b".into(),
+            // An emoji ZWJ sequence: invisible joiners between visible ones.
+            "\u{1F469}\u{200D}\u{1F4BB}".into(),
+        ];
+        for label in &good {
+            assert!(valid_node_label(label), "{label:?}");
+        }
+
+        let home = TempHome::new();
+        let store = open(&home);
+        let host = Some("192.168.1.20".to_owned());
+        for (class, label) in bad {
+            assert_eq!(
+                store.set_listen_config(host.clone(), 49_200, Some(label)),
+                refused,
+                "{class}"
+            );
+            assert_eq!(store.state().unwrap().config.node_label, None, "{class}");
+        }
+        store
+            .set_listen_config(host.clone(), 49_200, Some("n".repeat(128)))
+            .unwrap();
+        store
+            .set_listen_config(host.clone(), 49_200, Some("Cafe\u{301} Mac".into()))
+            .unwrap();
+        assert_eq!(
+            store.state().unwrap().config.node_label.as_deref(),
+            Some("Caf\u{e9} Mac")
+        );
+
+        // A stored label that fails the rule: written straight into
+        // `state.json` while the store is closed.
+        drop(store);
+        let mut value: Value =
+            serde_json::from_slice(&std::fs::read(home.state_file()).unwrap()).unwrap();
+        value["config"]["nodeLabel"] = "Mac\u{202E}exe".into();
+        std::fs::write(
+            home.state_file(),
+            syrtis_agent::canonical::CanonicalJsonV1::encode(&value).unwrap(),
+        )
+        .unwrap();
+        let store = open(&home);
+        let stored = store.state().unwrap().config.node_label;
+        assert_eq!(stored.as_deref(), Some("Mac\u{202E}exe"));
+        store.set_listen_config(host, 49_201, stored).unwrap();
+        assert_eq!(store.state().unwrap().config.bind_port, 49_201);
     }
 
     #[test]

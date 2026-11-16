@@ -21,7 +21,8 @@ application integration.
 ## Peer request and response
 
 `ReportRequest` and `ReportResponse<R>` use `CanonicalJsonV1`. The response
-repeats every request field byte-for-byte and adds `records` and `saturated`.
+repeats every request field byte-for-byte and adds `records`, `saturated`,
+`nodeLabel` and `costIncomplete` (`DR-2b`), all four required.
 Unknown or missing fields, non-canonical bytes, wrong revisions, invalid IDs,
 invalid dates, unsorted clients, and endpoint/type mismatches are rejected.
 
@@ -34,11 +35,13 @@ invalid dates, unsorted clients, and endpoint/type mismatches are rejected.
 | `endpoint` | `1=graph`, `2=models`, `3=hourly`, `4=agents` |
 | `grantId`, `requestId` | lowercase 16-byte hex |
 | `protocol` | `u16`, exactly `1` |
-| `reportSchema` | `u16`, exactly `1` |
+| `reportSchema` | `u16`, exactly `2` |
 | `sourceScopeGeneration` | `u64` |
 | `timezone` | non-empty NFC string, at most 255 UTF-8 bytes |
 | `tzdbRevision` | exactly `2026c` |
 | `saturated` | `bool`; true if any `u64` merge add saturated |
+| `nodeLabel` | The producer's `config.nodeLabel` or `null`. A string passes the node-label rule (`security::valid_node_label`): 1–128 bytes; NFC; no Cc, Zl or Zp character and none of U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069; and at least one character that is neither whitespace nor one of U+00AD, U+115F, U+1160, U+200B, U+200C, U+200D, U+2060, U+3164, U+FEFF, U+2800 (those stay legal between visible characters). The producer sends `null` for a stored label that fails it. `decode_response` reads a label that decodes but fails the rule as `null` and keeps the rest of the body; a non-NFC label is not canonical and fails the whole body. On the peer wire the receiver's shape gate also refuses the whole body for a label over 255 bytes (`spec/report-peer-v1.md`) |
+| `costIncomplete` | `bool`; true when the pricing table the producer priced the body with is missing or corrupt (the engine's `RemotePricingDiagnostic::Missing` or `Corrupt`), so a cost may be zero; false when it is fresh or stale. Only the boolean is sent, never the diagnostic |
 
 All numerator fields are `u64` and merge with saturating addition. Optional
 `model` and `provider` values are NFC strings or `null`; `client` and `agent`
@@ -72,7 +75,8 @@ production filesystem is outside SA-0.
 
 | Cache key field | Type and rule |
 |---|---|
-| `aggregationRevision`, `reportSchema` | `u16`, exactly `1` |
+| `aggregationRevision` | `u16`, exactly `1` |
+| `reportSchema` | `u16`, exactly `2` |
 | `authEpoch`, `sourceScopeGeneration` | `u64` |
 | `clients` | Same sorted, unique list as the request |
 | `endDateExclusive`, `startDate`, `timezone`, `tzdbRevision` | Same request values |
@@ -85,6 +89,11 @@ Metadata has exactly `bodySha256`, `cacheKey`, `createdAtUnixMs`, and
 `expiresAtUnixMs`. Expiry must be after creation and no more than 30 days;
 `now >= expiresAtUnixMs` rejects the entry. `bodySha256` is lowercase
 SHA-256 of the exact body bytes.
+
+A key whose `reportSchema` is not the current one fails key validation, so
+an entry written under report schema 1 is deleted by `CacheStore::open`
+(its file name no longer validates, `spec/cache-store-v1.md`) the first
+time a store opens after the move to schema 2 (`DR-2b`); it is never read.
 
 The filename is lowercase hexadecimal `SHA-256(cacheKeyJson)`, where
 `cacheKeyJson` is the canonical encoding of the exact cache-key object. The

@@ -26,15 +26,17 @@ use crate::{
     security::{
         AuthorizationRequest, CONSENT_SCOPE, CONTROL_VERSION, Grant, GrantState, Offer, OfferState,
         Pending, PendingState, ReferenceState, STATE_SCHEMA_VERSION, SecurityError, Terminal,
-        TerminalKind, authorize, decode_fixed_hex, hex_encode, verify_control_command,
+        TerminalKind, authorize, decode_fixed_hex, hex_encode, valid_node_label,
+        verify_control_command,
     },
 };
+use unicode_normalization::UnicodeNormalization;
 
 pub const STATE_FILE: &str = "state.json";
 /// Read bound for `state.json`. Guards against a corrupt same-UID file, not
 /// an attacker; it is deliberately far above any reachable state.
 pub const STATE_FILE_MAX_BYTES: usize = 4 * 1024 * 1024;
-pub const NODE_LABEL_MAX_BYTES: usize = 128;
+pub use crate::security::NODE_LABEL_MAX_BYTES;
 const ACTIVE_GRANTS_MAX: usize = 16;
 const GRANT_ENDPOINTS: [u16; 4] = [1, 2, 3, 4];
 const BIND_PORT_FIRST: u16 = 49_152;
@@ -249,15 +251,27 @@ impl StateStore {
     /// Replaces the listen config. Counters and records are unchanged. The
     /// same rules as load apply: a non-null host must pass the frozen
     /// `listenConfigure` validator (canonical host, port 1024–65535) and must
-    /// not be an unspecified address; a label is at most 128 bytes. Anything
-    /// else is `Refused(Invalid)` with nothing written.
+    /// not be an unspecified address; a stored label is at most 128 bytes.
+    /// Anything else is `Refused(Invalid)` with nothing written.
+    ///
+    /// DR-2b: the label is normalized to NFC first, and a label other than
+    /// the one already stored must then pass `security::valid_node_label`
+    /// (`Refused(Invalid)` otherwise). The stored one is written back as it
+    /// is, so a label stored before this rule never blocks a listen change;
+    /// the producer sends such a label as `null`.
     pub fn set_listen_config(
         &self,
         bind_host: Option<String>,
         bind_port: u16,
         node_label: Option<String>,
     ) -> Result<(), StorageError> {
+        let node_label = node_label.map(|label| label.nfc().collect::<String>());
         self.commit(WallMay::OnlyAdvance, |current| {
+            if node_label != current.config.node_label
+                && !node_label.as_deref().is_none_or(valid_node_label)
+            {
+                return Err(StorageError::Refused(SecurityError::Invalid));
+            }
             Ok(StoredState {
                 config: ListenConfig {
                     bind_host,

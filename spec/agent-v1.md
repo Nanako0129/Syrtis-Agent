@@ -55,7 +55,8 @@ A cached body is used only when the producer gave no answer about authorization.
 | `Fetch(InvalidQuery)`: refused before sending | `NoAnswer` | same |
 | `Fetch(Revoked)`, `Fetch(Expired)`: codes 4, 3 (the runtime also clears the cache) | `Refused` | `Refused` / `Refused` |
 | `Fetch(CheckGrantStatus)`: code 2 | `Refused` | same |
-| `Fetch(Rejected)`: codes 1, 6 | `Refused` | same |
+| `Fetch(Rejected)`: code 1 | `Refused` | same |
+| `Fetch(Incompatible)`: code 6, the producer speaks another report schema (`DR-2b`) | `Refused` | same |
 | `Fetch(Internal)`: code 8 | `Refused` | same |
 | `Fetch(Unusable)`, `NoPeer`: this side's record is not usable or gone | `Refused` | same |
 | `Fetch(Protocol)`, `Fetch(Invalid)`: a broken frame, or a body the decoder refused | `InvalidReply` | `InvalidReply` / `InvalidReply` |

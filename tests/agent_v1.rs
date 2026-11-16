@@ -31,6 +31,8 @@ fn classify_matches_the_spec_table() {
         (PullError::Fetch(FetchError::Busy), NoAnswer),
         (PullError::Fetch(FetchError::Internal), Refused),
         (PullError::Fetch(FetchError::Rejected), Refused),
+        // DR-2b: code 6 has its own outcome, classified as code 1 is.
+        (PullError::Fetch(FetchError::Incompatible), Refused),
         (
             PullError::Fetch(FetchError::Transport(NoiseError::Io)),
             NoAnswer,
@@ -556,7 +558,7 @@ mod live {
         }
         let body = producer
             .source()
-            .report(&request(endpoint, generation(producer)), far())
+            .report(&request(endpoint, generation(producer)), None, far())
             .unwrap();
         match endpoint {
             Endpoint::Graph => typed::<GraphRecord>(&body, Records::Graph),
@@ -782,7 +784,7 @@ mod live {
         let serves = |agent: &Agent| {
             agent
                 .source()
-                .report(&request(Endpoint::Graph, generation(agent)), far())
+                .report(&request(Endpoint::Graph, generation(agent)), None, far())
                 .is_ok()
         };
         assert!(!status_scope(&producer));
@@ -849,7 +851,11 @@ mod live {
         assert!(
             producer
                 .source()
-                .report(&request(Endpoint::Graph, generation(&producer)), far())
+                .report(
+                    &request(Endpoint::Graph, generation(&producer)),
+                    None,
+                    far()
+                )
                 .is_err()
         );
 
@@ -910,7 +916,7 @@ mod live {
         assert!(
             producer
                 .source()
-                .report(&request(Endpoint::Graph, after_reset), far())
+                .report(&request(Endpoint::Graph, after_reset), None, far())
                 .is_err()
         );
 
@@ -959,7 +965,7 @@ mod live {
 
         // A denial after a success leaves `ok` too.
         let wrong = request(Endpoint::Graph, generation(&producer) + 7);
-        assert!(producer.source().report(&wrong, far()).is_err());
+        assert!(producer.source().report(&wrong, None, far()).is_err());
         assert_eq!(
             call(producer.runtime(), STATUS, json!({}))["scanStatus"],
             "ok"
@@ -969,7 +975,12 @@ mod live {
         // is a failed scan.
         let mut unknown_zone = request(Endpoint::Graph, generation(&producer));
         unknown_zone.timezone = "Nowhere/Atlantis".into();
-        assert!(producer.source().report(&unknown_zone, far()).is_err());
+        assert!(
+            producer
+                .source()
+                .report(&unknown_zone, None, far())
+                .is_err()
+        );
         let status = call(producer.runtime(), STATUS, json!({}));
         assert_eq!(status["scanStatus"], "error");
         assert_eq!(status["lastScanAt"].as_i64(), Some(at));
@@ -1024,7 +1035,12 @@ mod live {
     struct Slow(Arc<TestClock>);
 
     impl ReportSource for Slow {
-        fn report(&self, request: &ReportRequest, _: Instant) -> Result<Vec<u8>, SourceError> {
+        fn report(
+            &self,
+            request: &ReportRequest,
+            _: Option<&str>,
+            _: Instant,
+        ) -> Result<Vec<u8>, SourceError> {
             thread::sleep(Duration::from_millis(200));
             self.0.advance(61);
             fn empty<R: ReportRecord>(request: &ReportRequest) -> Result<Vec<u8>, SourceError> {

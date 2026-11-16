@@ -50,14 +50,14 @@ The same inputs may be approved again at any generation (after a reset, for exam
 
 D1: consent binds `ownerInputsSha256`, not the engine's fingerprint. The engine's fingerprint also hashes its client table and resolver version, so it changes with every pin; binding it would make every app update re-ask. An engine pin change therefore keeps the existing consent, including clients the new engine supports; an owner change to a setting or custom root needs a new approval. So does a change to the default roots an assembler supplies (`config_dir`, `data_dir`, for example `cli::default_dirs`): it changes the owner inputs and their digest, so it is a consent change, not an engine-pin (D1) case. The owner approves the scope again after a `source_change_commit`, and every existing grant, bound to the old generation, stops authorizing.
 
-## `report(request, deadline)`
+## `report(request, node_label, deadline)`
 
 0. If `Instant::now()` is already past `deadline`, `SourceError` before anything is read (`SA-2C2a`). Such a call is not a scan (below).
 1. The endpoint must be one of the four; else `SourceError`.
 2. Deny (`SourceError`) unless `source-scope.json` exists, decodes, has `schema` 1, its `generation` equals `request.sourceScopeGeneration` (which the producer's admission already checked against the durable counter), and its `ownerInputsSha256` equals this source's.
 3. Build `RemoteSourceScopeTokenV1` from the engine's `preview_fingerprint` of the same inputs and the request's generation, then `RemoteSourceContextV1::new`.
 4. Call `aggregate_remote_usage_from_source_v1` with the request's clients, dates, timezone and tzdb revision, and the pricing snapshot of `pricing/`.
-5. Take the requested endpoint's records and the bundle's `saturated`, copy each record field by field, encode. The other three endpoints are dropped: each endpoint request is one engine scan. The engine's source cache is meant to make repeat scans cheaper; that is not measured here.
+5. Take the requested endpoint's records and the bundle's `saturated`, copy each record field by field, encode. `DR-2b`: the response's `nodeLabel` is `node_label` (the producer passes its stored label, `None` when it fails `security::valid_node_label`), and `costIncomplete` is true when the step 4 snapshot's `RemotePricingSnapshot::diagnostic()` is `Missing` or `Corrupt`, false when it is `Stale` or none; only that boolean leaves the source. The other three endpoints are dropped: each endpoint request is one engine scan. The engine's source cache is meant to make repeat scans cheaper; that is not measured here.
 6. If `Instant::now()` is past `deadline` when the body is ready, `SourceError`.
 
 Every failure is `SourceError`; no path, engine message or file content leaves this module.

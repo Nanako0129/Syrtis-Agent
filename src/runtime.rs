@@ -337,6 +337,11 @@ impl Runtime {
     /// stop what follows), then every cache entry of that producer is
     /// removed, then the error is returned. Any other error leaves the
     /// cache alone.
+    ///
+    /// DR-2b: after a success, also `PeerStore::set_label` with the label
+    /// the body carried (`Fetched::node_label`), naming the record used for
+    /// the fetch. The same label writes nothing; a refusal or a failed
+    /// write does not change the result.
     pub fn pull(
         &self,
         responder_static: &[u8; 32],
@@ -351,7 +356,14 @@ impl Runtime {
             &self.fetches,
         );
         match &result {
-            Ok(fetched) => self.remember(&record, query, &fetched.body),
+            Ok(fetched) => {
+                self.remember(&record, query, &fetched.body);
+                let _ = self.peers.set_label(
+                    &record.responder_static,
+                    &record.grant_id,
+                    fetched.node_label.clone(),
+                );
+            }
             Err(FetchError::Revoked) => self.forget(&record, PeerState::Revoked),
             Err(FetchError::Expired) => self.forget(&record, PeerState::Expired),
             Err(_) => {}
@@ -380,6 +392,20 @@ impl Runtime {
             return Ok(None);
         };
         cache.get(&cache_key(&record, query), now_ms)
+    }
+
+    /// DR-2b: whether the receiver cache holds any body from
+    /// `responder_static`, for any query (`CacheStore::has_peer`): the
+    /// producer has answered a pull before, and its entries have not been
+    /// removed since (a revoke, an expiry, `remove_peer`, eviction or
+    /// expiry of every entry). `false` without a cache. Read-only, and
+    /// grants nothing: no body is read and no record is consulted.
+    pub fn ever_answered(&self, responder_static: &[u8; 32]) -> bool {
+        self.inner.cache.as_ref().is_some_and(|cache| {
+            cache
+                .has_peer(&hex_encode(responder_static))
+                .unwrap_or(false)
+        })
     }
 
     /// Removes the producer `responder_static`: first its record with
@@ -956,12 +982,16 @@ mod tests {
     struct Empty;
 
     impl ReportSource for Empty {
-        fn report(&self, request: &ReportRequest, _: Instant) -> Result<Vec<u8>, SourceError> {
-            encode_response(&ReportResponse::<AgentsRecord>::from_request(
-                request,
-                Vec::new(),
-                false,
-            ))
+        fn report(
+            &self,
+            request: &ReportRequest,
+            node_label: Option<&str>,
+            _: Instant,
+        ) -> Result<Vec<u8>, SourceError> {
+            encode_response(&ReportResponse {
+                node_label: node_label.map(str::to_owned),
+                ..ReportResponse::<AgentsRecord>::from_request(request, Vec::new(), false)
+            })
             .map_err(|_| SourceError)
         }
     }
@@ -1003,6 +1033,110 @@ mod tests {
                     .starts_with("rcache-")
             })
             .count()
+    }
+
+    /// A producer runtime sharing on loopback with `label` stored, and a
+    /// receiver runtime paired with it. Returns both, the producer's static
+    /// and an agents query.
+    fn labeled_pair(
+        producer_home: &ShortHome,
+        receiver_home: &ShortHome,
+        label: &str,
+    ) -> (Runtime, Runtime, [u8; 32], ReportQuery) {
+        let producer = start(producer_home, Arc::new(Empty));
+        let port = free_port();
+        call(
+            &producer,
+            LISTEN_CONFIGURE,
+            json!({"bindHost": "127.0.0.1", "bindPort": port}),
+        );
+        producer
+            .store()
+            .set_listen_config(Some("127.0.0.1".into()), port, Some(label.into()))
+            .unwrap();
+        producer.enable_sharing().unwrap();
+        let offer = call(&producer, OFFER_CREATE, json!({"ttlSeconds": 600}));
+        let url = offer["pairUrl"].as_str().unwrap().to_owned();
+        let receiver = start(receiver_home, Arc::new(NoSource));
+        let identity = StaticKey::from_state(&receiver.store().state().unwrap()).unwrap();
+        let (ledger, clock) = (MemoryLedger::default(), SystemClock);
+        let client = PairingClient {
+            identity: &identity,
+            ledger: &ledger,
+            clock: &clock,
+        };
+        let now = clock.os_now_seconds().unwrap();
+        let claimed = client
+            .claim(&url, now * 1_000, &mut ClaimAttempts::default())
+            .unwrap();
+        approve(producer.store(), claimed.pending_id, 1, true, now).unwrap();
+        let confirmed = client.poll(&claimed).unwrap();
+        receiver
+            .peers()
+            .upsert(PeerRecord::from_confirmed(&confirmed, None, now * 1_000))
+            .unwrap();
+        let query = ReportQuery {
+            endpoint: Endpoint::Agents,
+            start_date: "2025-01-01".into(),
+            end_date_exclusive: "2025-02-01".into(),
+            timezone: "UTC".into(),
+            clients: vec![],
+        };
+        (producer, receiver, confirmed.responder_static, query)
+    }
+
+    /// DR-2b review: a `set_label` write that fails, at each kind of step
+    /// (writing the temp file, the rename, the directory sync after the
+    /// rename), neither fails the pull nor poisons the peer store: the
+    /// label still comes back in `Fetched`, the peer is still listed, the
+    /// temp file is gone, the stored label is what is on disk (old before
+    /// the rename, new after it), and the next pull stores the label.
+    #[test]
+    fn a_failed_label_write_does_not_fail_the_pull_or_hide_the_peers() {
+        for (step, stored_after_failure) in [
+            (Step::Write, None),
+            (Step::Rename, None),
+            (Step::SyncDir, Some("Studio Mac")),
+        ] {
+            let (producer_home, receiver_home) = (ShortHome::new(), ShortHome::new());
+            let (_producer, receiver, producer_static, query) =
+                labeled_pair(&producer_home, &receiver_home, "Studio Mac");
+            let _reset = Reset;
+            seams::set_hook(Some(Box::new(move |at| {
+                if at == step {
+                    Err(std::io::Error::other("injected"))
+                } else {
+                    Ok(())
+                }
+            })));
+            let fetched = receiver.pull(&producer_static, &query);
+            seams::set_hook(None);
+            assert_eq!(
+                fetched.unwrap().node_label.as_deref(),
+                Some("Studio Mac"),
+                "{step:?}"
+            );
+            let peers = receiver.peers().peers();
+            assert!(peers.is_ok(), "{step:?}: the peer store is unknown");
+            let peers = peers.unwrap();
+            assert_eq!(peers.len(), 1, "{step:?}");
+            assert_eq!(
+                peers[0].node_label.as_deref(),
+                stored_after_failure,
+                "{step:?}"
+            );
+            assert!(
+                !receiver_home.0.join("r/.peers.json.tmp").exists(),
+                "{step:?}: temp file left"
+            );
+            // The next pull works and stores the label.
+            receiver.pull(&producer_static, &query).unwrap();
+            assert_eq!(
+                receiver.peers().peers().unwrap()[0].node_label.as_deref(),
+                Some("Studio Mac"),
+                "{step:?}"
+            );
+        }
     }
 
     /// SA-2B3b acceptance (3c): the producer answers `revoked` and the

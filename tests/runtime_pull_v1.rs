@@ -123,18 +123,27 @@ mod disk {
         }
     }
 
-    /// An agents report with one record, echoing the request.
+    /// An agents report with the fixture's records, echoing the request,
+    /// with the label the producer passes (as `EngineSource` does).
     struct Stub;
 
     impl ReportSource for Stub {
-        fn report(&self, request: &ReportRequest, _: Instant) -> Result<Vec<u8>, SourceError> {
+        fn report(
+            &self,
+            request: &ReportRequest,
+            node_label: Option<&str>,
+            _: Instant,
+        ) -> Result<Vec<u8>, SourceError> {
             let bytes: &[u8] = include_bytes!("fixtures/v1/report/agents.json");
             let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
             let records = syrtis_agent::report::decode_response::<AgentsRecord>(bytes, None)
                 .map_err(|_| SourceError)?
                 .records;
-            encode_response(&ReportResponse::from_request(request, records, false))
-                .map_err(|_| SourceError)
+            encode_response(&ReportResponse {
+                node_label: node_label.map(str::to_owned),
+                ..ReportResponse::from_request(request, records, false)
+            })
+            .map_err(|_| SourceError)
         }
     }
 
@@ -348,6 +357,63 @@ mod disk {
             .unwrap()
             .unwrap();
         assert_eq!(cached.body(), body.as_slice());
+    }
+
+    /// DR-2b: a successful pull carries the producer's stored label and
+    /// `costIncomplete`, stores the label on the peer record (and only on a
+    /// change: the same label leaves `peers.json` unreplaced), and from then
+    /// on `ever_answered` is true. A label the producer clears is cleared.
+    /// Removing the producer ends `ever_answered`.
+    #[test]
+    fn a_pull_stores_the_producers_label_and_marks_it_answered() {
+        let pair = pair(None, SLOW);
+        let runtime = &pair.receiver.runtime;
+        let label = |label: Option<&str>| {
+            let store = pair.producer.runtime.store();
+            let config = store.state().unwrap().config;
+            store
+                .set_listen_config(config.bind_host, config.bind_port, label.map(str::to_owned))
+                .unwrap();
+        };
+        let record = || runtime.peers().peers().unwrap()[0].clone();
+        let peers_file = || {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(pair.receiver.home.root().join("peers.json"))
+                .unwrap()
+                .ino()
+        };
+        assert!(!runtime.ever_answered(&pair.producer_static));
+        let before = record();
+
+        label(Some("Studio Mac"));
+        let fetched = runtime.pull(&pair.producer_static, &query()).unwrap();
+        assert_eq!(fetched.node_label.as_deref(), Some("Studio Mac"));
+        assert!(!fetched.cost_incomplete);
+        assert_eq!(
+            record(),
+            PeerRecord {
+                node_label: Some("Studio Mac".into()),
+                ..before.clone()
+            }
+        );
+        assert!(runtime.ever_answered(&pair.producer_static));
+        assert!(!runtime.ever_answered(&[0x5a; 32]));
+
+        // The same label: nothing written. (The producer's rate tokens
+        // refill on its monotonic clock.)
+        let file = peers_file();
+        pair.producer.clock.sleep(Duration::from_secs(60));
+        runtime.pull(&pair.producer_static, &query()).unwrap();
+        assert_eq!(peers_file(), file, "an unchanged label rewrote peers.json");
+
+        label(None);
+        pair.producer.clock.sleep(Duration::from_secs(60));
+        let fetched = runtime.pull(&pair.producer_static, &query()).unwrap();
+        assert_eq!(fetched.node_label, None);
+        assert_eq!(record(), before);
+
+        runtime.remove_peer(&pair.producer_static).unwrap();
+        assert!(!runtime.ever_answered(&pair.producer_static));
     }
 
     /// `SA-3e`: `remove_peer` deletes the producer's record and its cache
