@@ -167,8 +167,8 @@ mod engine {
         state_store::StateStore,
     };
     use tokscale_core::{
-        RemotePricingSnapshot, RemoteSourceContextV1, RemoteSourceScopeTokenV1,
-        RemoteUsageBundleV1, RemoteUsageQueryV1, ScannerSettings,
+        RemotePricingDiagnostic, RemotePricingSnapshot, RemoteSourceContextV1,
+        RemoteSourceScopeTokenV1, RemoteUsageBundleV1, RemoteUsageQueryV1, ScannerSettings,
         aggregate_remote_usage_from_source_v1,
     };
 
@@ -276,13 +276,13 @@ mod engine {
 
     fn report(source: &EngineSource, endpoint: Endpoint, generation: u64) -> Vec<u8> {
         source
-            .report(&request(endpoint, generation), far())
+            .report(&request(endpoint, generation), None, far())
             .unwrap_or_else(|error| panic!("{endpoint:?}: {error:?}"))
     }
 
     fn denied(source: &EngineSource, generation: u64) -> bool {
         ENDPOINTS.iter().all(|endpoint| {
-            source.report(&request(*endpoint, generation), far()) == Err(SourceError)
+            source.report(&request(*endpoint, generation), None, far()) == Err(SourceError)
         })
     }
 
@@ -340,10 +340,16 @@ mod engine {
     /// Pricing for the sonnet model only, so one model has a cost and the
     /// other does not.
     fn write_pricing(dir: &Path) {
+        write_pricing_aged(dir, 0);
+    }
+
+    /// The same table, stamped `age` seconds ago.
+    fn write_pricing_aged(dir: &Path, age: u64) {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_secs();
+            .as_secs()
+            - age;
         let body = serde_json::json!({
             "timestamp": stamp,
             "data": {"claude-3-5-sonnet": {
@@ -491,6 +497,49 @@ mod engine {
                 && codex.sample_count > 0,
             "{codex:?}"
         );
+    }
+
+    /// DR-2b (e), end to end through `EngineSource`: `costIncomplete` is
+    /// true when the pricing table is missing or corrupt and false when it
+    /// is fresh or stale (each precondition read from the engine's own
+    /// diagnostic first), and the label the producer passes is the body's
+    /// `nodeLabel`.
+    #[test]
+    fn cost_incomplete_follows_the_pricing_diagnostic_and_the_label_is_sent() {
+        let home = TempDir::new("cost");
+        write_sessions(&home.path);
+        let store = open_store(&home.path);
+        let source = source(&store, &home.path, ScannerSettings::default());
+        source.approve(&store).unwrap();
+        let generation = generation(&store);
+        let dir = source.pricing_dir().to_path_buf();
+        let asked = request(Endpoint::Graph, generation);
+        let report = |label: Option<&str>| {
+            let body = source.report(&asked, label, far()).unwrap();
+            decode_response::<GraphRecord>(&body, Some(&asked)).unwrap()
+        };
+        let diagnostic = || RemotePricingSnapshot::from_cache_root(&dir).diagnostic();
+
+        assert_eq!(diagnostic(), Some(RemotePricingDiagnostic::Missing));
+        let missing = report(Some("Studio Mac"));
+        assert!(missing.cost_incomplete);
+        assert_eq!(missing.node_label.as_deref(), Some("Studio Mac"));
+
+        for name in ["pricing-litellm.json", "pricing-openrouter.json"] {
+            std::fs::write(dir.join(name), b"not json").unwrap();
+        }
+        assert_eq!(diagnostic(), Some(RemotePricingDiagnostic::Corrupt));
+        let corrupt = report(None);
+        assert!(corrupt.cost_incomplete);
+        assert_eq!(corrupt.node_label, None);
+
+        write_pricing_aged(&dir, 30 * 86_400);
+        assert_eq!(diagnostic(), Some(RemotePricingDiagnostic::Stale));
+        assert!(!report(None).cost_incomplete);
+
+        write_pricing(&dir);
+        assert_eq!(diagnostic(), None);
+        assert!(!report(Some("Studio Mac")).cost_incomplete);
     }
 
     /// Acceptance (2): no record → deny; `approve` → served.
@@ -706,7 +755,7 @@ mod engine {
         source.approve(&store).unwrap();
         let generation = generation(&store);
         assert_eq!(
-            source.report(&request(Endpoint::Graph, generation), Instant::now()),
+            source.report(&request(Endpoint::Graph, generation), None, Instant::now()),
             Err(SourceError)
         );
         report(&source, Endpoint::Graph, generation);

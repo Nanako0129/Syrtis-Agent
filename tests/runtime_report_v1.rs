@@ -51,8 +51,8 @@ mod disk {
         secure_fs::{SecureRoot, StorageError},
         security::{
             FRAME_PAYLOAD_MAX, Frame, FrameKind, GrantState, LOGICAL_BODY_MAX, MemoryLedger, Offer,
-            OfferClaim, OfferState, PairOffer, REMOTE_MEMORY_MAX, assemble_response, hex_encode,
-            offer_secret_hash, pair_url,
+            OfferClaim, OfferState, PairOffer, REMOTE_MEMORY_MAX, REPORT_SCHEMA_VERSION,
+            assemble_response, hex_encode, offer_secret_hash, pair_url,
         },
         state_store::{AuthorizationQuery, StateStore},
     };
@@ -101,13 +101,20 @@ mod disk {
         }
     }
 
-    type SourceFn = dyn Fn(&ReportRequest) -> Result<Vec<u8>, SourceError> + Send + Sync;
+    type SourceFn =
+        dyn Fn(&ReportRequest, Option<&str>) -> Result<Vec<u8>, SourceError> + Send + Sync;
 
+    /// A source closure; it gets the label the producer passes.
     struct FnSource(Box<SourceFn>);
 
     impl ReportSource for FnSource {
-        fn report(&self, request: &ReportRequest, _: Instant) -> Result<Vec<u8>, SourceError> {
-            (self.0)(request)
+        fn report(
+            &self,
+            request: &ReportRequest,
+            node_label: Option<&str>,
+            _: Instant,
+        ) -> Result<Vec<u8>, SourceError> {
+            (self.0)(request, node_label)
         }
     }
 
@@ -159,10 +166,36 @@ mod disk {
         fn new(
             source: impl Fn(&ReportRequest) -> Result<Vec<u8>, SourceError> + Send + Sync + 'static,
         ) -> Self {
+            Self::build(None, move |request, _| source(request))
+        }
+
+        /// DR-2b: a node whose `state.json` holds `label` exactly as written
+        /// there, past the setter's rule (as a state stored before that rule
+        /// would), served by the agents stub carrying the label the producer
+        /// passes to its source.
+        fn labeled(label: &str) -> Self {
+            Self::build(Some(label), |request, label| {
+                Ok(encode_response(&ReportResponse {
+                    node_label: label.map(str::to_owned),
+                    ..ReportResponse::from_request(request, agents_records(), false)
+                })
+                .unwrap())
+            })
+        }
+
+        fn build(
+            raw_label: Option<&str>,
+            source: impl Fn(&ReportRequest, Option<&str>) -> Result<Vec<u8>, SourceError>
+            + Send
+            + Sync
+            + 'static,
+        ) -> Self {
             let home = TempHome::new();
-            let store =
+            let open = || {
                 retry_busy(|| StateStore::open(SecureRoot::open_under(&home.0, SUFFIX)?, NOW))
-                    .unwrap();
+                    .unwrap()
+            };
+            let store = open();
             store.transition(|state| state.enable_sharing()).unwrap();
             let port = TcpListener::bind((LOOPBACK, 0))
                 .unwrap()
@@ -172,6 +205,21 @@ mod disk {
             store
                 .set_listen_config(Some(LOOPBACK.into()), port, None)
                 .unwrap();
+            let store = match raw_label {
+                None => store,
+                Some(label) => {
+                    drop(store);
+                    let path = SUFFIX
+                        .iter()
+                        .fold(home.0.clone(), |path, part| path.join(part))
+                        .join("state.json");
+                    let mut state: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    state["config"]["nodeLabel"] = label.into();
+                    std::fs::write(&path, CanonicalJsonV1::encode(&state).unwrap()).unwrap();
+                    open()
+                }
+            };
             let store = Arc::new(store);
             let clock = Arc::new(TestClock {
                 mono: Mutex::new(Duration::from_secs(1_000)),
@@ -350,7 +398,7 @@ mod disk {
             endpoint,
             grant_id: hex_encode(&granted.grant_id),
             protocol: 1,
-            report_schema: 1,
+            report_schema: REPORT_SCHEMA_VERSION,
             request_id: hex_encode(&REQUEST_ID),
             source_scope_generation: granted.source_scope_generation,
             start_date: "2025-01-01".into(),
@@ -872,9 +920,8 @@ mod disk {
         assert_eq!(refused(&node.fetch(&key, &other_id)), error_payload(1));
 
         type Breach = fn(&mut ReportRequest);
-        let breaches: [(&str, Breach); 11] = [
+        let breaches: [(&str, Breach); 10] = [
             ("aggregationRevision", |r| r.aggregation_revision = 2),
-            ("reportSchema", |r| r.report_schema = 2),
             ("tzdbRevision", |r| r.tzdb_revision = "2026b".into()),
             ("startDate", |r| r.start_date = "2025-13-01".into()),
             ("endDateExclusive", |r| {
@@ -956,6 +1003,107 @@ mod disk {
                 );
                 assert_eq!(refused(&frames), error_payload(code), "{keys:?} {size}");
             }
+        }
+    }
+
+    /// DR-2b (a), the producer: a Peer request naming a report schema
+    /// other than this producer's is `incompatible` (6), not `invalid`, for
+    /// an older and a newer one. Control: its own schema is served.
+    #[test]
+    fn a_report_schema_other_than_the_producers_is_incompatible() {
+        let node = Node::new(canonical);
+        let key = StaticKey::generate().unwrap();
+        let granted = node.grant(1, &key);
+        for schema in [REPORT_SCHEMA_VERSION - 1, REPORT_SCHEMA_VERSION + 1] {
+            let mut other = request(&granted, 4);
+            other.report_schema = schema;
+            assert_eq!(
+                refused(&node.fetch(&key, &other)),
+                error_payload(6),
+                "reportSchema {schema}"
+            );
+        }
+        complete(&node.fetch(&key, &request(&granted, 4)));
+    }
+
+    /// DR-2b (c) producer send and (f): the producer's label reaches the
+    /// receiver only inside an authorized response body. A stored label
+    /// that fails the label rule is sent as `null`. Error payloads stay the
+    /// fixed `{code, protocol}` bytes, and the pairing answers (claim,
+    /// status, Grant status) carry no label: the receiver's strict decoders
+    /// accept them, and the raw Grant status payload does not hold its
+    /// bytes.
+    #[test]
+    fn the_label_is_sent_only_in_an_authorized_response_body() {
+        for (stored, sent) in [
+            ("Studio Mac", Some("Studio Mac")),
+            ("Mac\u{202E}cod.exe", None),
+            ("tab\there", None),
+        ] {
+            let node = Node::labeled(stored);
+            let key = StaticKey::generate().unwrap();
+            let granted = node.grant(1, &key);
+            let body = complete(&node.fetch(&key, &request(&granted, 4)));
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["nodeLabel"].as_str(), sent, "{stored:?}");
+
+            let refusals = [
+                (
+                    2,
+                    request(
+                        &Granted {
+                            auth_epoch: granted.auth_epoch + 1,
+                            ..granted
+                        },
+                        4,
+                    ),
+                ),
+                (6, {
+                    let mut other = request(&granted, 4);
+                    other.report_schema = REPORT_SCHEMA_VERSION - 1;
+                    other
+                }),
+                (1, {
+                    let mut other = request(&granted, 4);
+                    other.start_date = "2025-13-01".into();
+                    other
+                }),
+            ];
+            for (code, refused_request) in refusals {
+                node.clock.advance(GRANT_REFILL);
+                let payload = refused(&node.fetch(&key, &refused_request));
+                assert_eq!(payload, error_payload(code), "{stored:?} {code}");
+            }
+
+            let receiver = Receiver::new();
+            let peer = node.pair(2, &receiver);
+            node.clock.advance(GRANT_REFILL);
+            let status = fetch_raw(
+                node.port(),
+                &receiver.key,
+                &node.responder,
+                REQUEST_ID,
+                CanonicalJsonV1::encode(
+                    &json!({"grantId": hex_encode(&peer.grant_id), "protocol": 1}),
+                )
+                .unwrap(),
+            );
+            assert_eq!(status.len(), 1);
+            assert_eq!(status[0].kind, FrameKind::Response, "{stored:?}");
+            let answer: serde_json::Value = serde_json::from_slice(&status[0].payload).unwrap();
+            assert_eq!(answer["state"], "active", "{stored:?}");
+            assert!(
+                !status[0]
+                    .payload
+                    .windows(stored.len())
+                    .any(|window| window == stored.as_bytes()),
+                "{stored:?} in a Grant status answer"
+            );
+            // The receiver gets the label through `fetch` (control: the
+            // label is set and reachable).
+            node.clock.advance(GRANT_REFILL);
+            let fetched = receiver.fetch(&peer, Endpoint::Agents).unwrap();
+            assert_eq!(fetched.node_label.as_deref(), sent, "{stored:?}");
         }
     }
 

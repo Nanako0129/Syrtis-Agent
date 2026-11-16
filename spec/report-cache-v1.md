@@ -21,7 +21,8 @@ application integration.
 ## Peer request and response
 
 `ReportRequest` and `ReportResponse<R>` use `CanonicalJsonV1`. The response
-repeats every request field byte-for-byte and adds `records` and `saturated`.
+repeats every request field byte-for-byte and adds `records`, `saturated`,
+`nodeLabel` and `costIncomplete` (`DR-2b`), all four required.
 Unknown or missing fields, non-canonical bytes, wrong revisions, invalid IDs,
 invalid dates, unsorted clients, and endpoint/type mismatches are rejected.
 
@@ -34,11 +35,13 @@ invalid dates, unsorted clients, and endpoint/type mismatches are rejected.
 | `endpoint` | `1=graph`, `2=models`, `3=hourly`, `4=agents` |
 | `grantId`, `requestId` | lowercase 16-byte hex |
 | `protocol` | `u16`, exactly `1` |
-| `reportSchema` | `u16`, exactly `1` |
+| `reportSchema` | `u16`, exactly `2` |
 | `sourceScopeGeneration` | `u64` |
 | `timezone` | non-empty NFC string, at most 255 UTF-8 bytes |
 | `tzdbRevision` | exactly `2026c` |
 | `saturated` | `bool`; true if any `u64` merge add saturated |
+| `nodeLabel` | The producer's `config.nodeLabel` or `null`. A string passes `security::valid_node_label`: 1–128 bytes, NFC, not only whitespace, no Cc, Zl or Zp character and none of U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069. The producer sends `null` for a stored label that fails it; `decode_response` reads such a label as `null` and keeps the rest of the body |
+| `costIncomplete` | `bool`; true when the pricing table the producer priced the body with is missing or corrupt (the engine's `RemotePricingDiagnostic::Missing` or `Corrupt`), so a cost may be zero; false when it is fresh or stale. Only the boolean is sent, never the diagnostic |
 
 All numerator fields are `u64` and merge with saturating addition. Optional
 `model` and `provider` values are NFC strings or `null`; `client` and `agent`
@@ -72,7 +75,8 @@ production filesystem is outside SA-0.
 
 | Cache key field | Type and rule |
 |---|---|
-| `aggregationRevision`, `reportSchema` | `u16`, exactly `1` |
+| `aggregationRevision` | `u16`, exactly `1` |
+| `reportSchema` | `u16`, exactly `2` |
 | `authEpoch`, `sourceScopeGeneration` | `u64` |
 | `clients` | Same sorted, unique list as the request |
 | `endDateExclusive`, `startDate`, `timezone`, `tzdbRevision` | Same request values |

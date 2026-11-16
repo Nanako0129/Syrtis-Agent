@@ -280,12 +280,6 @@ fn every_load_rule_fails_closed_and_its_control_loads() {
             set(&["peers", "0", "port"], 65_535.into()),
         ),
         (
-            "nodeLabel 129 bytes",
-            Corrupt,
-            set(&["peers", "0", "nodeLabel"], "x".repeat(129).into()),
-            set(&["peers", "0", "nodeLabel"], "x".repeat(128).into()),
-        ),
-        (
             "state outside the three",
             Corrupt,
             set(&["peers", "0", "state"], "approved".into()),
@@ -317,6 +311,25 @@ fn every_load_rule_fails_closed_and_its_control_loads() {
     };
     assert_eq!(decode_peers(&label("e\u{301}")), Err(Corrupt), "non-NFC");
     assert!(decode_peers(&label("\u{e9}")).is_ok(), "control NFC");
+    // DR-2b (c), the `peers.json` use point: a label failing the label rule
+    // is read as `None`; the file and every other field still load.
+    for bad in [
+        "x".repeat(129),
+        "Mac\u{202E}exe".into(),
+        "a\u{7}b".into(),
+        "\u{2028}".into(),
+        "   ".into(),
+        String::new(),
+    ] {
+        let peers = decode_peers(&label(&bad)).unwrap_or_else(|error| panic!("{bad:?}: {error:?}"));
+        assert_eq!(peers[0], record(1), "{bad:?}");
+        assert_eq!(peers[1], record(2), "{bad:?}");
+    }
+    let kept = decode_peers(&label(&"x".repeat(128))).unwrap();
+    assert_eq!(
+        kept[0].node_label.as_deref(),
+        Some("x".repeat(128).as_str())
+    );
     // The read bound, also applied by the decoder.
     assert_eq!(decode_peers(&vec![b' '; 1024 * 1024 + 1]), Err(Corrupt));
     // `expiresAt` is the producer's clock, `createdAt` the receiver's: an
@@ -797,6 +810,72 @@ mod disk {
     /// record is refused, an equal or higher one replaces; `update_grant`
     /// changes only the matching `active` record and never lowers the
     /// epoch. Each refusal has a control that the same call succeeds.
+    /// DR-2b (d): `set_label` stores the label on the record holding the
+    /// grant and nothing else; an unknown producer is `Refused(Invalid)`,
+    /// another grant `Refused(Conflict)`, an invalid label
+    /// `Refused(Invalid)`, each with the file untouched. A revoked record
+    /// stays revoked, a removed producer is not added back, and the same
+    /// label writes nothing.
+    #[test]
+    fn set_label_names_the_grant_and_never_changes_state_or_adds_a_record() {
+        use syrtis_agent::security::SecurityError::{Conflict, Invalid};
+        let home = TempHome::new();
+        let (_state, peers) = open_both(&home.path);
+        peers.upsert(record(1)).unwrap();
+        peers.upsert(record(2)).unwrap();
+        let file = home.read_peers();
+        let label = || Some("Studio Mac".to_owned());
+
+        assert_eq!(
+            peers.set_label(&[99; 32], &[99; 16], label()),
+            Err(StorageError::Refused(Invalid))
+        );
+        assert_eq!(
+            peers.set_label(&[1; 32], &[0xee; 16], label()),
+            Err(StorageError::Refused(Conflict))
+        );
+        assert_eq!(
+            peers.set_label(&[1; 32], &[1; 16], Some("Mac\u{202E}exe".into())),
+            Err(StorageError::Refused(Invalid))
+        );
+        assert_eq!(home.read_peers(), file);
+
+        peers.set_label(&[1; 32], &[1; 16], label()).unwrap();
+        let labeled = PeerRecord {
+            node_label: label(),
+            ..record(1)
+        };
+        assert_eq!(peers.peers().unwrap(), vec![labeled.clone(), record(2)]);
+        // The same label again: no write (the file is not replaced).
+        let inode = || {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(home.peers_file()).unwrap().ino()
+        };
+        let before = inode();
+        peers.set_label(&[1; 32], &[1; 16], label()).unwrap();
+        assert_eq!(inode(), before);
+
+        // A revoked record takes a label and stays revoked.
+        peers
+            .set_state(&[2; 32], &[2; 16], PeerState::Revoked)
+            .unwrap();
+        peers.set_label(&[2; 32], &[2; 16], label()).unwrap();
+        let revoked = &peers.peers().unwrap()[1];
+        assert_eq!(revoked.state, PeerState::Revoked);
+        assert_eq!(revoked.node_label, label());
+
+        // A removed producer is not added back; `None` clears a label.
+        peers.remove(&[2; 32]).unwrap();
+        assert_eq!(
+            peers.set_label(&[2; 32], &[2; 16], label()),
+            Err(StorageError::Refused(Invalid))
+        );
+        peers.set_label(&[1; 32], &[1; 16], None).unwrap();
+        drop((_state, peers));
+        let (_state, peers) = open_both(&home.path);
+        assert_eq!(peers.peers().unwrap(), vec![record(1)]);
+    }
+
     #[test]
     fn grant_guards_refuse_stale_writes_and_leave_the_file_alone() {
         use syrtis_agent::security::SecurityError::{Conflict, Invalid};

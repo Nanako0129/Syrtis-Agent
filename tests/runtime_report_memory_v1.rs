@@ -25,7 +25,7 @@ use syrtis_agent::{
         ReportRequest, ReportResponse, decode_response, encode_response,
     },
     report_peer::{VALUE_STRINGS_MAX, decode_reservation, scan},
-    security::{FRAME_PAYLOAD_MAX, LOGICAL_BODY_MAX, REMOTE_MEMORY_MAX},
+    security::{FRAME_PAYLOAD_MAX, LOGICAL_BODY_MAX, REMOTE_MEMORY_MAX, REPORT_SCHEMA_VERSION},
 };
 
 struct Counting;
@@ -96,7 +96,7 @@ fn request(endpoint: Endpoint) -> ReportRequest {
         endpoint: endpoint.into(),
         grant_id: "11".repeat(16),
         protocol: 1,
-        report_schema: 1,
+        report_schema: REPORT_SCHEMA_VERSION,
         request_id: "22".repeat(16),
         source_scope_generation: 1,
         start_date: "2025-01-01".into(),

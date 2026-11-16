@@ -19,8 +19,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokscale_core::{
     RemoteAgentsRecordV1, RemoteGraphRecordV1, RemoteHourlyRecordV1, RemoteModelsRecordV1,
-    RemotePricingSnapshot, RemoteSourceContextV1, RemoteSourceScopeTokenV1, RemoteUsageQueryV1,
-    ScannerSettings, aggregate_remote_usage_from_source_v1,
+    RemotePricingDiagnostic, RemotePricingSnapshot, RemoteSourceContextV1,
+    RemoteSourceScopeTokenV1, RemoteUsageQueryV1, ScannerSettings,
+    aggregate_remote_usage_from_source_v1,
 };
 
 use crate::{
@@ -303,6 +304,7 @@ impl EngineSource {
         &self,
         request: &ReportRequest,
         endpoint: Endpoint,
+        node_label: Option<&str>,
     ) -> Result<(Vec<u8>, BTreeSet<String>), SourceError> {
         let fingerprint = RemoteSourceContextV1::preview_fingerprint(
             &self.home,
@@ -335,7 +337,13 @@ impl EngineSource {
         // if scans are measured to dominate.
         let bundle = aggregate_remote_usage_from_source_v1(&context, &query, &pricing)
             .map_err(|_| SourceError)?;
-        let saturated = bundle.saturated;
+        // The flag is read here, on the producer, from the snapshot this
+        // fold was priced with.
+        let meta = Meta {
+            saturated: bundle.saturated,
+            node_label,
+            cost_incomplete: cost_incomplete(pricing.diagnostic()),
+        };
         let families: BTreeSet<String> = (bundle.graph.iter().map(|r| &r.client))
             .chain(bundle.models.iter().map(|r| &r.client))
             .chain(bundle.hourly.iter().map(|r| &r.client))
@@ -343,10 +351,10 @@ impl EngineSource {
             .cloned()
             .collect();
         let body = match endpoint {
-            Endpoint::Graph => encode(request, bundle.graph.into_iter().map(graph), saturated),
-            Endpoint::Models => encode(request, bundle.models.into_iter().map(models), saturated),
-            Endpoint::Hourly => encode(request, bundle.hourly.into_iter().map(hourly), saturated),
-            Endpoint::Agents => encode(request, bundle.agents.into_iter().map(agents), saturated),
+            Endpoint::Graph => encode(request, bundle.graph.into_iter().map(graph), meta),
+            Endpoint::Models => encode(request, bundle.models.into_iter().map(models), meta),
+            Endpoint::Hourly => encode(request, bundle.hourly.into_iter().map(hourly), meta),
+            Endpoint::Agents => encode(request, bundle.agents.into_iter().map(agents), meta),
         }?;
         Ok((body, families))
     }
@@ -372,7 +380,12 @@ impl ReportSource for EngineSource {
     /// Errors carry no path or engine text: every failure is [`SourceError`].
     /// A deadline already passed, an unknown endpoint or a scope denial is
     /// refused before the engine runs, and is not recorded as a scan.
-    fn report(&self, request: &ReportRequest, deadline: Instant) -> Result<Vec<u8>, SourceError> {
+    fn report(
+        &self,
+        request: &ReportRequest,
+        node_label: Option<&str>,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, SourceError> {
         if Instant::now() > deadline {
             return Err(SourceError);
         }
@@ -380,7 +393,7 @@ impl ReportSource for EngineSource {
         if !self.approved(request) {
             return Err(SourceError);
         }
-        let result = self.scan(request, endpoint).and_then(|done| {
+        let result = self.scan(request, endpoint, node_label).and_then(|done| {
             (Instant::now() <= deadline)
                 .then_some(done)
                 .ok_or(SourceError)
@@ -398,16 +411,36 @@ impl ReportSource for EngineSource {
     }
 }
 
+/// What the response carries besides the records.
+#[derive(Clone, Copy)]
+struct Meta<'a> {
+    saturated: bool,
+    node_label: Option<&'a str>,
+    cost_incomplete: bool,
+}
+
+/// DR-2b `costIncomplete`: a pricing half that prices nothing (`Missing`,
+/// `Corrupt`) can leave costs at zero; a `Stale` table still prices. Only
+/// the boolean leaves the producer, never the diagnostic itself (it would
+/// tell the clock and how often prices are fetched). Exhaustive: an engine
+/// pin that adds a diagnostic stops compiling here.
+fn cost_incomplete(diagnostic: Option<RemotePricingDiagnostic>) -> bool {
+    match diagnostic {
+        Some(RemotePricingDiagnostic::Missing | RemotePricingDiagnostic::Corrupt) => true,
+        Some(RemotePricingDiagnostic::Stale) | None => false,
+    }
+}
+
 fn encode<R: ReportRecord>(
     request: &ReportRequest,
     records: impl Iterator<Item = R>,
-    saturated: bool,
+    meta: Meta<'_>,
 ) -> Result<Vec<u8>, SourceError> {
-    encode_response(&ReportResponse::from_request(
-        request,
-        records.collect(),
-        saturated,
-    ))
+    encode_response(&ReportResponse {
+        node_label: meta.node_label.map(str::to_owned),
+        cost_incomplete: meta.cost_incomplete,
+        ..ReportResponse::from_request(request, records.collect(), meta.saturated)
+    })
     .map_err(|_| SourceError)
 }
 
@@ -483,5 +516,19 @@ fn agents(record: RemoteAgentsRecordV1) -> AgentsRecord {
         message_count: record.message_count,
         turn_count: record.turn_count,
         cost_nano_usd: record.cost_nano_usd,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DR-2b (e): Missing and Corrupt are incomplete; None and Stale are not.
+    #[test]
+    fn cost_is_incomplete_only_for_a_missing_or_corrupt_table() {
+        assert!(cost_incomplete(Some(RemotePricingDiagnostic::Missing)));
+        assert!(cost_incomplete(Some(RemotePricingDiagnostic::Corrupt)));
+        assert!(!cost_incomplete(Some(RemotePricingDiagnostic::Stale)));
+        assert!(!cost_incomplete(None));
     }
 }

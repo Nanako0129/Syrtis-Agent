@@ -292,6 +292,20 @@ impl CacheStore {
         self.remove_where(|entry| now_ms >= entry.expires_at_ms)
     }
 
+    /// DR-2b: whether any entry of `peer_static` (lowercase hex) is
+    /// indexed, for any query or grant. Read-only: no file is read. Only a
+    /// successful pull writes a receiver entry, so this says the producer
+    /// has answered before and its entries have not been removed since.
+    /// `Unknown` in the sticky unknown state.
+    pub fn has_peer(&self, peer_static: &str) -> Result<bool, StorageError> {
+        Ok(self
+            .lock()
+            .as_ref()
+            .ok_or(StorageError::Unknown)?
+            .values()
+            .any(|entry| entry.peer_static == peer_static))
+    }
+
     /// Indexed entries; `Unknown` in the sticky unknown state.
     pub fn len(&self) -> Result<usize, StorageError> {
         Ok(self.lock().as_ref().ok_or(StorageError::Unknown)?.len())

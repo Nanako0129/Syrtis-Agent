@@ -2143,9 +2143,11 @@ fn consent_surface_and_privacy_registry() {
                 "aggregationRevision",
                 "authEpoch",
                 "clients",
+                "costIncomplete",
                 "endDateExclusive",
                 "endpoint",
                 "grantId",
+                "nodeLabel",
                 "protocol",
                 "records",
                 "reportSchema",
@@ -2486,6 +2488,18 @@ fn consent_surface_and_privacy_registry() {
         // SA-0G: the control-only fields never reach a peer.
         for control in ["enabled", "ownerInputsSha256", "scopeApproved"] {
             assert!(!fields.contains(&control), "{name} carries {control}");
+        }
+    }
+    // DR-2b (f): of the surfaces that reach a peer, only the authorized
+    // response body carries the producer's label; no pairing surface, Pair
+    // URL or error payload does.
+    for (name, facing, fields) in named_protocol_surfaces {
+        if *facing == Facing::Peer {
+            assert_eq!(
+                fields.contains(&"nodeLabel"),
+                *name == "Peer response envelope",
+                "{name} and nodeLabel"
+            );
         }
     }
     // SA-0G: each new field name is in the registry it was added to.

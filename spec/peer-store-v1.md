@@ -33,7 +33,7 @@ Reads and writes use the root's agent-file rules unchanged (`read_file`, `stage`
 | `expiresAt` | Unix milliseconds on the producer's wall clock (from Grant status), signed integer |
 | `host` | String: the host of the claimed Pair URL |
 | `port` | Integer: the port of the claimed Pair URL |
-| `nodeLabel` | The receiver's own label for the producer: a string of at most 128 bytes, NFC, or `null` |
+| `nodeLabel` | The name the producer gave in its latest successful response (`set_label`), or `null`: a string passing `security::valid_node_label` (1–128 bytes, NFC, no control, separator or bidirectional formatting character, not only whitespace) |
 | `state` | `active`, `revoked` or `expired` |
 
 Every field other than `nodeLabel` is required and never `null`. `peers` is sorted by `responderStatic`, holds at most one record per `responderStatic`, and at most 16 records.
@@ -49,13 +49,14 @@ Load fails closed. An absent `peers.json` is an empty list, and opening does not
 | More than 16 records; `responderStatic` not strictly increasing (unsorted or repeated) | `corrupt` |
 | An ID or static whose hex is not lowercase or not the exact length | `corrupt` |
 | `host` and `port` refused by the frozen Pair URL rule (canonical host, port at least 1024), checked through the public `pair_url` rather than a second copy of the rule | `corrupt` |
-| `nodeLabel` over 128 bytes | `corrupt` |
+
+A `nodeLabel` that fails `security::valid_node_label` (over 128 bytes, for example) is read as `null`; the file still loads (`DR-2b`).
 
 `expiresAt` is not compared with `createdAt`: the first is the producer's clock and the second the receiver's, and they cannot be compared.
 
 ## Writes
 
-Every write builds the next list, encodes it, and runs those bytes through the load decoder before staging them: the store never writes a file that load would refuse. A write load would refuse is `refused(invalid)` and writes nothing; it is a caller error, so the store does not become unknown. So is a guard refusal (`refused(conflict)` below). A write that leaves the list unchanged writes nothing.
+Every write builds the next list, encodes it, and runs those bytes through the load decoder before staging them: the store never writes a file that load would refuse, or would read back as another list (a label load would read as `null`). A write load would refuse is `refused(invalid)` and writes nothing; it is a caller error, so the store does not become unknown. So is a guard refusal (`refused(conflict)` below). A write that leaves the list unchanged writes nothing.
 
 A caller recording what a producer answered names the record by the `responderStatic` and `grantId` of the record it asked with, never by bytes of the answer (`spec/report-peer-v1.md`, "Receiver").
 
@@ -64,6 +65,7 @@ A caller recording what a producer answered names the record by the `responderSt
 | `upsert(record)` | Only an `active` record. A record for a `responderStatic` already present replaces it (re-pairing) when its `authEpoch` is equal or higher; a lower one is `refused(conflict)`, so a stale answer cannot overwrite a newer pairing. A new one is inserted in order. A 17th distinct producer is `refused(bounds)`. Anything else load would refuse (an over-long or non-NFC `nodeLabel`, a non-canonical `host`, a `port` below 1024) is `refused(invalid)` |
 | `set_state(responderStatic, grantId, state)` | `revoked` or `expired` only; `active` comes only from `upsert`. An unknown producer is `refused(invalid)`; a record holding another `grantId` (the producer was paired again since) is `refused(conflict)` |
 | `update_grant(responderStatic, grantId, authEpoch, sourceScopeGeneration, expiresAt)` | Stores what Grant status answered `active`. Only the record holding `grantId` and still `active`, and never to a lower `authEpoch` (equal is allowed); otherwise `refused(conflict)`. An unknown producer is `refused(invalid)` |
+| `set_label(responderStatic, grantId, nodeLabel)` | `DR-2b`: stores the label of the producer's latest successful response. Only the record holding `grantId`: an unknown producer is `refused(invalid)`, another `grantId` `refused(conflict)`, a label failing `security::valid_node_label` `refused(invalid)`. It never changes `state` or any other field and never adds a record; it is not `upsert`. The same label writes nothing. `Runtime::pull` calls it after a successful fetch; its failure does not change the pull's result |
 | `remove(responderStatic)` | Removes that producer's record; an absent one is not an error |
 | `peers()` | A snapshot, sorted by `responderStatic` |
 

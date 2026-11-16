@@ -17,7 +17,7 @@ A Peer request arrives on a connection accepted by the product listener and serv
 | 1 | Handshake, frame kind Request, payload ≤ `FRAME_PAYLOAD_MAX` (61,402, enforced by the frozen `Frame::decode`), CanonicalJsonV1, exact key set equal to the Peer request set, `protocol` an integer equal to `1`, typed decode into the frozen `ReportRequest`, payload `requestId` equal to the frame header's `requestId` | Frame and handshake failures close without a frame (`spec/pairing-v1.md`); otherwise `invalid`, and an integer `protocol` other than `1` is `incompatible`. Reads no state |
 | 2 | Static binding: from one `StateStore::state()` snapshot, the grant whose `grantId` is the request's, and the Noise remote static equal to its `initiatorStatic` (constant-time) | `unauthorized`. A `grantId` that is not 16-byte lowercase hex, an unknown grant and a foreign static send the same payload. An unreadable state answers by the store error map of `spec/pairing-v1.md` |
 | 3 | Authorization: `StateStore::authorize` with the request's `grantId`, `authEpoch`, `sourceScopeGeneration`, `endpoint` and the OS wall clock now | See "Refusal codes" |
-| 4 | `ReportRequest::validate` | `invalid` |
+| 4 | `reportSchema` equal to this producer's `REPORT_SCHEMA_VERSION` (`2`; one version only), then `ReportRequest::validate` | Another `reportSchema`: `incompatible`. Otherwise `invalid` |
 | 5 | Per-grant limit ("Limits") | `busy` |
 | 6 | Compute slot ("Report source") | `busy` |
 | 7 | Call the source; check the body length is 1..=`LOGICAL_BODY_MAX`; reserve the length on the memory ledger | A source error, a result returned at or after the compute deadline, an empty body or one over 16,777,216 bytes is `internal`, and no chunk is sent; a refused reservation is `busy` |
@@ -57,11 +57,11 @@ Per grant, after steps 2–4, so only an authorized, valid request is counted. T
 
 ```rust
 trait ReportSource: Send + Sync {
-    fn report(&self, request: &ReportRequest, deadline: Instant) -> Result<Vec<u8>, SourceError>;
+    fn report(&self, request: &ReportRequest, node_label: Option<&str>, deadline: Instant) -> Result<Vec<u8>, SourceError>;
 }
 ```
 
-The source returns the canonical `ReportResponse` body for the request's endpoint. The producer does not decode or validate it; the receiver validates the echo. `NoSource`, used until `SA-2B3`, always fails, so every authorized request is `internal`.
+The source returns the canonical `ReportResponse` body for the request's endpoint, with `nodeLabel` equal to `node_label` and `costIncomplete` from the pricing table it priced the body with (`spec/report-cache-v1.md`). `node_label` is the producer's `config.nodeLabel` from the step 2 snapshot, `None` when it fails `security::valid_node_label` (a label stored before that rule). The producer does not decode or validate the body; the receiver validates the echo. The label reaches a peer only in this body: never in a pairing answer, a Pair URL, the SAS input or an error payload. `NoSource`, used until `SA-2B3`, always fails, so every authorized request is `internal`.
 
 - **Compute slot.** One per `Reports` value, with no queue: a second request while the source runs is `busy`. The listener holds one `Reports`, and the agent runs one listener per process, so in the product that is one computation per process. The slot is released only when the source call returns, however late.
 - **Deadline.** 120 s on the producer's injectable monotonic clock, measured from just before the call. The source gets the same deadline as an `Instant` and must keep to it itself: nothing interrupts it. A result returned at or after the deadline is discarded and answered `internal`.
@@ -99,7 +99,7 @@ A client that stops reading makes a chunk's write time out after at most 2 s; th
 
 ## Receiver
 
-`report_peer::fetch(peer, query, stateStore, ledger, limiter)` asks the producer named by one peer record for one report and returns `Fetched { body, records, saturated }`, the records typed by the endpoint asked for. The producer is untrusted for framing, size and content. `fetch` never retries, never polls in the background and writes no cache and no log.
+`report_peer::fetch(peer, query, stateStore, ledger, limiter)` asks the producer named by one peer record for one report and returns `Fetched { body, records, saturated, node_label, cost_incomplete }`, the records typed by the endpoint asked for. `node_label` is the body's `nodeLabel`, `None` when it fails `security::valid_node_label` (the body is still accepted); `cost_incomplete` is the body's `costIncomplete`. The producer is untrusted for framing, size and content. `fetch` never retries, never polls in the background and writes no cache and no log.
 
 `query` is the endpoint, `startDate`, `endDateExclusive`, `timezone` and `clients`. Everything else in the Peer request comes from the record (`grantId`, `authEpoch`, `sourceScopeGeneration`) or is a protocol constant; `requestId` is 16 random bytes, the same in the payload and in the frame header.
 
@@ -126,7 +126,8 @@ Any failure discards everything received and returns every reservation. Errors c
 | 2 | `CheckGrantStatus`: the grant may be fine and the record stale (a revocation of another grant renumbers `authEpoch`). The caller asks Grant status (`PairingClient::grant_status`) and stores its answer with `PeerStore::update_grant` |
 | 5 | `Busy`. The producer answers `busy` after its rate step too, with a token already spent (section "Limits"), so the caller must not retry at once: not before 60 s |
 | 8 | `Internal` |
-| 1, 6 | `Rejected` |
+| 1 | `Rejected` |
+| 6 | `Incompatible`: the producer speaks another report schema. Not retried with another version |
 | Another code, `protocol` other than 1, or a payload that is not a CanonicalJsonV1 `{code, protocol}` | `Protocol` |
 
 **Which record.** Nothing in the reply chooses the type, the endpoint or the record: the reply is checked against the request this receiver built. A caller that updates `peers.json` after a fetch (`set_state`, `update_grant`) names the record by the `responderStatic` and `grantId` of the record it fetched with, never by bytes of the reply. `PeerStore` refuses a write naming another `grantId` (`spec/peer-store-v1.md`).
@@ -138,7 +139,7 @@ The frozen decoder builds a `serde_json` value tree (objects are `BTreeMap<Strin
 **Shape gate.** It refuses, before any tree is built, the structures the typed decode or `validate` refuses anyway, and it replaces none of the decoder's checks, which all still run in step 11. Two limits come on top and are the receiver's own: the decoder would accept a body over them (only the 8 MiB one can be reached within 16 MiB).
 
 - No whitespace and nothing after the top-level value (CanonicalJsonV1 has neither).
-- The top level is an object whose keys are exactly the 15 response keys, in canonical order, written without escapes.
+- The top level is an object whose keys are exactly the 17 response keys, in canonical order, written without escapes.
 - `clients` is an array of at most 128 strings. `records` is an array of objects, each with exactly the endpoint's record keys in canonical order, and each value a string, an integer or `null`.
 - Every other top-level value is a string, an integer, `true`, `false` or `null`. No other array or object appears anywhere (depth at most 3).
 - An integer has at most 20 digits; a fraction or exponent (a float) is refused.
@@ -151,7 +152,7 @@ The frozen decoder builds a `serde_json` value tree (objects are `BTreeMap<Strin
 
 | Term | Bytes |
 |---|---|
-| Object nodes, per object | `std`'s B-tree holds 11 entries per node. A leaf is `16 + 11 × (size_of String + size_of Value)` and an internal node a leaf plus 12 edge pointers, each rounded up to 16 (640 and 736 on 64-bit). 1–11 entries: one leaf. 12–17 entries: two leaves and one internal node, whether the map is built by insertion (the second tree) or in bulk (the first): after the split at 12 each leaf holds at least 5, so neither can split again before 18. The gate admits only 13–15 |
+| Object nodes, per object | `std`'s B-tree holds 11 entries per node. A leaf is `16 + 11 × (size_of String + size_of Value)` and an internal node a leaf plus 12 edge pointers, each rounded up to 16 (640 and 736 on 64-bit). 1–11 entries: one leaf. 12–17 entries: two leaves and one internal node, whether the map is built by insertion (the second tree) or in bulk (the first): after the split at 12 each leaf holds at least 5, so neither can split again before 18. The gate admits only 13–17. The response object has 17 keys since `DR-2b`, the top of this range: another response key needs this term recomputed |
 | Strings | Each key and each value string: its decoded length rounded up to 16, bounded as `bytes + 15 × count` |
 | Value slots | `size_of Value` for the top-level value and twice for each array element (`Vec` growth); map values live inside the nodes |
 | One tree | nodes + strings + value slots |
@@ -220,5 +221,16 @@ Receiver (`SA-2B2b2`):
 | (7) nothing sent for an unusable record or a bad query | `unusable_records_and_bad_queries_never_connect` |
 | (8) the absolute deadline | unit `the_fetch_deadline_is_absolute` (a shortened deadline: a silent producer, and chunks 300 ms apart that together outlast it) |
 | (9) `peer_store` guards | `spec/peer-store-v1.md` |
+
+`DR-2b` (`nodeLabel`, `costIncomplete`, report schema 2):
+
+| Acceptance | Test |
+|---|---|
+| (a) `reportSchema` mismatch, each direction | producer `a_report_schema_other_than_the_producers_is_incompatible`; receiver unit `error_codes_map_to_their_variants` (code 6 is `Incompatible`) |
+| (b) the label rule, NFC on set | `tests/runtime_storage_v1.rs` `the_node_label_rule_refuses_each_class_and_stores_nfc` |
+| (c) the four use points | set: (b); send: `the_label_is_sent_only_in_an_authorized_response_body`; receive: unit `the_label_and_cost_flag_reach_fetched_and_a_bad_label_is_dropped`, `tests/report_cache_v1.rs` `strict_report_echo_and_field_validation`; `peers.json`: `tests/runtime_peer_store_v1.rs` `every_load_rule_fails_closed_and_its_control_loads` |
+| (d) `set_label` | `tests/runtime_peer_store_v1.rs` `set_label_names_the_grant_and_never_changes_state_or_adds_a_record`; `tests/runtime_pull_v1.rs` `a_pull_stores_the_producers_label_and_marks_it_answered`; unit `runtime::tests::a_failed_label_write_does_not_fail_the_pull` |
+| (e) `costIncomplete` | `tests/runtime_source_v1.rs` `cost_incomplete_follows_the_pricing_diagnostic_and_the_label_is_sent`; unit `source::tests::cost_is_incomplete_only_for_a_missing_or_corrupt_table` |
+| (f) no label outside a response body | `the_label_is_sent_only_in_an_authorized_response_body`; `tests/security_contract_v1.rs` `consent_surface_and_privacy_registry` |
 
 The tests that need a secure root run on macOS and Linux; the unit tests of the limit, the slot and the code numbering, the receiver unit tests (a scripted producer that completes a real handshake, then writes any frame) and the memory measurement run on all three platforms.

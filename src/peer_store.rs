@@ -15,8 +15,9 @@ use crate::{
     secure_fs::{SecureRoot, StorageError},
     security::{
         PEER_PROTOCOL_VERSION, PairOffer, SecurityError, decode_fixed_hex, hex_encode, pair_url,
+        valid_node_label,
     },
-    state_store::{NODE_LABEL_MAX_BYTES, StateStore},
+    state_store::StateStore,
 };
 
 pub const PEERS_FILE: &str = "peers.json";
@@ -45,6 +46,9 @@ pub struct PeerRecord {
     pub grant_id: [u8; 16],
     pub host: String,
     pub initiator_static: [u8; 32],
+    /// DR-2b: the label the producer sent in its latest successful
+    /// response (`PeerStore::set_label`), or `None`. Always passes
+    /// `security::valid_node_label` once loaded.
     pub node_label: Option<String>,
     pub pending_id: [u8; 16],
     pub port: u16,
@@ -56,7 +60,8 @@ pub struct PeerRecord {
 impl PeerRecord {
     /// The record for a grant Grant status confirmed `active`. `host` and
     /// `port` are the claimed offer's, carried by the grant; `node_label` is
-    /// the receiver's own input. Nothing is validated here:
+    /// the first label to show (a pull replaces it with the producer's own,
+    /// `PeerStore::set_label`). Nothing is validated here:
     /// [`PeerStore::upsert`] refuses what load would refuse.
     pub fn from_confirmed(
         grant: &ConfirmedGrant,
@@ -144,7 +149,9 @@ pub fn encode_peers(peers: &[PeerRecord]) -> Result<Vec<u8>, StorageError> {
 
 /// Strict decode of `peers.json`, the one load rule: an integer `schema`
 /// other than 1 is `Incompatible`; everything else that fails is `Corrupt`.
-/// Every write runs its bytes through this first.
+/// A `nodeLabel` failing `security::valid_node_label` is read as `None`
+/// (DR-2b): a label never makes the file unreadable. Every write runs its
+/// bytes through this first.
 pub fn decode_peers(bytes: &[u8]) -> Result<Vec<PeerRecord>, StorageError> {
     if bytes.len() > PEERS_FILE_MAX_BYTES {
         return Err(StorageError::Corrupt);
@@ -168,11 +175,7 @@ pub fn decode_peers(bytes: &[u8]) -> Result<Vec<PeerRecord>, StorageError> {
         .peers
         .into_iter()
         .map(|peer| {
-            let label_ok = peer
-                .node_label
-                .as_ref()
-                .is_none_or(|label| label.len() <= NODE_LABEL_MAX_BYTES);
-            if !label_ok || !endpoint_valid(&peer.host, peer.port) {
+            if !endpoint_valid(&peer.host, peer.port) {
                 return Err(StorageError::Corrupt);
             }
             Ok(PeerRecord {
@@ -182,7 +185,7 @@ pub fn decode_peers(bytes: &[u8]) -> Result<Vec<PeerRecord>, StorageError> {
                 grant_id: decode_fixed_hex(&peer.grant_id).map_err(corrupt)?,
                 host: peer.host,
                 initiator_static: decode_fixed_hex(&peer.initiator_static).map_err(corrupt)?,
-                node_label: peer.node_label,
+                node_label: peer.node_label.filter(|label| valid_node_label(label)),
                 pending_id: decode_fixed_hex(&peer.pending_id).map_err(corrupt)?,
                 port: peer.port,
                 responder_static: decode_fixed_hex(&peer.responder_static).map_err(corrupt)?,
@@ -332,6 +335,26 @@ impl PeerStore {
         })
     }
 
+    /// DR-2b: stores `label` as the name of the producer's record, the one
+    /// its latest successful response carried. Only the record holding
+    /// `grant_id`: an unknown producer is `Refused(Invalid)`, another grant
+    /// `Refused(Conflict)`; a label failing `security::valid_node_label` is
+    /// `Refused(Invalid)`. Never changes `state` or anything else and never
+    /// adds a record (a revoked record stays revoked). The same label
+    /// writes nothing. A refusal writes nothing.
+    pub fn set_label(
+        &self,
+        responder_static: &[u8; 32],
+        grant_id: &[u8; 16],
+        label: Option<String>,
+    ) -> Result<(), StorageError> {
+        self.commit(|peers| {
+            let mut next = peers.to_vec();
+            find(&mut next, responder_static, grant_id)?.node_label = label;
+            Ok(next)
+        })
+    }
+
     /// Removes the producer's record; an absent one is not an error.
     /// The record only: `Runtime::remove_peer` also deletes the producer's
     /// receiver cache entries, and is what an owner's removal should call.
@@ -356,11 +379,14 @@ impl PeerStore {
         if next == current {
             return Ok(());
         }
-        // Never write a file that load would refuse: the bytes go through
-        // the load decoder first. A refusal is a caller error, not sticky.
+        // Never write a file that load would refuse, or read back as another
+        // list (a label load would drop): the bytes go through the load
+        // decoder first. A refusal is a caller error, not sticky.
         let bytes =
             encode_peers(&next).map_err(|_| StorageError::Refused(SecurityError::Invalid))?;
-        decode_peers(&bytes).map_err(|_| StorageError::Refused(SecurityError::Invalid))?;
+        if decode_peers(&bytes).ok().as_ref() != Some(&next) {
+            return Err(StorageError::Refused(SecurityError::Invalid));
+        }
         let staged = match self.root.stage(PEERS_FILE, &bytes) {
             Ok(staged) => staged,
             Err(_) => {

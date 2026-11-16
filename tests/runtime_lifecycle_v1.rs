@@ -141,7 +141,12 @@ mod disk {
     struct Stub;
 
     impl ReportSource for Stub {
-        fn report(&self, request: &ReportRequest, _: Instant) -> Result<Vec<u8>, SourceError> {
+        fn report(
+            &self,
+            request: &ReportRequest,
+            _: Option<&str>,
+            _: Instant,
+        ) -> Result<Vec<u8>, SourceError> {
             encode_response(&ReportResponse::from_request(request, agents(), false))
                 .map_err(|_| SourceError)
         }

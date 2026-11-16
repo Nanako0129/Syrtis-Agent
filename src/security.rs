@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::canonical::{CanonicalJsonV1, constant_time_eq};
 
 pub const PEER_PROTOCOL_VERSION: u16 = 1;
-pub const REPORT_SCHEMA_VERSION: u16 = 1;
+pub const REPORT_SCHEMA_VERSION: u16 = 2;
 pub const STATE_SCHEMA_VERSION: u16 = 1;
 pub const FRAME_VERSION: u16 = 1;
 pub const CONTROL_VERSION: u16 = 1;
@@ -34,6 +34,35 @@ pub const ERROR_PAYLOAD_MAX: usize = 4_096;
 pub const LOGICAL_BODY_MAX: usize = 16_777_216;
 pub const RESPONSE_CHUNKS_MAX: u32 = 274;
 pub const REMOTE_MEMORY_MAX: usize = 384 * 1024 * 1024;
+
+/// Most bytes of a node label (`config.nodeLabel`, `nodeLabel` on the wire
+/// and in `peers.json`).
+pub const NODE_LABEL_MAX_BYTES: usize = 128;
+
+/// DR-2b: the one rule for a node label, wherever one is set, sent,
+/// received or loaded. 1–128 bytes, already NFC, not only whitespace, and
+/// no control character (Cc), line or paragraph separator (Zl, Zp), or
+/// bidirectional mark, embedding, override or isolate (U+061C, U+200E,
+/// U+200F, U+202A–U+202E, U+2066–U+2069): a label is shown to another
+/// person, so it may not reorder or hide the text around it.
+pub fn valid_node_label(label: &str) -> bool {
+    (1..=NODE_LABEL_MAX_BYTES).contains(&label.len())
+        && unicode_normalization::is_nfc(label)
+        && !label.chars().all(char::is_whitespace)
+        && !label.chars().any(|c| {
+            c.is_control()
+                || matches!(
+                    c,
+                    '\u{2028}'
+                        | '\u{2029}'
+                        | '\u{061C}'
+                        | '\u{200E}'
+                        | '\u{200F}'
+                        | '\u{202A}'..='\u{202E}'
+                        | '\u{2066}'..='\u{2069}'
+                )
+        })
+}
 
 /// Raw paste bound, applied before any parsing work is done on it.
 pub const PAIR_URL_RAW_MAX: usize = 16_384;
@@ -1736,6 +1765,7 @@ pub const PROTOCOL_FIELDS: &[&str] = &[
     "code",
     "commandId",
     "controlVersion",
+    "costIncomplete",
     "data",
     "enabled",
     "endDateExclusive",

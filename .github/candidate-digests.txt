@@ -181,36 +181,62 @@
 # others). spec/cli-v1.md states the new dirs; spec/source-v1.md now says a
 # change to an assembler's default roots changes the owner inputs and is a
 # consent change (re-approval, old grants stop authorizing), not a D1 case.
+#
+# DR-2b (2026-11-16) amended the SA-0 contract on purpose; the owner
+# approved adding `nodeLabel` and `costIncomplete` to the Peer response
+# envelope. The envelope has 17 required keys: `nodeLabel` (the producer's
+# config.nodeLabel, or null when unset or failing security::valid_node_label)
+# and `costIncomplete` (the producer's pricing table was missing or corrupt).
+# REPORT_SCHEMA_VERSION moved 1 -> 2 (one version only; a producer answers
+# another reportSchema with code 6). PEER_PROTOCOL_VERSION and every pairing,
+# SAS and offer byte are unchanged (sas.txt, pair_url.txt keep their
+# digests). Changed: spec/v1.md (report schema, envelope row,
+# protocolFields), src/security.rs (the schema constant, `costIncomplete` in
+# PROTOCOL_FIELDS, valid_node_label), src/report.rs (the two fields, the
+# label read as null on decode), the consent fixture, the four report golden
+# bodies (schema 2; agents.json also pins a label and costIncomplete true),
+# the cache golden key, file name and body digest (schema 2 in the key, the
+# new body), tests/report_cache_v1.rs, tests/security_contract_v1.rs and
+# spec/security-v1.md (which pins its hash), spec/report-cache-v1.md,
+# spec/report-peer-v1.md (step 4 code 6, the source seam's label, Fetched,
+# code 6 -> Incompatible, 17 response keys, the cost model's 13-17 note,
+# the DR-2b acceptance map) and spec/peer-store-v1.md (nodeLabel is the
+# producer's name, a failing label loads as null, set_label). Also changed:
+# the cache golden metadata (tests/fixtures/v1/cache/metadata.json: the
+# body digest and reportSchema 2 in its key); spec/agent-v1.md (code 6 is
+# its own Incompatible outcome, classified Refused); spec/runtime-v1.md
+# (pull calls set_label after a success; ever_answered); spec/source-v1.md
+# (report takes node_label; how nodeLabel and costIncomplete are set).
 4eb5d2ca0aa2906676095dd4d2450d142f15fd6e8cdfbff774ee9d7cbf2e9373  spec/cache-store-v1.md
 055a5c81aade6aec75c8f43bccb8128ab22ca1691b15b690ca833d0005176a2f  spec/install-v1.md
 14448b1b0ca3be54b08c8c13f0e267eaa12058bcd571d678a481e574d2d7859a  spec/cli-v1.md
 5b1db7ec2cbcdb80479f7edd75e8c82a016c321c9726832af868f6e1c5a6da8e  spec/control-v1.md
 fa83df962309c42614f7fb4a557f601b862c988d90343b06bb1d16fc46aa9ba8  spec/pairing-v1.md
-ee750e1996a12ada3e565139d547cfa4a12dcf9997aea095b4e2a436241f6b92  spec/runtime-v1.md
-178f632d3cf46503f390f0efffebe1ab441e06b93642b2fd69d6f611c72c2e1b  spec/report-peer-v1.md
-3cce5944bf106ca5e5503505f3b4150f192eead0db3f9b1a3fdaf3617ae1c59b  spec/peer-store-v1.md
-79d1c0363e4576d67827ebfa029fad7e3a5981474f4aafba3bd71e54f1a98172  spec/report-cache-v1.md
-910fbb67d3d7b464863f4ad525e803f61e80b8e13d7ef4eba347d135c6616265  spec/security-v1.md
+7f4080b8e9c9e19fe075351e2c094d50fe023f4e7688021a4bb95fbe9fff04f9  spec/runtime-v1.md
+4b3793d29100ba0f3938503e8bd7131f1c5887fefd640cc8f4f875c129d1b421  spec/report-peer-v1.md
+60149236c768d5b7d874ced4ebb89916641dad19b43b478ae8b0fcc401d39e7c  spec/peer-store-v1.md
+b6f0397f753f14a28477a2b0a7411babb7b43fde372887568f6aec9a9fac618a  spec/report-cache-v1.md
+7d8e9bbc76d84ba028f053006ee3815a98398f1bde989f9a5e33c2a607bc053a  spec/security-v1.md
 1b125846c4aa9f5d70bd7c4ab4f07f99decd5087a20f4a9f3e7e900c524202f5  spec/state-store-v1.md
-8bc39c0eb646a39c500aa2efbb39ae9ca4d065365e4ad2388f931e0b2d7e9827  spec/v1.md
-22c5d2ca7a60c2ae44bebdfb36b4fe36731cca1bbeb6f7d4cb7ae88c77bb0aa9  spec/source-v1.md
-6f17681e22cc9ed39ee510ea7a7f055139edaaec1f975395c1262eae0b0d8934  spec/agent-v1.md
+3e97171eda23b646b27ed21a26dffe9cb3a285636a558fc96e9b202076b3eb53  spec/v1.md
+4b28b7ce8b1d5192e8ee25aae4f8df4911ab3b7833df1d3324bff47aeaeb1c38  spec/source-v1.md
+5cf48f921f1a881a9d3da5a9e9a2cf46398797aead91311fee667cff1d110547  spec/agent-v1.md
 ff21cbcfdd6aedfb68ac1b3cfda056663203f2c7f08fd05a856dc5dbe5e4c25a  src/cache.rs
 8b0add8d4fde2253edebdddd448d381559d63ff630f0e9d2f9faad8d9625567f  src/canonical.rs
-e3f35e33b4b26bab06e243d14eb087b5b2405a3b093a6a744cc84a5a36573ab0  src/report.rs
-026735a9ef784c2a26e195401b6f73910fd9a51b3f9a3065223230cd252cc911  src/security.rs
+86182c4080bee4fd3ad49eabbea38914e91c1026f645fdc17a1bb294574baf01  src/report.rs
+1b22834914798fcd825e431782850ba0c3b4a4cccb09698a3b9566a731720f78  src/security.rs
 c8b01baf8a687f066d8d361963b262d903e7776949ccf971130200759c86a167  tests/dependency_provenance_v1.rs
-e01e9d55a26fb4f807ff0baea4a9681b0cbbb86b61f6b00fe5c49d919a2ebb10  tests/fixtures/v1/cache/body.sha256
-edb92226baac009e4c7779cb2c7a7369049e0ea97615945f8e64378322785b19  tests/fixtures/v1/cache/filename.txt
-417b8bac17da40d1de4fee3e71f3a13770427d98ac764313f3d1074e4cb64002  tests/fixtures/v1/cache/key.json
-f039ea486c2313a5f31661147ef661b18afe7a63d15d89283f22169747e766bd  tests/fixtures/v1/cache/metadata.json
-e3437af54f3292180d1510ca274cc445d243d777188f1e441dec50a9d1450ffc  tests/fixtures/v1/report/agents.json
-e222989ac752a128717fc37b48e8f5c625d5883c0be98d761c3ac19d298a2b72  tests/fixtures/v1/report/graph.json
-c02dccddf2ffbb5c86f0a0230db59e59276efece0970aad85252d78af6d31d05  tests/fixtures/v1/report/hourly.json
-60c2996518decd1ec26e810df8b92a32298530947e3df5eb59db1aaa4294d07c  tests/fixtures/v1/report/models.json
+c9d617dc9bf0f082b1ded0f9713b4b25019d53c27da3222cf10313b9d26d948b  tests/fixtures/v1/cache/body.sha256
+fb83883b05cfae1d1c43e99ef176d0c030f730821e4b948a0af44db00948e056  tests/fixtures/v1/cache/filename.txt
+b66991a435b5e89814a1486b3a354119b240adf8fa17d09e28a578f5039c5733  tests/fixtures/v1/cache/key.json
+ae49173b3522596aacf7c767ad3ef7959d2333167f18293fd404aadfc3467981  tests/fixtures/v1/cache/metadata.json
+3ddfc746bea2f60dc03c3ef4e93f3699adf68071932251d641da79c4d4aff9f0  tests/fixtures/v1/report/agents.json
+fbafa7ed3a76229676c94fb2709ee1e68ff17f9b139a1cc0ac3944af987fe725  tests/fixtures/v1/report/graph.json
+d323ed6e422d0b2f2d9a53980630c960c7379beeb67ab130b858945b167d3678  tests/fixtures/v1/report/hourly.json
+1b19e6980a40a4c4baf68edec8a219810fbebd33514e4799c18a6e8100e50aed  tests/fixtures/v1/report/models.json
 e339b9a73b92d9ca2288a8ab03de8d7742db31cff81ed64731f694c5e16738bc  tests/fixtures/v1/runtime/storage/cargo-lock-baseline.json
 f8326f22b3df9d37df1ec1eea8dd6b4a160de6022b3a226a35bb618c4345f4e0  tests/fixtures/v1/runtime/storage/state-golden.json
-1687926712daab8925fcaa639ebb687fd3b397bf6a296dbbe31f7a225b1c9669  tests/fixtures/v1/security/consent.json
+2c954878055be61bca2aa8ab1800ae44970499df97f36b800c851f90e84b14a7  tests/fixtures/v1/security/consent.json
 a58bdd593173195fa9042f6c0e4065a11d553fcc88d4ae79bfc1a5e31f16692e  tests/fixtures/v1/security/control_mac.hex
 ad73bef2423761d5f2d473cab2561133560498054009e01e52c2a845a643dfd1  tests/fixtures/v1/security/linux_roots.json
 c5947513e177225ac089cef1980abe2814e3e8e2aa2ccf6cd609eb55dd4c272c  tests/fixtures/v1/security/memory_budget.json
@@ -224,5 +250,5 @@ cbd942c4fd168b5d78fbfc469acd06cb62f77c026fcbc256285c6c7d9680fdd1  tests/fixtures
 212a6d74e16ee8b4a5f92414d0894fb9334eb40041ed9cc0b78c5962391cbf77  tests/fixtures/v1/source/codex-duration-timing.jsonl
 3442574c566e7a932f6aa28c42f2159b04fa1bbb28e84658634b62c15047fd26  tests/fixtures/v1/source/default-roots.json
 e8e7dc707bb657c1e55bb24d12f5dc9ec1963c3bfae68e694b5c4b3ddb8d092d  tests/fixtures/v1/source/environment-keys.json
-39c2823d68bf6de7854574899b606167897c21292037b8ed359b19fe2e08062c  tests/report_cache_v1.rs
-34c2a335cc9bc3cb3e4af5e6f7bbefd153b5dcef4896cba3dc161f1ad2abdb02  tests/security_contract_v1.rs
+a584f0562d3fbe16d266bc4877754f6a2ba0f945089a6c63065efd3fa945d2be  tests/report_cache_v1.rs
+e833e6c56fca37c33bab37ba665ac0386151b239257edefd05577276a96a6031  tests/security_contract_v1.rs
