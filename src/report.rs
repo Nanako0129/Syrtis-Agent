@@ -221,8 +221,9 @@ pub struct ReportResponse<R> {
     pub saturated: bool,
     /// DR-2b: the producer's `config.nodeLabel`, or `null` when it has none
     /// or it fails `security::valid_node_label`. Required on the wire.
-    /// [`decode_response`] reads a label failing that rule as `None` and
-    /// keeps the rest of the body.
+    /// [`decode_response`] reads a decodable label failing that rule as
+    /// `None` and keeps the rest of the body; a non-NFC label fails the
+    /// whole body, as any non-canonical string does.
     pub node_label: Option<String>,
     /// DR-2b: the pricing table the producer used was missing or corrupt
     /// (the engine's `RemotePricingDiagnostic::Missing` or `Corrupt`), so
@@ -309,7 +310,10 @@ pub fn decode_response<R: ReportRecord>(
 ) -> Result<ReportResponse<R>, ReportError> {
     let mut response: ReportResponse<R> = CanonicalJsonV1::decode(bytes)?;
     response.validate(expected)?;
-    // DR-2b: an unusable label costs the label, not the report.
+    // DR-2b: a label that decoded but fails the label rule costs the label,
+    // not the report. A label that does not decode (not NFC, so not
+    // canonical) fails the whole body above, and over the receiver's 255-byte
+    // string maximum the shape gate refuses the body before this decoder.
     if !response.node_label.as_deref().is_some_and(valid_node_label) {
         response.node_label = None;
     }

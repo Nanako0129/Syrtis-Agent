@@ -251,8 +251,8 @@ impl StateStore {
     /// Replaces the listen config. Counters and records are unchanged. The
     /// same rules as load apply: a non-null host must pass the frozen
     /// `listenConfigure` validator (canonical host, port 1024–65535) and must
-    /// not be an unspecified address; a label is at most 128 bytes. Anything
-    /// else is `Refused(Invalid)` with nothing written.
+    /// not be an unspecified address; a stored label is at most 128 bytes.
+    /// Anything else is `Refused(Invalid)` with nothing written.
     ///
     /// DR-2b: the label is normalized to NFC first, and a label other than
     /// the one already stored must then pass `security::valid_node_label`

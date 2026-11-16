@@ -98,7 +98,7 @@ Nothing depends on the sweep for authority: claim, approval, Pair and Grant stat
 5. Any other error (`Busy`, `Timeout`, `Transport`, `TooLarge`, …) leaves the cache alone.
 6. `DR-2b`: after step 3, `PeerStore::set_label(responderStatic, grantId, fetched.node_label)` with the record used for the fetch. The same label writes nothing; a refusal (`Conflict`: paired again since) or a failed write does not change the result.
 
-`Runtime::ever_answered(responderStatic) -> bool` (`DR-2b`): whether the receiver cache indexes any entry of that producer, for any query or grant (`CacheStore::has_peer`, no file read). `false` without a cache or when the cache is unknown. Entries leave with a revoke or expiry (step 4), `remove_peer`, expiry or eviction, and with them this answer.
+`Runtime::ever_answered(responderStatic) -> bool` (`DR-2b`): whether the receiver cache indexes any entry of that producer, for any query or grant (`CacheStore::has_peer`, no file read). `false` without a cache or when the cache is unknown. Entries leave with a revoke or expiry (step 4), `remove_peer`, expiry or eviction, and with them this answer. Entries written under report schema 1 are deleted by the first `CacheStore::open` after the move to schema 2 (`spec/report-cache-v1.md`), so it is `false` for every producer until its next successful pull.
 
 `Runtime::last_good(responderStatic, query) -> Result<Option<CachedBody>, StorageError>`: `None` without a cache, without a readable record, when that record is not `usable`, when the OS clock or the state cannot be read, or while the clock is anomalous (a read at a wrong time would delete entries that are still valid; `pull` does not write the cache then either); otherwise `CacheStore::get` under the key built from that same record, at the effective now in ms. A revoked or expired record, or one bound to an identity from before a reset, therefore reads nothing, whatever is still on disk. A record replaced by a new pairing (another `grantId`), or removed through `PeerStore::remove` alone, builds another key or none; the old entries are left to expiry and eviction. `Runtime::remove_peer` (below) deletes them at once.
 
@@ -138,7 +138,7 @@ Nothing depends on the sweep for authority: claim, approval, Pair and Grant stat
 | 7 | `listen_configure_to_the_bound_address_keeps_the_listener` |
 | 8 | `housekeeping_retries_a_listener_that_did_not_bind` |
 | `SA-3e` `remove_peer` | `remove_peer_deletes_the_record_and_its_cache`, `removing_an_absent_peer_leaves_other_entries` |
-| `DR-2b` `set_label`, `ever_answered` | `a_pull_stores_the_producers_label_and_marks_it_answered`; `src/runtime.rs` `a_failed_label_write_does_not_fail_the_pull` |
+| `DR-2b` `set_label`, `ever_answered` | `a_pull_stores_the_producers_label_and_marks_it_answered`; `src/runtime.rs` `a_failed_label_write_does_not_fail_the_pull_or_hide_the_peers` |
 
 **Record table fixture (5).** One `StateStore::transition` whose closure pushes filler terminal records onto `terminal` until offers + pending + grants + terminal = 256 (`MAX_RECORDS`). Each filler has a unique ID, `cleanupComplete: true` and `terminalAt` = a chosen instant minus 90 days, so the frozen `compact_terminals` (the checkpoint) removes them all exactly when the effective now reaches that instant, and none before. That lets one test hold the table full through the disable and the gated enable, then free it to show that the later claim refusal is the offer's expiry, not the table.
 

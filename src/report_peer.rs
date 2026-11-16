@@ -1946,6 +1946,34 @@ mod receiver_tests {
         assert_eq!(ledger.used(), 0);
     }
 
+    /// DR-2b review: a label costs only the label when it decodes. One over
+    /// the shape gate's 255-byte string maximum (300 bytes) and one that is
+    /// not NFC (so not canonical) refuse the whole body as `Invalid`.
+    /// Control: the same body with a valid label decodes.
+    #[test]
+    fn a_label_over_the_string_maximum_or_not_nfc_refuses_the_body() {
+        let ledger = MemoryLedger::default();
+        let labeled = |label: &str| {
+            String::from_utf8(graph_body(&request(Endpoint::Graph), 3))
+                .unwrap()
+                .replace(r#""nodeLabel":null"#, &format!(r#""nodeLabel":"{label}""#))
+                .into_bytes()
+        };
+        for (what, label) in [
+            ("300 bytes", "x".repeat(300)),
+            ("not NFC", "e\u{301}".to_owned()),
+        ] {
+            assert_eq!(
+                run(Endpoint::Graph, &ledger, serve(labeled(&label))).err(),
+                Some(FetchError::Invalid),
+                "{what}"
+            );
+        }
+        let fetched = run(Endpoint::Graph, &ledger, serve(labeled("Studio Mac"))).unwrap();
+        assert_eq!(fetched.node_label.as_deref(), Some("Studio Mac"));
+        assert_eq!(ledger.used(), 0);
+    }
+
     /// Acceptance (4): a valid body for another grant, other dates or
     /// another endpoint fails validation against the request that was
     /// sent; the same body for the right request decodes (control).

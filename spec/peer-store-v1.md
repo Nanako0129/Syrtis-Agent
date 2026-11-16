@@ -33,7 +33,7 @@ Reads and writes use the root's agent-file rules unchanged (`read_file`, `stage`
 | `expiresAt` | Unix milliseconds on the producer's wall clock (from Grant status), signed integer |
 | `host` | String: the host of the claimed Pair URL |
 | `port` | Integer: the port of the claimed Pair URL |
-| `nodeLabel` | The name the producer gave in its latest successful response (`set_label`), or `null`: a string passing `security::valid_node_label` (1–128 bytes, NFC, no control, separator or bidirectional formatting character, not only whitespace) |
+| `nodeLabel` | The name the producer gave in its latest successful response (`set_label`), or `null`: a string passing the node-label rule of `spec/report-cache-v1.md` (`security::valid_node_label`) |
 | `state` | `active`, `revoked` or `expired` |
 
 Every field other than `nodeLabel` is required and never `null`. `peers` is sorted by `responderStatic`, holds at most one record per `responderStatic`, and at most 16 records.
@@ -62,14 +62,16 @@ A caller recording what a producer answered names the record by the `responderSt
 
 | Operation | Rule |
 |---|---|
-| `upsert(record)` | Only an `active` record. A record for a `responderStatic` already present replaces it (re-pairing) when its `authEpoch` is equal or higher; a lower one is `refused(conflict)`, so a stale answer cannot overwrite a newer pairing. A new one is inserted in order. A 17th distinct producer is `refused(bounds)`. Anything else load would refuse (an over-long or non-NFC `nodeLabel`, a non-canonical `host`, a `port` below 1024) is `refused(invalid)` |
+| `upsert(record)` | Only an `active` record. A record for a `responderStatic` already present replaces it (re-pairing) when its `authEpoch` is equal or higher; a lower one is `refused(conflict)`, so a stale answer cannot overwrite a newer pairing. A new one is inserted in order. A 17th distinct producer is `refused(bounds)`. Anything load would refuse (a non-NFC `nodeLabel`, a non-canonical `host`, a `port` below 1024) or read back as another list (a `nodeLabel` failing the label rule, which load reads as `null`) is `refused(invalid)` |
 | `set_state(responderStatic, grantId, state)` | `revoked` or `expired` only; `active` comes only from `upsert`. An unknown producer is `refused(invalid)`; a record holding another `grantId` (the producer was paired again since) is `refused(conflict)` |
 | `update_grant(responderStatic, grantId, authEpoch, sourceScopeGeneration, expiresAt)` | Stores what Grant status answered `active`. Only the record holding `grantId` and still `active`, and never to a lower `authEpoch` (equal is allowed); otherwise `refused(conflict)`. An unknown producer is `refused(invalid)` |
-| `set_label(responderStatic, grantId, nodeLabel)` | `DR-2b`: stores the label of the producer's latest successful response. Only the record holding `grantId`: an unknown producer is `refused(invalid)`, another `grantId` `refused(conflict)`, a label failing `security::valid_node_label` `refused(invalid)`. It never changes `state` or any other field and never adds a record; it is not `upsert`. The same label writes nothing. `Runtime::pull` calls it after a successful fetch; its failure does not change the pull's result |
+| `set_label(responderStatic, grantId, nodeLabel)` | `DR-2b`: stores the label of the producer's latest successful response. Only the record holding `grantId`: an unknown producer is `refused(invalid)`, another `grantId` `refused(conflict)`, a label failing `security::valid_node_label` `refused(invalid)`. It never changes `state` or any other field and never adds a record; it is not `upsert`. The same label writes nothing. A failed write is `unknown` but not sticky (below). `Runtime::pull` calls it after a successful fetch; its failure does not change the pull's result |
 | `remove(responderStatic)` | Removes that producer's record; an absent one is not an error |
 | `peers()` | A snapshot, sorted by `responderStatic` |
 
 A commit follows the state store: one commit mutex serializes writers; the in-memory list changes only after `publish` returns, while the writer holds the list exclusively; any failure while staging or publishing makes the store sticky `unknown` (every later read and write is `unknown`) until it is reopened. A reopen after such a failure reads the old list or the new one: a failure before the rename leaves the old file, a failure after it the new one.
+
+`set_label` is the one exception (`DR-2b` review): a label is cosmetic, and a sticky store would hide every producer until a restart. After its stage or publish fails, still under the commit mutex, the store removes `.peers.json.tmp` (a failed write or rename leaves it, and the next stage creates it exclusively) and reads `peers.json` back through the load rule: the old list after a failure up to the rename, the new one after a failed directory sync. Only if that removal, read or decode fails does it become sticky `unknown`. The call still returns `unknown`.
 
 ## When a record is written
 

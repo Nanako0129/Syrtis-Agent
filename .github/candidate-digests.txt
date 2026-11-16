@@ -207,24 +207,33 @@
 # its own Incompatible outcome, classified Refused); spec/runtime-v1.md
 # (pull calls set_label after a success; ever_answered); spec/source-v1.md
 # (report takes node_label; how nodeLabel and costIncomplete are set).
+# DR-2b review round 1: src/security.rs (a label needs one visible
+# character: not whitespace nor one of INVISIBLE_LABEL_CHARS), src/report.rs
+# (comment: only a decodable label is dropped alone), spec/report-cache-v1.md
+# (the rule restated; a non-NFC or over-255-byte label refuses the body;
+# schema-1 cache entries are deleted at open), spec/peer-store-v1.md (a
+# failed set_label reloads peers.json instead of going sticky unknown; the
+# upsert example), spec/state-store-v1.md (set_listen_config: NFC, a changed
+# label passes the rule, an unchanged stored one is not re-validated; load
+# checks 128 bytes only), spec/runtime-v1.md and spec/report-peer-v1.md.
 4eb5d2ca0aa2906676095dd4d2450d142f15fd6e8cdfbff774ee9d7cbf2e9373  spec/cache-store-v1.md
 055a5c81aade6aec75c8f43bccb8128ab22ca1691b15b690ca833d0005176a2f  spec/install-v1.md
 14448b1b0ca3be54b08c8c13f0e267eaa12058bcd571d678a481e574d2d7859a  spec/cli-v1.md
 5b1db7ec2cbcdb80479f7edd75e8c82a016c321c9726832af868f6e1c5a6da8e  spec/control-v1.md
 fa83df962309c42614f7fb4a557f601b862c988d90343b06bb1d16fc46aa9ba8  spec/pairing-v1.md
-7f4080b8e9c9e19fe075351e2c094d50fe023f4e7688021a4bb95fbe9fff04f9  spec/runtime-v1.md
-4b3793d29100ba0f3938503e8bd7131f1c5887fefd640cc8f4f875c129d1b421  spec/report-peer-v1.md
-60149236c768d5b7d874ced4ebb89916641dad19b43b478ae8b0fcc401d39e7c  spec/peer-store-v1.md
-b6f0397f753f14a28477a2b0a7411babb7b43fde372887568f6aec9a9fac618a  spec/report-cache-v1.md
+fcb5bd1f4941c3f8ed15c0b9d0e73d8d3f5efa2da3fadae7654be19fa6d3a0c3  spec/runtime-v1.md
+26b94d43b40c537b49747a23befb5e53187dbba07cb0aae399350e7f3dd42527  spec/report-peer-v1.md
+7cc4eb2a75af280535da80a2955e14af83e95b1842ad4339b9b51536c2d797ee  spec/peer-store-v1.md
+f2c1c9300b27ab7607fad510baf5380b6d4e050e483a422a3046d19b76be8de6  spec/report-cache-v1.md
 7d8e9bbc76d84ba028f053006ee3815a98398f1bde989f9a5e33c2a607bc053a  spec/security-v1.md
-1b125846c4aa9f5d70bd7c4ab4f07f99decd5087a20f4a9f3e7e900c524202f5  spec/state-store-v1.md
+851b2c3306943ab32f1a6184bd6a593364e3ddf17d00ffde500222c2413d5267  spec/state-store-v1.md
 3e97171eda23b646b27ed21a26dffe9cb3a285636a558fc96e9b202076b3eb53  spec/v1.md
 4b28b7ce8b1d5192e8ee25aae4f8df4911ab3b7833df1d3324bff47aeaeb1c38  spec/source-v1.md
 5cf48f921f1a881a9d3da5a9e9a2cf46398797aead91311fee667cff1d110547  spec/agent-v1.md
 ff21cbcfdd6aedfb68ac1b3cfda056663203f2c7f08fd05a856dc5dbe5e4c25a  src/cache.rs
 8b0add8d4fde2253edebdddd448d381559d63ff630f0e9d2f9faad8d9625567f  src/canonical.rs
-86182c4080bee4fd3ad49eabbea38914e91c1026f645fdc17a1bb294574baf01  src/report.rs
-1b22834914798fcd825e431782850ba0c3b4a4cccb09698a3b9566a731720f78  src/security.rs
+7f3d545bf38d846fd2cad5ebfc77d1ff865d42fad68001dd3e7af2282a1e96ef  src/report.rs
+ed146b7f2056e11a7d679c370c5a317f153babd98f6d63012f4231f6f3ac4653  src/security.rs
 c8b01baf8a687f066d8d361963b262d903e7776949ccf971130200759c86a167  tests/dependency_provenance_v1.rs
 c9d617dc9bf0f082b1ded0f9713b4b25019d53c27da3222cf10313b9d26d948b  tests/fixtures/v1/cache/body.sha256
 fb83883b05cfae1d1c43e99ef176d0c030f730821e4b948a0af44db00948e056  tests/fixtures/v1/cache/filename.txt

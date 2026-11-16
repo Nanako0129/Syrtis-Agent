@@ -40,15 +40,19 @@ pub const REMOTE_MEMORY_MAX: usize = 384 * 1024 * 1024;
 pub const NODE_LABEL_MAX_BYTES: usize = 128;
 
 /// DR-2b: the one rule for a node label, wherever one is set, sent,
-/// received or loaded. 1–128 bytes, already NFC, not only whitespace, and
+/// received or loaded. 1–128 bytes, already NFC, at least one visible
+/// character (one that is neither whitespace nor one of the invisible
+/// [`INVISIBLE_LABEL_CHARS`], which stay legal between visible ones), and
 /// no control character (Cc), line or paragraph separator (Zl, Zp), or
 /// bidirectional mark, embedding, override or isolate (U+061C, U+200E,
 /// U+200F, U+202A–U+202E, U+2066–U+2069): a label is shown to another
-/// person, so it may not reorder or hide the text around it.
+/// person, so it may not be blank or reorder or hide the text around it.
 pub fn valid_node_label(label: &str) -> bool {
     (1..=NODE_LABEL_MAX_BYTES).contains(&label.len())
         && unicode_normalization::is_nfc(label)
-        && !label.chars().all(char::is_whitespace)
+        && label
+            .chars()
+            .any(|c| !c.is_whitespace() && !INVISIBLE_LABEL_CHARS.contains(&c))
         && !label.chars().any(|c| {
             c.is_control()
                 || matches!(
@@ -63,6 +67,15 @@ pub fn valid_node_label(label: &str) -> bool {
                 )
         })
 }
+
+/// Characters that render as nothing: soft hyphen, the Hangul fillers,
+/// zero-width space, non-joiner and joiner, word joiner, byte order mark
+/// and the blank Braille pattern. A label made only of these (and
+/// whitespace) is blank, so [`valid_node_label`] refuses it.
+pub const INVISIBLE_LABEL_CHARS: [char; 10] = [
+    '\u{00AD}', '\u{115F}', '\u{1160}', '\u{200B}', '\u{200C}', '\u{200D}', '\u{2060}', '\u{3164}',
+    '\u{FEFF}', '\u{2800}',
+];
 
 /// Raw paste bound, applied before any parsing work is done on it.
 pub const PAIR_URL_RAW_MAX: usize = 16_384;

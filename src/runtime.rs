@@ -1035,14 +1035,15 @@ mod tests {
             .count()
     }
 
-    /// DR-2b: a `set_label` write that fails (every `rename` on the pulling
-    /// thread fails) does not fail the pull: the label still comes back in
-    /// `Fetched`, and the peer store, whose commit failed, is sticky
-    /// unknown (so the write was attempted).
-    #[test]
-    fn a_failed_label_write_does_not_fail_the_pull() {
-        let (producer_home, receiver_home) = (ShortHome::new(), ShortHome::new());
-        let producer = start(&producer_home, Arc::new(Empty));
+    /// A producer runtime sharing on loopback with `label` stored, and a
+    /// receiver runtime paired with it. Returns both, the producer's static
+    /// and an agents query.
+    fn labeled_pair(
+        producer_home: &ShortHome,
+        receiver_home: &ShortHome,
+        label: &str,
+    ) -> (Runtime, Runtime, [u8; 32], ReportQuery) {
+        let producer = start(producer_home, Arc::new(Empty));
         let port = free_port();
         call(
             &producer,
@@ -1051,13 +1052,12 @@ mod tests {
         );
         producer
             .store()
-            .set_listen_config(Some("127.0.0.1".into()), port, Some("Studio Mac".into()))
+            .set_listen_config(Some("127.0.0.1".into()), port, Some(label.into()))
             .unwrap();
         producer.enable_sharing().unwrap();
         let offer = call(&producer, OFFER_CREATE, json!({"ttlSeconds": 600}));
         let url = offer["pairUrl"].as_str().unwrap().to_owned();
-
-        let receiver = start(&receiver_home, Arc::new(NoSource));
+        let receiver = start(receiver_home, Arc::new(NoSource));
         let identity = StaticKey::from_state(&receiver.store().state().unwrap()).unwrap();
         let (ledger, clock) = (MemoryLedger::default(), SystemClock);
         let client = PairingClient {
@@ -1082,19 +1082,61 @@ mod tests {
             timezone: "UTC".into(),
             clients: vec![],
         };
+        (producer, receiver, confirmed.responder_static, query)
+    }
 
-        let _reset = Reset;
-        seams::set_hook(Some(Box::new(|step| {
-            if step == Step::Rename {
-                Err(std::io::Error::other("injected"))
-            } else {
-                Ok(())
-            }
-        })));
-        let fetched = receiver.pull(&confirmed.responder_static, &query);
-        seams::set_hook(None);
-        assert_eq!(fetched.unwrap().node_label.as_deref(), Some("Studio Mac"));
-        assert_eq!(receiver.peers().peers(), Err(StorageError::Unknown));
+    /// DR-2b review: a `set_label` write that fails, at each kind of step
+    /// (writing the temp file, the rename, the directory sync after the
+    /// rename), neither fails the pull nor poisons the peer store: the
+    /// label still comes back in `Fetched`, the peer is still listed, the
+    /// temp file is gone, the stored label is what is on disk (old before
+    /// the rename, new after it), and the next pull stores the label.
+    #[test]
+    fn a_failed_label_write_does_not_fail_the_pull_or_hide_the_peers() {
+        for (step, stored_after_failure) in [
+            (Step::Write, None),
+            (Step::Rename, None),
+            (Step::SyncDir, Some("Studio Mac")),
+        ] {
+            let (producer_home, receiver_home) = (ShortHome::new(), ShortHome::new());
+            let (_producer, receiver, producer_static, query) =
+                labeled_pair(&producer_home, &receiver_home, "Studio Mac");
+            let _reset = Reset;
+            seams::set_hook(Some(Box::new(move |at| {
+                if at == step {
+                    Err(std::io::Error::other("injected"))
+                } else {
+                    Ok(())
+                }
+            })));
+            let fetched = receiver.pull(&producer_static, &query);
+            seams::set_hook(None);
+            assert_eq!(
+                fetched.unwrap().node_label.as_deref(),
+                Some("Studio Mac"),
+                "{step:?}"
+            );
+            let peers = receiver.peers().peers();
+            assert!(peers.is_ok(), "{step:?}: the peer store is unknown");
+            let peers = peers.unwrap();
+            assert_eq!(peers.len(), 1, "{step:?}");
+            assert_eq!(
+                peers[0].node_label.as_deref(),
+                stored_after_failure,
+                "{step:?}"
+            );
+            assert!(
+                !receiver_home.0.join("r/.peers.json.tmp").exists(),
+                "{step:?}: temp file left"
+            );
+            // The next pull works and stores the label.
+            receiver.pull(&producer_static, &query).unwrap();
+            assert_eq!(
+                receiver.peers().peers().unwrap()[0].node_label.as_deref(),
+                Some("Studio Mac"),
+                "{step:?}"
+            );
+        }
     }
 
     /// SA-2B3b acceptance (3c): the producer answers `revoked` and the

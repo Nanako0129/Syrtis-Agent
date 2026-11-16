@@ -99,7 +99,7 @@ A client that stops reading makes a chunk's write time out after at most 2 s; th
 
 ## Receiver
 
-`report_peer::fetch(peer, query, stateStore, ledger, limiter)` asks the producer named by one peer record for one report and returns `Fetched { body, records, saturated, node_label, cost_incomplete }`, the records typed by the endpoint asked for. `node_label` is the body's `nodeLabel`, `None` when it fails `security::valid_node_label` (the body is still accepted); `cost_incomplete` is the body's `costIncomplete`. The producer is untrusted for framing, size and content. `fetch` never retries, never polls in the background and writes no cache and no log.
+`report_peer::fetch(peer, query, stateStore, ledger, limiter)` asks the producer named by one peer record for one report and returns `Fetched { body, records, saturated, node_label, cost_incomplete }`, the records typed by the endpoint asked for. `node_label` is the body's `nodeLabel`, `None` when it decodes but fails `security::valid_node_label` (the body is still accepted); a label over the shape gate's 255 bytes or not NFC refuses the whole body (`Invalid`), as any such string would; `cost_incomplete` is the body's `costIncomplete`. The producer is untrusted for framing, size and content. `fetch` never retries, never polls in the background and writes no cache and no log.
 
 `query` is the endpoint, `startDate`, `endDateExclusive`, `timezone` and `clients`. Everything else in the Peer request comes from the record (`grantId`, `authEpoch`, `sourceScopeGeneration`) or is a protocol constant; `requestId` is 16 random bytes, the same in the payload and in the frame header.
 
@@ -228,8 +228,8 @@ Receiver (`SA-2B2b2`):
 |---|---|
 | (a) `reportSchema` mismatch, each direction | producer `a_report_schema_other_than_the_producers_is_incompatible`; receiver unit `error_codes_map_to_their_variants` (code 6 is `Incompatible`) |
 | (b) the label rule, NFC on set | `tests/runtime_storage_v1.rs` `the_node_label_rule_refuses_each_class_and_stores_nfc` |
-| (c) the four use points | set: (b); send: `the_label_is_sent_only_in_an_authorized_response_body`; receive: unit `the_label_and_cost_flag_reach_fetched_and_a_bad_label_is_dropped`, `tests/report_cache_v1.rs` `strict_report_echo_and_field_validation`; `peers.json`: `tests/runtime_peer_store_v1.rs` `every_load_rule_fails_closed_and_its_control_loads` |
-| (d) `set_label` | `tests/runtime_peer_store_v1.rs` `set_label_names_the_grant_and_never_changes_state_or_adds_a_record`; `tests/runtime_pull_v1.rs` `a_pull_stores_the_producers_label_and_marks_it_answered`; unit `runtime::tests::a_failed_label_write_does_not_fail_the_pull` |
+| (c) the four use points | set: (b); send: `the_label_is_sent_only_in_an_authorized_response_body`; receive: unit `the_label_and_cost_flag_reach_fetched_and_a_bad_label_is_dropped`, `a_label_over_the_string_maximum_or_not_nfc_refuses_the_body`, `tests/report_cache_v1.rs` `strict_report_echo_and_field_validation`; `peers.json`: `tests/runtime_peer_store_v1.rs` `every_load_rule_fails_closed_and_its_control_loads` |
+| (d) `set_label` | `tests/runtime_peer_store_v1.rs` `set_label_names_the_grant_and_never_changes_state_or_adds_a_record`; `tests/runtime_pull_v1.rs` `a_pull_stores_the_producers_label_and_marks_it_answered`; unit `runtime::tests::a_failed_label_write_does_not_fail_the_pull_or_hide_the_peers` |
 | (e) `costIncomplete` | `tests/runtime_source_v1.rs` `cost_incomplete_follows_the_pricing_diagnostic_and_the_label_is_sent`; unit `source::tests::cost_is_incomplete_only_for_a_missing_or_corrupt_table` |
 | (f) no label outside a response body | `the_label_is_sent_only_in_an_authorized_response_body`; `tests/security_contract_v1.rs` `consent_surface_and_privacy_registry` |
 

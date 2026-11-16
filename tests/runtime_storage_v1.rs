@@ -854,6 +854,12 @@ mod disk {
             ("129 bytes", "n".repeat(129)),
             ("129 bytes, multi-byte", format!("{}n", "é".repeat(64))),
             ("only whitespace", " \u{3000}\u{2003}".into()),
+            ("only a zero-width space", "\u{200B}".into()),
+            ("only ZWJ and BOM", "\u{200D}\u{FEFF}".into()),
+            (
+                "only fillers and a blank pattern",
+                "\u{3164} \u{2800}\u{AD}".into(),
+            ),
             ("Cc NUL", "a\u{0}b".into()),
             ("Cc BEL", "a\u{7}b".into()),
             ("Cc LF", "a\nb".into()),
@@ -885,6 +891,8 @@ mod disk {
             "書房的 Mac".into(),
             " padded ".into(),
             "a\u{200d}b".into(),
+            // An emoji ZWJ sequence: invisible joiners between visible ones.
+            "\u{1F469}\u{200D}\u{1F4BB}".into(),
         ];
         for label in &good {
             assert!(valid_node_label(label), "{label:?}");
