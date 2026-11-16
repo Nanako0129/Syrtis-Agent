@@ -12,7 +12,7 @@ Not in this slice: wiring the source into `Runtime` (the assembler injects it, `
 
 `Cargo.toml` declares, under `[target.'cfg(unix)'.dependencies]`:
 
-`tokscale-core = { git = "https://github.com/Nanako0129/tokscale-core", rev = "e156d67caa9708458fd2030f379d3c2a77ff05bf" }`
+`tokscale-core = { git = "https://github.com/Nanako0129/tokscale-core", rev = "b0e2e5f43254d8c2c78f07ed9ca23096c4ed8249" }`
 
 The SHA is the `vendor/tokscale-core` commit recorded on `Nanako0129/TokenBar-Native` `origin/main` on 2026-11-12 (`git ls-tree origin/main vendor/tokscale-core`), the engine the Syrtis macOS app builds. A pin change is a reviewed change: SEC-R4 (the engine's remote tests at the new SHA, and a security review of the engine's `src/` diff) and the D1 list below are redone for it.
 
