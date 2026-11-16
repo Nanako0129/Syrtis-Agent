@@ -33,7 +33,7 @@ The engine's `reqwest`, `tokio`, `rusqlite` (bundled SQLite) and `zstd` are not 
 
 `SecureRoot::clear_private_subdir(name)` (`SA-2C2a`; called only by `Agent::uninstall` with `source-cache`) opens `name` the same way and with the same checks, but never creates or chmods it; absent is success. It empties the directory and keeps it: each entry is classified by a no-follow `fstatat` on its parent's descriptor; a directory is opened `O_DIRECTORY|O_NOFOLLOW` relative to that descriptor, emptied the same way and removed with `unlinkat(AT_REMOVEDIR)`; every other entry, a symlink included, is removed with `unlinkat`, which removes the link, never its target. More than 32 nested levels, or any failed call, is `UnsafeState`, and what was removed before it stays removed. The entry list is not capped (a same-UID process can grow it; same-UID non-claim). The stub on other platforms is uncallable.
 
-Nothing writes pricing files yet. With `pricing/` empty the engine prices every record at zero cost (the engine's fail-soft rule, its test `pricing_snapshot_absence_zeroes_cost_and_changes_nothing_else`, which passed at the pin; this crate's tests observe zero cost only for a model missing from a non-empty pricing root); filling it is out of this slice. One `EngineSource` per root.
+Nothing in this crate writes pricing files; an embedding app does (`spec/agent-v1.md`). With `pricing/` empty the engine prices every record at zero cost (the engine's fail-soft rule, its test `pricing_snapshot_absence_zeroes_cost_and_changes_nothing_else`, which passed at the pin; this crate's tests observe zero cost only for a model missing from a non-empty pricing root); filling it is out of this slice. One `EngineSource` per root.
 
 ## Owner inputs and the approved scope
 

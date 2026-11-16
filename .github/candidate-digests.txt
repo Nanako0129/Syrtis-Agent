@@ -164,7 +164,8 @@
 # Engine pin moved to tokscale-core 51047602 (a stale price table prices a
 # shared report instead of zeroing its cost). Changed on purpose: the 40-hex
 # pin in spec/source-v1.md, the lock baseline fixture and the two D1
-# fixtures' engineSha; the PR number in the spec's provenance sentence; and
+# fixtures' engineSha; the PR number in the spec's provenance sentence; the
+# spec's "nothing writes pricing files" sentence, now scoped to this crate; and
 # spec/cli-v1.md, which now says pricing files left in the shared root by an
 # app keep pricing the standalone agent. The D1 fixtures' cited engine line
 # numbers still hold: the engine delta touches src/pricing/mod.rs and
@@ -181,7 +182,7 @@ ee750e1996a12ada3e565139d547cfa4a12dcf9997aea095b4e2a436241f6b92  spec/runtime-v
 910fbb67d3d7b464863f4ad525e803f61e80b8e13d7ef4eba347d135c6616265  spec/security-v1.md
 1b125846c4aa9f5d70bd7c4ab4f07f99decd5087a20f4a9f3e7e900c524202f5  spec/state-store-v1.md
 8bc39c0eb646a39c500aa2efbb39ae9ca4d065365e4ad2388f931e0b2d7e9827  spec/v1.md
-799d16ebc47d7f8c2a548710b36fef25d46e065def1b6a40976987213eeb988c  spec/source-v1.md
+3aa30131c764596ab2df24544def5ff61cedf28f3897597bf5b7288c91320b77  spec/source-v1.md
 6f17681e22cc9ed39ee510ea7a7f055139edaaec1f975395c1262eae0b0d8934  spec/agent-v1.md
 ff21cbcfdd6aedfb68ac1b3cfda056663203f2c7f08fd05a856dc5dbe5e4c25a  src/cache.rs
 8b0add8d4fde2253edebdddd448d381559d63ff630f0e9d2f9faad8d9625567f  src/canonical.rs
