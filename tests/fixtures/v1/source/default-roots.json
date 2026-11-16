@@ -354,7 +354,7 @@
     }
   ],
   "derivedFrom": "tokscale-core CLIENTS (src/clients.rs) and the hard-coded extra roots of scan_all_clients_resolved_inner (src/scanner.rs:1401-1794) and its helpers; remote contexts resolve env-var roots to home/<fallbackRelative> (src/source_context.rs:1133)",
-  "engineSha": "e156d67caa9708458fd2030f379d3c2a77ff05bf",
+  "engineSha": "b0e2e5f43254d8c2c78f07ed9ca23096c4ed8249",
   "extraRoots": [
     {
       "base": "home",
