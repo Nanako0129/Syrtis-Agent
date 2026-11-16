@@ -712,6 +712,52 @@ mod engine {
         report(&source, Endpoint::Graph, generation);
     }
 
+    /// DR-1e: built as the standalone `run` builds it (`cli::default_dirs`),
+    /// the source finds an XdgData client under `home/.local/share` and a
+    /// Config client under `home/.config/tokscale`, where the engine's local
+    /// report lane looks on macOS too.
+    #[test]
+    fn standalone_default_dirs_reach_xdg_data_and_config_clients() {
+        let home = TempDir::new("xdg");
+        write(
+            &home
+                .path
+                .join(".local/share/opencode/storage/message/ses_x/msg_x.json"),
+            r#"{"id":"msg_x","sessionID":"ses_x","role":"assistant","modelID":"m-open","providerID":"anthropic","tokens":{"input":410,"output":41,"reasoning":0,"cache":{"read":4,"write":1}},"time":{"created":2209032000000.0}}"#,
+        );
+        write(
+            &home
+                .path
+                .join(".config/tokscale/antigravity-cache/sessions/s.jsonl"),
+            r#"{"type":"usage","sessionId":"s","timestamp":2209032000000,"modelId":"m-anti","input":520,"output":52}"#,
+        );
+        let store = open_store(&home.path);
+        let (config_dir, data_dir) = syrtis_agent::cli::default_dirs(&home.path);
+        let source = EngineSource::new(
+            store.root(),
+            home.path.clone(),
+            config_dir,
+            data_dir,
+            ScannerSettings::default(),
+        )
+        .unwrap();
+        source.approve(&store).unwrap();
+        let generation = generation(&store);
+        let graph: Vec<GraphRecord> = records(
+            &report(&source, Endpoint::Graph, generation),
+            Endpoint::Graph,
+            generation,
+        );
+        let input = |client: &str| {
+            graph
+                .iter()
+                .find(|row| row.client == client)
+                .map(|row| row.input_tokens)
+        };
+        assert_eq!(input("opencode"), Some(410), "{graph:?}");
+        assert_eq!(input("antigravity"), Some(520), "{graph:?}");
+    }
+
     /// A cc-mirror variant whose `configDir` (file content) names `config`.
     fn write_variant(home: &Path, config: &Path) {
         write(

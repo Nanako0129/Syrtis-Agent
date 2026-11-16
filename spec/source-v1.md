@@ -48,7 +48,7 @@ The owner inputs are: `home`, `config_dir`, `data_dir` (absolute paths the assem
 
 The same inputs may be approved again at any generation (after a reset, for example).
 
-D1: consent binds `ownerInputsSha256`, not the engine's fingerprint. The engine's fingerprint also hashes its client table and resolver version, so it changes with every pin; binding it would make every app update re-ask. An engine pin change therefore keeps the existing consent, including clients the new engine supports; an owner change to a setting or custom root needs a new approval.
+D1: consent binds `ownerInputsSha256`, not the engine's fingerprint. The engine's fingerprint also hashes its client table and resolver version, so it changes with every pin; binding it would make every app update re-ask. An engine pin change therefore keeps the existing consent, including clients the new engine supports; an owner change to a setting or custom root needs a new approval. So does a change to the default roots an assembler supplies (`config_dir`, `data_dir`, for example `cli::default_dirs`): it changes the owner inputs and their digest, so it is a consent change, not an engine-pin (D1) case. The owner approves the scope again after a `source_change_commit`, and every existing grant, bound to the old generation, stops authorizing.
 
 ## `report(request, deadline)`
 

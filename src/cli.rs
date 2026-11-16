@@ -60,17 +60,17 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     imp::start(resident)
 }
 
-/// The config and data directories the engine resolves clients against,
-/// from the home by platform convention (no environment variable is read):
-/// macOS `Library/Application Support` for both; elsewhere `.config` and
-/// `.local/share`.
+/// The config and data directories the engine resolves clients against:
+/// `home/.config` and `home/.local/share` on every unix, macOS included.
+/// They depend on `home` alone (no environment variable, no `dirs` crate).
+/// The engine substitutes the data dir for the XDG data root and
+/// `<config dir>/tokscale` for its config root, so these are the places the
+/// engine's local report lane also falls back to on macOS; `Library/
+/// Application Support` would miss every client kept under `.local/share`
+/// or `.config/tokscale`. Changing them changes the owner inputs: a consent
+/// change (`spec/source-v1.md`). The Syrtis app calls this function too.
 pub fn default_dirs(home: &Path) -> (PathBuf, PathBuf) {
-    if cfg!(target_os = "macos") {
-        let support = home.join("Library").join("Application Support");
-        (support.clone(), support)
-    } else {
-        (home.join(".config"), home.join(".local").join("share"))
-    }
+    (home.join(".config"), home.join(".local").join("share"))
 }
 
 #[cfg(debug_assertions)]
@@ -861,5 +861,24 @@ mod imp {
             Err(AgentError::Storage(StorageError::Busy)) => writeln!(out, "{STOP_FIRST}"),
             Err(error) => writeln!(out, "Not uninstalled ({error:?})."),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Same pair on every unix: the engine's local report lane falls back
+    /// to these on macOS too, so a share scans the same tools.
+    #[test]
+    fn default_dirs_are_dot_config_and_dot_local_share_of_the_home() {
+        let home = Path::new("/h/u");
+        assert_eq!(
+            default_dirs(home),
+            (
+                PathBuf::from("/h/u/.config"),
+                PathBuf::from("/h/u/.local/share")
+            )
+        );
     }
 }
