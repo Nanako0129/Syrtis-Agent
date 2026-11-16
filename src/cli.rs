@@ -61,14 +61,17 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> ExitCode {
 }
 
 /// The config and data directories the engine resolves clients against:
-/// `home/.config` and `home/.local/share` on every unix, macOS included.
+/// `home/.config` and `home/.local/share`, on macOS as on Linux. The value
+/// for Windows is not decided here (the engine maps these two to `APPDATA`
+/// and `LOCALAPPDATA` there); this crate's binary is unix-only.
 /// They depend on `home` alone (no environment variable, no `dirs` crate).
 /// The engine substitutes the data dir for the XDG data root and
 /// `<config dir>/tokscale` for its config root, so these are the places the
 /// engine's local report lane also falls back to on macOS; `Library/
 /// Application Support` would miss every client kept under `.local/share`
 /// or `.config/tokscale`. Changing them changes the owner inputs: a consent
-/// change (`spec/source-v1.md`). The Syrtis app calls this function too.
+/// change (`spec/source-v1.md`). `pub` so that an embedding app can call it and
+/// compute the same owner inputs as this binary on the shared secure root.
 pub fn default_dirs(home: &Path) -> (PathBuf, PathBuf) {
     (home.join(".config"), home.join(".local").join("share"))
 }

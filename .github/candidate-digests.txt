@@ -183,7 +183,7 @@
 # consent change (re-approval, old grants stop authorizing), not a D1 case.
 4eb5d2ca0aa2906676095dd4d2450d142f15fd6e8cdfbff774ee9d7cbf2e9373  spec/cache-store-v1.md
 055a5c81aade6aec75c8f43bccb8128ab22ca1691b15b690ca833d0005176a2f  spec/install-v1.md
-595eec4a777b65fe4a58eb4c5c200d827148ee4dfcb2b96665a1ba84c446c87e  spec/cli-v1.md
+14448b1b0ca3be54b08c8c13f0e267eaa12058bcd571d678a481e574d2d7859a  spec/cli-v1.md
 5b1db7ec2cbcdb80479f7edd75e8c82a016c321c9726832af868f6e1c5a6da8e  spec/control-v1.md
 fa83df962309c42614f7fb4a557f601b862c988d90343b06bb1d16fc46aa9ba8  spec/pairing-v1.md
 ee750e1996a12ada3e565139d547cfa4a12dcf9997aea095b4e2a436241f6b92  spec/runtime-v1.md
