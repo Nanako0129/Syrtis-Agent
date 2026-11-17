@@ -85,7 +85,7 @@ One thread. A round:
 
 Failures are ignored; the next round tries again (`expire_one` refuses `Bounds` while the record table is full, for example). The thread then waits on a condition variable until `stop()` or the pause ends. The pause is the period (60 s; `Options::housekeeping_period`), or, when a record not yet expired expires sooner, the time until then but at least 1 s (the wall clock has whole seconds) and never more than the period. A skipped or failed round waits the full period: the thread never spins. Clock and period are injectable (`Options`); production uses the OS clock and 60 s.
 
-Nothing depends on the sweep for authority: claim, approval, Pair and Grant status and authorization compare `expiresAt` with the effective now themselves. The sweep only makes the stored state say so, and frees the slots (five active offers, five awaiting pending, sixteen active grants) that expired records would otherwise hold.
+Nothing depends on the sweep for authority: claim, approval, Pair and Grant status and authorization compare `expiresAt` with the effective now themselves. The sweep only makes the stored state say so, and frees the slots (five active offers, five awaiting pending) that expired offers and pending records would otherwise hold. Grants are approved for 100 years (`spec/pairing-v1.md`, "Approval"), so the sweep does not routinely free any of the sixteen active-grant slots: a revocation does, including the one a re-pairing of the same device makes.
 
 ## Receiver pull and cache (`SA-2B3b`)
 

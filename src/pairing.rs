@@ -40,7 +40,10 @@ use crate::{
 
 /// v1 never re-issues a SAS, so every pending claim has generation 1.
 pub const SAS_GENERATION: u64 = 1;
-pub const GRANT_LIFETIME_MS: i64 = 30 * 86_400_000;
+/// 100 years: in practice a grant does not expire. Access ends by
+/// revocation (control `revoke`, disable, a source change) or by a newer
+/// approval for the same device ([`approve`]), not by waiting out a date.
+pub const GRANT_LIFETIME_MS: i64 = 100 * 365 * 86_400_000;
 /// Largest Pair claim, Pair status or Grant status request payload,
 /// applied after the key-set dispatch. A Peer request is bounded only by
 /// the frame (`FRAME_PAYLOAD_MAX`).
@@ -734,8 +737,18 @@ pub(crate) fn error_frame(request_id: [u8; 16], code: u16) -> Frame {
 
 /// Owner approval of `pending_id` (the control command is `SA-2B2c`).
 /// `responderStatic` is this agent's identity from one snapshot; the grant
-/// ID is derived from the pending ID; the grant lasts 30 days from the
-/// effective now. Returns the grant ID.
+/// ID is derived from the pending ID; the grant lasts
+/// [`GRANT_LIFETIME_MS`] (100 years) from the effective now. Returns the
+/// grant ID.
+///
+/// DR-3a: every other active grant of the same initiator static is then
+/// revoked with `revoke_commit`, so re-pairing a device leaves it one
+/// grant. That is a second transition, after the new grant is durable: an
+/// `Err` from it means the new grant exists and is active, while the older
+/// grants of that device are all still active (one transition, so none or
+/// all) and can be revoked by hand. Grants of other statics are not
+/// revoked, but `revoke_commit` renumbers their `authEpoch` as any revoke
+/// does (their receivers learn it from Grant status).
 pub fn approve(
     store: &StateStore,
     pending_id: [u8; 16],
@@ -764,6 +777,30 @@ pub fn approve(
             os_now_seconds,
         )
     })?;
+    let older = |state: &ReferenceState| -> Vec<([u8; 16], i64)> {
+        let Some(new) = state.grants.iter().find(|grant| grant.grant_id == grant_id) else {
+            return Vec::new();
+        };
+        state
+            .grants
+            .iter()
+            .filter(|grant| {
+                grant.state == GrantState::Active
+                    && grant.grant_id != grant_id
+                    && grant.initiator_static == new.initiator_static
+            })
+            // The new grant's creation time is the revocation's record time.
+            .map(|grant| (grant.grant_id, new.created_at_ms))
+            .collect()
+    };
+    // A first pairing of a device adds no second write.
+    if !older(&store.state()?.reference).is_empty() {
+        store.transition(|state| {
+            older(state)
+                .into_iter()
+                .try_fold(state.clone(), |next, (id, at)| next.revoke_commit(id, at))
+        })?;
+    }
     Ok(grant_id)
 }
 
@@ -1413,7 +1450,7 @@ mod tests {
                 seams::{self as fs_seams, Reset as FsReset},
                 test_support::{SUFFIX, TempHome, retry_busy},
             },
-            security::{Offer, OfferState},
+            security::{Offer, OfferClaim, OfferState},
         };
 
         const NOW: i64 = 1_700_000_000;
@@ -1594,6 +1631,104 @@ mod tests {
             let state = node.store.state().unwrap();
             assert!(!state.reference.sharing_enabled);
             assert!(state.reference.pending.is_empty());
+        }
+
+        /// DR-3a failure order: `approve` revokes the device's older grant
+        /// in a second commit, after the new grant's. With that commit
+        /// failing, the reopened state has the new grant and the older one
+        /// both active and `approve` returned the error; the control (no
+        /// failure) leaves the older one revoked.
+        #[test]
+        fn a_failed_same_device_revoke_keeps_the_new_grant_and_the_older_one() {
+            for fail in [false, true] {
+                let home = TempHome::new();
+                let open = || {
+                    retry_busy(|| {
+                        StateStore::open(SecureRoot::open_under(&home.path, SUFFIX)?, NOW)
+                    })
+                    .unwrap()
+                };
+                let store = open();
+                let responder = store.state().unwrap().identity_public().unwrap();
+                // Offer `n` claimed by INITIATOR; returns the pending ID.
+                let claimed = |n: u8| {
+                    let (offer_id, secret, pending_id) = ([n; 16], [n; 32], [0x80 | n; 16]);
+                    store
+                        .transition(|state| {
+                            let state = if state.sharing_enabled {
+                                state.clone()
+                            } else {
+                                state.enable_sharing()?
+                            };
+                            state
+                                .create_offer(
+                                    Offer {
+                                        offer_id,
+                                        secret_hash: offer_secret_hash(
+                                            &offer_id, &secret, &responder,
+                                        ),
+                                        created_at_ms: NOW * 1_000,
+                                        expires_at_ms: NOW * 1_000 + 600_000,
+                                        state: OfferState::Active,
+                                    },
+                                    NOW,
+                                )?
+                                .claim_offer(
+                                    OfferClaim {
+                                        offer_id,
+                                        secret,
+                                        responder_static: responder,
+                                        pending_id,
+                                        initiator_static: INITIATOR,
+                                        sas_code: "0A1B-2C3D".into(),
+                                        sas_generation: 1,
+                                    },
+                                    NOW,
+                                )
+                                .map(|(next, _, _)| next)
+                        })
+                        .unwrap();
+                    pending_id
+                };
+                let older = approve(&store, claimed(1), 1, true, NOW).unwrap();
+                let second = claimed(2);
+                let _reset = FsReset;
+                if fail {
+                    // The approval's own commit passes; the revoke's fails.
+                    let mut commits = 0;
+                    fs_seams::set_hook(Some(Box::new(move |at| {
+                        if at == Step::CreateTemp {
+                            commits += 1;
+                        }
+                        if commits == 2 {
+                            Err(std::io::Error::other("injected"))
+                        } else {
+                            Ok(())
+                        }
+                    })));
+                }
+                let result = approve(&store, second, 1, true, NOW);
+                fs_seams::set_hook(None);
+                drop(store);
+                let state = open().state().unwrap().reference;
+                let state_of = |id: [u8; 16]| {
+                    state
+                        .grants
+                        .iter()
+                        .find(|grant| grant.grant_id == id)
+                        .unwrap()
+                        .state
+                };
+                let new = derive_grant_id(&second);
+                assert_eq!(state_of(new), GrantState::Active, "fail={fail}");
+                if fail {
+                    assert_eq!(result, Err(StorageError::Unknown));
+                    assert_eq!(state_of(older), GrantState::Active);
+                } else {
+                    assert_eq!(result, Ok(new));
+                    assert_eq!(state_of(older), GrantState::Revoked);
+                }
+            }
         }
     }
 }
