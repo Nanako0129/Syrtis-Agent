@@ -1355,7 +1355,10 @@ mod disk {
         pairing::{ConfirmedGrant, GrantStatus, PairStatus, Producer, approve},
         report_peer::{NoSource, Reports},
         secure_fs::SecureRoot,
-        security::{NOISE_PROLOGUE, NOISE_SUITE, Offer, OfferState, PendingState},
+        security::{
+            GrantState, NOISE_PROLOGUE, NOISE_SUITE, Offer, OfferState, PendingApproval,
+            PendingState,
+        },
         state_store::StateStore,
     };
 
@@ -1659,15 +1662,7 @@ mod disk {
     /// through real loopback connections; returns the client's confirmed
     /// grant and the store's pending ID.
     fn paired(node: &Node, port: u16, key: &StaticKey, n: u8, clock: &FakeClock<'_>) -> [u8; 16] {
-        node.offer(n, 600_000, clock.os_now_seconds().unwrap());
-        clock.tick();
-        let body = body_of(&raw(
-            port,
-            key,
-            node.key.public(),
-            claim_json(n, &secret(n)),
-        ));
-        let pending_id = pending_of(&body);
+        let pending_id = claimed(node, port, key, n, clock);
         approve(
             &node.store,
             pending_id,
@@ -1676,6 +1671,49 @@ mod disk {
             clock.os_now_seconds().unwrap(),
         )
         .unwrap();
+        pending_id
+    }
+
+    /// Offer `n` and a real claim of it by `key`; returns the pending ID.
+    fn claimed(node: &Node, port: u16, key: &StaticKey, n: u8, clock: &FakeClock<'_>) -> [u8; 16] {
+        node.offer(n, 600_000, clock.os_now_seconds().unwrap());
+        clock.tick();
+        pending_of(&body_of(&raw(
+            port,
+            key,
+            node.key.public(),
+            claim_json(n, &secret(n)),
+        )))
+    }
+
+    /// Like [`paired`], but approved through the frozen `approve_pending`
+    /// with an explicit `expires_at_ms`, so expiry is reached without
+    /// walking the wall to the real lifetime (100 years).
+    fn paired_expiring(
+        node: &Node,
+        port: u16,
+        key: &StaticKey,
+        n: u8,
+        clock: &FakeClock<'_>,
+        expires_at_ms: i64,
+    ) -> [u8; 16] {
+        let pending_id = claimed(node, port, key, n, clock);
+        let os_now = clock.os_now_seconds().unwrap();
+        node.store
+            .transition(|state| {
+                state.approve_pending(
+                    PendingApproval {
+                        pending_id,
+                        sas_generation: 1,
+                        grant_id: derive_grant_id(&pending_id),
+                        responder_static: *node.key.public(),
+                        grant_expires_at_ms: expires_at_ms,
+                        disclosure_exact: true,
+                    },
+                    os_now,
+                )
+            })
+            .unwrap();
         pending_id
     }
 
@@ -1755,8 +1793,8 @@ mod disk {
             assert_eq!(grant.responder_static, *node.key.public());
             assert_eq!(
                 grant.expires_at_ms - grant.created_at_ms,
-                30 * 86_400_000,
-                "30-day grant"
+                3_153_600_000_000,
+                "100-year grant (DR-3a)"
             );
             // Claim, Pair status x2 (awaiting, approved), Grant status.
             assert_eq!(accepted.len(), 4, "{accepted:?}");
@@ -2051,55 +2089,64 @@ mod disk {
         let alice = StaticKey::generate().unwrap();
         let mallory = StaticKey::generate().unwrap();
         let responder = *node.key.public();
+        // One device per grant: a second approval for the same static
+        // would revoke the first (DR-3a).
+        let devices: Vec<StaticKey> = (0..3).map(|_| StaticKey::generate().unwrap()).collect();
         serve(&node.producer(&clock), |port| {
-            let grants: Vec<[u8; 16]> = (1..=5)
-                .map(|n| derive_grant_id(&paired(&node, port, &alice, n, &clock)))
+            let grants: Vec<[u8; 16]> = (1..=3)
+                .map(|n| {
+                    let key = &devices[usize::from(n) - 1];
+                    derive_grant_id(&paired(&node, port, key, n, &clock))
+                })
                 .collect();
             let status = |key: &StaticKey, grant_id: &[u8; 16]| {
                 clock.tick();
                 raw(port, key, &responder, grant_status_json(grant_id))
             };
-            assert_eq!(state_of(&status(&alice, &grants[0])), "active");
-            let body = body_of(&status(&alice, &grants[0]));
+            let [a, b, c] = [&devices[0], &devices[1], &devices[2]];
+            assert_eq!(state_of(&status(a, &grants[0])), "active");
+            let body = body_of(&status(a, &grants[0]));
             assert_eq!(body["grantId"], hex_encode(&grants[0]));
 
             node.store
                 .transition(|state| state.revoke_commit(grants[0], NOW * 1_000))
                 .unwrap();
-            assert_eq!(state_of(&status(&alice, &grants[0])), "revoked");
-            assert_eq!(state_of(&status(&alice, &grants[1])), "active");
+            assert_eq!(state_of(&status(a, &grants[0])), "revoked");
+            assert_eq!(state_of(&status(b, &grants[1])), "active");
 
             let expires = node.store.state().unwrap().reference.grants[2].expires_at_ms;
             node.store
                 .transition(|state| state.expire_one(grants[2], expires))
                 .unwrap();
-            assert_eq!(state_of(&status(&alice, &grants[2])), "expired");
+            assert_eq!(state_of(&status(c, &grants[2])), "expired");
 
             // Clock anomaly: forward by more than a day.
             clock.skew(200_000);
-            assert_eq!(status(&alice, &grants[1]).payload, error_payload(5));
-            assert_eq!(state_of(&status(&alice, &grants[0])), "revoked");
-            assert_eq!(state_of(&status(&alice, &grants[2])), "expired");
+            assert_eq!(status(b, &grants[1]).payload, error_payload(5));
+            assert_eq!(state_of(&status(a, &grants[0])), "revoked");
+            assert_eq!(state_of(&status(c, &grants[2])), "expired");
             assert_eq!(status(&mallory, &grants[1]).payload, error_payload(2));
             clock.skew(0);
 
             node.store
                 .transition(|state| state.source_change_commit())
                 .unwrap();
-            assert_eq!(state_of(&status(&alice, &grants[1])), "revoked");
+            assert_eq!(state_of(&status(b, &grants[1])), "revoked");
         });
 
-        // Expiry by effective now: walk the durable wall forward a day at a
-        // time (a single 30-day step is a clock anomaly), then ask.
+        // Expiry by effective now: a grant approved with a 60 s expiry (the
+        // real lifetime is 100 years), asked once its expiry is reached.
         let node = Node::new();
         let time = Mutex::new(Duration::ZERO);
         let clock = FakeClock::new(&time);
         serve(&node.producer(&clock), |port| {
-            let grant_id = derive_grant_id(&paired(&node, port, &alice, 1, &clock));
-            let expires = node.store.state().unwrap().reference.grants[0].expires_at_ms;
-            for day in 1..=30 {
-                node.store.checkpoint(NOW + day * 86_400).unwrap();
-            }
+            let expires = (NOW + 60) * 1_000;
+            let grant_id =
+                derive_grant_id(&paired_expiring(&node, port, &alice, 1, &clock, expires));
+            assert_eq!(
+                node.store.state().unwrap().reference.grants[0].expires_at_ms,
+                expires
+            );
             clock.skew(expires / 1_000 - NOW);
             clock.tick();
             let reply = raw(
@@ -2111,7 +2158,7 @@ mod disk {
             assert_eq!(state_of(&reply), "expired");
             assert_eq!(
                 node.store.state().unwrap().reference.grants[0].state,
-                syrtis_agent::security::GrantState::Active,
+                GrantState::Active,
                 "expired by effective now, not by a sweep"
             );
         });
@@ -2142,11 +2189,16 @@ mod disk {
         let node = Node::new();
         let time = Mutex::new(Duration::ZERO);
         let clock = FakeClock::new(&time);
-        let alice = StaticKey::generate().unwrap();
         let responder = *node.key.public();
+        // One device per grant (DR-3a: a second approval for the same
+        // static would revoke the first).
+        let devices: Vec<StaticKey> = (0..3).map(|_| StaticKey::generate().unwrap()).collect();
         serve(&node.producer(&clock), |port| {
             let grants: Vec<[u8; 16]> = (1..=3)
-                .map(|n| derive_grant_id(&paired(&node, port, &alice, n, &clock)))
+                .map(|n| {
+                    let key = &devices[usize::from(n) - 1];
+                    derive_grant_id(&paired(&node, port, key, n, &clock))
+                })
                 .collect();
             node.store
                 .transition(|state| state.revoke_commit(grants[0], NOW * 1_000))
@@ -2156,16 +2208,16 @@ mod disk {
                 .transition(|state| state.expire_one(grants[1], expires))
                 .unwrap();
             clock.wall_fails.store(true, Ordering::SeqCst);
-            let status = |grant_id: &[u8; 16]| {
+            let status = |n: usize| {
                 clock.tick();
-                raw(port, &alice, &responder, grant_status_json(grant_id))
+                raw(port, &devices[n], &responder, grant_status_json(&grants[n]))
             };
-            assert_eq!(state_of(&status(&grants[0])), "revoked");
-            assert_eq!(state_of(&status(&grants[1])), "expired");
-            assert_eq!(status(&grants[2]).payload, error_payload(8));
+            assert_eq!(state_of(&status(0)), "revoked");
+            assert_eq!(state_of(&status(1)), "expired");
+            assert_eq!(status(2).payload, error_payload(8));
             // Control: with the clock back, the active grant is `active`.
             clock.wall_fails.store(false, Ordering::SeqCst);
-            assert_eq!(state_of(&status(&grants[2])), "active");
+            assert_eq!(state_of(&status(2)), "active");
         });
     }
 

@@ -228,7 +228,7 @@ mod disk {
 
     /// Pairs a fresh receiver with a fresh producer over loopback. With
     /// `grant_expires_at_ms` the producer approves directly with that
-    /// expiry; otherwise through the normal approval (30 days).
+    /// expiry; otherwise through the normal approval (100 years).
     fn pair(grant_expires_at_ms: Option<i64>, receiver_period: Duration) -> Pair {
         let producer = Node::new(SLOW);
         producer.configure(free_port());

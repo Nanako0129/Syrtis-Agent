@@ -447,10 +447,18 @@ impl Runtime {
 
     /// `set_state` first: read access ends once that is durable. A removal
     /// that fails after it only leaves files no usable record can name.
+    ///
+    /// A `Refused(Conflict)` means the record now holds another grant (the
+    /// producer was paired again while this pull was in flight): this
+    /// answer is about the old grant, so the new grant's cache entries are
+    /// kept. Any other outcome removes them, as before.
     fn forget(&self, record: &PeerRecord, state: PeerState) {
-        let _ = self
+        let marked = self
             .peers
             .set_state(&record.responder_static, &record.grant_id, state);
+        if marked == Err(StorageError::Refused(SecurityError::Conflict)) {
+            return;
+        }
         if let Some(cache) = &self.inner.cache {
             let _ = cache.remove_peer(&hex_encode(&record.responder_static));
         }
@@ -1137,6 +1145,81 @@ mod tests {
                 "{step:?}"
             );
         }
+    }
+
+    /// DR-3a review: a pull with record A is in flight when the receiver
+    /// pairs again (the producer's approval revokes A, DR-3a), upserts B
+    /// and caches B's first body. A's late `revoked` answer then reaches
+    /// `forget`: `set_state` is a conflict, and B's entry, record and
+    /// `last_good` survive. Control: a real revoke of B, the current
+    /// record, marks it and deletes the entry.
+    #[test]
+    fn a_late_revoked_answer_for_a_replaced_grant_keeps_the_new_grants_cache() {
+        let (producer_home, receiver_home) = (ShortHome::new(), ShortHome::new());
+        let (producer, receiver, producer_static, query) =
+            labeled_pair(&producer_home, &receiver_home, "Studio Mac");
+        let a = receiver.peers().peers().unwrap()[0].clone();
+
+        let offer = call(&producer, OFFER_CREATE, json!({"ttlSeconds": 600}));
+        let url = offer["pairUrl"].as_str().unwrap().to_owned();
+        let identity = StaticKey::from_state(&receiver.store().state().unwrap()).unwrap();
+        let (ledger, clock) = (MemoryLedger::default(), SystemClock);
+        let client = PairingClient {
+            identity: &identity,
+            ledger: &ledger,
+            clock: &clock,
+        };
+        let now = clock.os_now_seconds().unwrap();
+        let claimed = client
+            .claim(&url, now * 1_000, &mut ClaimAttempts::default())
+            .unwrap();
+        approve(producer.store(), claimed.pending_id, 1, true, now).unwrap();
+        let confirmed = client.poll(&claimed).unwrap();
+        receiver
+            .peers()
+            .upsert(PeerRecord::from_confirmed(&confirmed, None, now * 1_000))
+            .unwrap();
+        let b = receiver.peers().peers().unwrap()[0].clone();
+        assert_ne!(a.grant_id, b.grant_id);
+        receiver.pull(&producer_static, &query).unwrap();
+        assert_eq!(receiver_files(&receiver_home), 1);
+
+        // A's fetch, answered now, and what `pull` does with that answer.
+        let inner = &receiver.inner;
+        assert_eq!(
+            fetch(&a, &query, &inner.store, &inner.ledger, &receiver.fetches).err(),
+            Some(FetchError::Revoked)
+        );
+        receiver.forget(&a, PeerState::Revoked);
+        assert_eq!(receiver_files(&receiver_home), 1, "B's entry was deleted");
+        let current = receiver.peers().peers().unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(
+            (current[0].grant_id, current[0].state),
+            (b.grant_id, PeerState::Active)
+        );
+        assert!(
+            receiver
+                .last_good(&producer_static, &query)
+                .unwrap()
+                .is_some()
+        );
+
+        // Control: a revoke of the current record.
+        call(
+            &producer,
+            REVOKE,
+            json!({"grantId": hex_encode(&b.grant_id)}),
+        );
+        assert_eq!(
+            receiver.pull(&producer_static, &query).err(),
+            Some(PullError::Fetch(FetchError::Revoked))
+        );
+        assert_eq!(receiver_files(&receiver_home), 0);
+        assert_eq!(
+            receiver.peers().peers().unwrap()[0].state,
+            PeerState::Revoked
+        );
     }
 
     /// SA-2B3b acceptance (3c): the producer answers `revoked` and the

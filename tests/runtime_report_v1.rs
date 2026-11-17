@@ -38,7 +38,9 @@ mod disk {
         canonical::CanonicalJsonV1,
         listener::Listener,
         noise::{self, Deadline, StaticKey},
-        pairing::{ClaimAttempts, Claimed, Clock, PairingClient, RateLimiter, approve},
+        pairing::{
+            ClaimAttempts, Claimed, Clock, PairingClient, RateLimiter, approve, derive_grant_id,
+        },
         peer_store::{PeerRecord, PeerState, PeerStore},
         report::{
             AgentsRecord, Endpoint, GraphRecord, HourlyRecord, ModelsRecord, ReportRecord,
@@ -50,14 +52,18 @@ mod disk {
         },
         secure_fs::{SecureRoot, StorageError},
         security::{
-            FRAME_PAYLOAD_MAX, Frame, FrameKind, GrantState, LOGICAL_BODY_MAX, MemoryLedger, Offer,
-            OfferClaim, OfferState, PairOffer, REMOTE_MEMORY_MAX, REPORT_SCHEMA_VERSION,
-            assemble_response, hex_encode, offer_secret_hash, pair_url,
+            AuthorizationRequest, FRAME_PAYLOAD_MAX, Frame, FrameKind, GrantState,
+            LOGICAL_BODY_MAX, MemoryLedger, Offer, OfferClaim, OfferState, PairOffer,
+            PendingApproval, REMOTE_MEMORY_MAX, REPORT_SCHEMA_VERSION, assemble_response,
+            authorize, hex_encode, offer_secret_hash, pair_url,
         },
         state_store::{AuthorizationQuery, StateStore},
     };
 
     const NOW: i64 = 1_700_000_000;
+    /// An explicit grant expiry two minutes after `NOW`, for the expiry
+    /// tests: a real approval lasts 100 years (DR-3a).
+    const SHORT_EXPIRY_MS: i64 = (NOW + 120) * 1_000;
     #[allow(dead_code)]
     const _RECEIVER: () = ();
     const SUFFIX: &[&str] = &["Library", "AppSupport", "agent"];
@@ -254,6 +260,43 @@ mod disk {
         /// Grant `n` to `key`, through the frozen offer, claim and approve
         /// transitions at the current OS clock.
         fn grant(&self, n: u8, key: &StaticKey) -> Granted {
+            self.grant_until(n, key, None)
+        }
+
+        /// The owner's approval of `pending_id` at `os_now`: `approve` (100
+        /// years, and DR-3a's revoke of the static's older grants), or with
+        /// `expires_at_ms` the frozen `approve_pending` with that expiry, so
+        /// an expiry test need not walk the wall for a century.
+        fn approve_until(
+            &self,
+            pending_id: [u8; 16],
+            os_now: i64,
+            expires_at_ms: Option<i64>,
+        ) -> [u8; 16] {
+            let Some(grant_expires_at_ms) = expires_at_ms else {
+                return approve(&self.store, pending_id, 1, true, os_now).unwrap();
+            };
+            let grant_id = derive_grant_id(&pending_id);
+            self.store
+                .transition(|state| {
+                    state.approve_pending(
+                        PendingApproval {
+                            pending_id,
+                            sas_generation: 1,
+                            grant_id,
+                            responder_static: self.responder,
+                            grant_expires_at_ms,
+                            disclosure_exact: true,
+                        },
+                        os_now,
+                    )
+                })
+                .unwrap();
+            grant_id
+        }
+
+        /// [`grant`](Self::grant), approved by [`approve_until`](Self::approve_until).
+        fn grant_until(&self, n: u8, key: &StaticKey, expires_at_ms: Option<i64>) -> Granted {
             let os_now = self.clock.os();
             let (offer_id, secret, pending_id) = ([n; 16], [n; 32], [0x80 | n; 16]);
             let responder = self.responder;
@@ -285,7 +328,7 @@ mod disk {
                         .map(|(next, _, _)| next)
                 })
                 .unwrap();
-            let grant_id = approve(&self.store, pending_id, 1, true, os_now).unwrap();
+            let grant_id = self.approve_until(pending_id, os_now, expires_at_ms);
             self.granted(grant_id, pending_id)
         }
 
@@ -633,7 +676,7 @@ mod disk {
 
         let node = Node::new(canonical);
         let key = StaticKey::generate().unwrap();
-        let granted = node.grant(1, &key);
+        let granted = node.grant_until(1, &key, Some(SHORT_EXPIRY_MS));
         node.advance_wall_to(granted.expires_at_ms / 1_000);
         assert_eq!(
             refused(&node.fetch(&key, &request(&granted, 1))),
@@ -643,6 +686,74 @@ mod disk {
             node.grant_state(granted.grant_id).state,
             GrantState::Expired
         );
+    }
+
+    /// DR-3a (F6): an approved grant still authorizes 30 days and a second
+    /// after its creation (the old 30-day lifetime refused that), and is
+    /// refused at its own `expiresAt` (100 years on), with no overflow.
+    #[test]
+    fn a_grant_authorizes_past_30_days_and_stops_at_its_expiry() {
+        let node = Node::new(canonical);
+        let key = StaticKey::generate().unwrap();
+        let granted = node.grant(1, &key);
+        let grant = node.grant_state(granted.grant_id);
+        let reference = node.store.state().unwrap().reference;
+        let at = |os_now_unix_seconds: i64| AuthorizationRequest {
+            sharing_enabled: reference.sharing_enabled,
+            auth_epoch: grant.auth_epoch,
+            deny_floor: reference.deny_floor,
+            source_scope_generation: grant.source_scope_generation,
+            counter_source_scope_generation: reference.source_scope_generation,
+            os_now_unix_seconds,
+            last_accepted_wall_unix_seconds: reference.last_accepted_wall_unix_seconds(),
+            endpoint: 1,
+        };
+        let created = grant.created_at_ms / 1_000;
+        assert!(authorize(&grant, &at(created + 30 * 86_400 + 1)));
+        assert!(authorize(&grant, &at(grant.expires_at_ms / 1_000 - 1)));
+        assert!(!authorize(&grant, &at(grant.expires_at_ms / 1_000)));
+    }
+
+    /// DR-3a (F3): a second approval for the same static revokes its
+    /// older grant (its report is `revoked`) and the new grant is served.
+    /// Another static's grant stays active; like any revoke, this
+    /// renumbers its `authEpoch`, and with the current epoch it is served.
+    /// Control: before the second approval the older grant is active and
+    /// served.
+    #[test]
+    fn a_second_approval_for_the_same_static_revokes_its_older_grant() {
+        let node = Node::new(canonical);
+        let (alice, bob) = (
+            StaticKey::generate().unwrap(),
+            StaticKey::generate().unwrap(),
+        );
+        let b = node.grant(1, &bob);
+        let older = node.grant(2, &alice);
+        assert_eq!(node.grant_state(older.grant_id).state, GrantState::Active);
+        complete(&node.fetch(&alice, &request(&older, 1)));
+
+        let newer = node.grant(3, &alice);
+        assert_eq!(node.grant_state(older.grant_id).state, GrantState::Revoked);
+        assert_eq!(
+            refused(&node.fetch(&alice, &request(&older, 1))),
+            error_payload(4)
+        );
+        complete(&node.fetch(&alice, &request(&newer, 1)));
+
+        let b_now = node.granted(b.grant_id, b.pending_id);
+        assert_eq!(node.grant_state(b.grant_id).state, GrantState::Active);
+        assert!(b_now.auth_epoch > b.auth_epoch);
+        complete(&node.fetch(&bob, &request(&b_now, 1)));
+        let active = node
+            .store
+            .state()
+            .unwrap()
+            .reference
+            .grants
+            .iter()
+            .filter(|grant| grant.state == GrantState::Active)
+            .count();
+        assert_eq!(active, 2, "one grant per device");
     }
 
     /// Acceptance (5): revoking A renumbers B. B's request with its old
@@ -1173,7 +1284,7 @@ mod disk {
     fn after_expiry_a_clock_moved_back_is_still_expired() {
         let node = Node::new(canonical);
         let key = StaticKey::generate().unwrap();
-        let granted = node.grant(1, &key);
+        let granted = node.grant_until(1, &key, Some(SHORT_EXPIRY_MS));
         let target = granted.expires_at_ms / 1_000 + 10;
         node.advance_wall_to(target);
         // Earlier than `expiresAt`, within the 300 s rollback tolerance.
@@ -1249,6 +1360,16 @@ mod disk {
         /// from the Pair URL, owner approval, poll) and stores the record
         /// from the confirmed grant, as the receiver's UI would.
         fn pair(&self, n: u8, receiver: &Receiver) -> PeerRecord {
+            self.pair_until(n, receiver, None)
+        }
+
+        /// [`pair`](Self::pair), approved by [`Node::approve_until`].
+        fn pair_until(
+            &self,
+            n: u8,
+            receiver: &Receiver,
+            grant_expires_at_ms: Option<i64>,
+        ) -> PeerRecord {
             let os_now = self.clock.os();
             let (offer_id, secret) = ([0x40 | n; 16], [0x40 | n; 32]);
             let responder = self.responder;
@@ -1281,7 +1402,7 @@ mod disk {
             let claimed = client
                 .claim(&url, os_now * 1_000, &mut ClaimAttempts::default())
                 .unwrap();
-            approve(&self.store, claimed.pending_id, 1, true, os_now).unwrap();
+            self.approve_until(claimed.pending_id, os_now, grant_expires_at_ms);
             let confirmed = client.poll(&claimed).unwrap();
             let record = PeerRecord::from_confirmed(&confirmed, None, NOW * 1_000);
             receiver.peers.upsert(record.clone()).unwrap();
@@ -1392,7 +1513,7 @@ mod disk {
 
         let node = Node::new(canonical);
         let receiver = Receiver::new();
-        let peer = node.pair(1, &receiver);
+        let peer = node.pair_until(1, &receiver, Some(SHORT_EXPIRY_MS));
         node.advance_wall_to(peer.expires_at_ms / 1_000);
         assert_eq!(
             receiver.fetch(&peer, Endpoint::Graph).err(),
@@ -1440,6 +1561,34 @@ mod disk {
         assert_eq!(renewed.auth_epoch, answer.auth_epoch);
         let fetched = bob.fetch(&renewed, Endpoint::Graph).unwrap();
         assert_eq!(fetched.records, stub_records(Endpoint::Graph));
+    }
+
+    /// DR-3a (e): the same receiver pairs twice over the wire. The second
+    /// approval revokes the first grant and creates the new one in one
+    /// commit, so the new grant takes its `authEpoch` after the
+    /// renumbering and keeps it: the epoch the receiver got from Grant
+    /// status during the poll is the stored one, above the deny floor, and
+    /// the new record is served at once (no `CheckGrantStatus`). The old
+    /// record is `Revoked`.
+    #[test]
+    fn re_pairing_confirms_the_new_grants_final_epoch() {
+        let node = Node::new(canonical);
+        let receiver = Receiver::new();
+        let first = node.pair(1, &receiver);
+        node.clock.advance(GRANT_REFILL);
+        let second = node.pair(2, &receiver);
+        let stored = node.grant_state(second.grant_id);
+        assert_eq!(second.auth_epoch, stored.auth_epoch);
+        assert!(stored.auth_epoch > node.store.state().unwrap().reference.deny_floor);
+        assert_eq!(node.grant_state(first.grant_id).state, GrantState::Revoked);
+        node.clock.advance(GRANT_REFILL);
+        let fetched = receiver.fetch(&second, Endpoint::Graph).unwrap();
+        assert_eq!(fetched.records, stub_records(Endpoint::Graph));
+        node.clock.advance(GRANT_REFILL);
+        assert_eq!(
+            receiver.fetch(&first, Endpoint::Graph).err(),
+            Some(FetchError::Revoked)
+        );
     }
 
     /// SA-2B2b2 acceptance (6): with two fetches in flight (each producer's

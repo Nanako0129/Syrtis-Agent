@@ -216,16 +216,51 @@
 # upsert example), spec/state-store-v1.md (set_listen_config: NFC, a changed
 # label passes the rule, an unchanged stored one is not re-validated; load
 # checks 128 bytes only), spec/runtime-v1.md and spec/report-peer-v1.md.
+#
+# DR-3a (2026-11-17) changed spec/pairing-v1.md and spec/runtime-v1.md on
+# purpose; the owner decided that grants should last very long and that a
+# new approval ends the same device's older grants. spec/pairing-v1.md: the
+# grant lifetime is 100 years (pairing::GRANT_LIFETIME_MS) and why
+# (revocation, not expiry, ends access; grants approved earlier keep their
+# expiry); "Approval" now states that approve revokes every other active
+# grant of the same initiatorStatic with the frozen revoke_commit (its
+# ordering and failure rules are the review round's, below), that other
+# devices' grants are not revoked but have their authEpoch renumbered as by
+# any revoke, and that a receiver removing the producer on its own side
+# keeps access until the producer revokes. spec/runtime-v1.md: the
+# housekeeping sentence no longer says the sweep routinely frees the
+# sixteen active-grant slots. src/security.rs is unchanged: the same-device
+# revoke lives in src/pairing.rs (not digest-pinned). No wire, schema or
+# SAS byte changed.
+#
+# DR-3a review round (2026-11-17) changed spec/pairing-v1.md,
+# spec/runtime-v1.md, spec/control-v1.md and spec/security-v1.md on
+# purpose. pairing::approve now revokes the pending initiator's active
+# grants and approves in ONE transition, revocations first, all or
+# nothing; this replaces the two-transition order of the first DR-3a
+# commit. spec/pairing-v1.md "Approval" states that rule (a refused or
+# failed approval revokes nothing; re-pairing succeeds at sixteen grants,
+# a seventeenth static is refused; each revocation's terminal record
+# counts before the record-table check; the new grant's epoch is final;
+# two pendings of one static end with the last approved) and two accepted
+# limits (the old grant ends at the owner's approval, not at the
+# receiver's take-up; other devices get code 2 once and the embedding app
+# refreshes them). spec/runtime-v1.md: pull step 4 leaves the cache alone
+# when set_state is Refused(Conflict) (the record holds a newer grant),
+# plus its acceptance row. spec/control-v1.md: the approve row says it
+# ends that device's earlier grant. spec/security-v1.md: the Approve row
+# says it is the reference transition alone and that pairing::approve
+# composes Revoke with it; the frozen transition itself is unchanged.
 4eb5d2ca0aa2906676095dd4d2450d142f15fd6e8cdfbff774ee9d7cbf2e9373  spec/cache-store-v1.md
 055a5c81aade6aec75c8f43bccb8128ab22ca1691b15b690ca833d0005176a2f  spec/install-v1.md
 14448b1b0ca3be54b08c8c13f0e267eaa12058bcd571d678a481e574d2d7859a  spec/cli-v1.md
-5b1db7ec2cbcdb80479f7edd75e8c82a016c321c9726832af868f6e1c5a6da8e  spec/control-v1.md
-fa83df962309c42614f7fb4a557f601b862c988d90343b06bb1d16fc46aa9ba8  spec/pairing-v1.md
-fcb5bd1f4941c3f8ed15c0b9d0e73d8d3f5efa2da3fadae7654be19fa6d3a0c3  spec/runtime-v1.md
+5e067392c4493745c43ea18da06dca5bbba1ff8a48bf5ddfddcae16036a9cdc8  spec/control-v1.md
+c6cfaf6793ab2d9319c461ac538c8d9e95428fdf2eebe54f630e6337673b3580  spec/pairing-v1.md
+a2cfe9ca7fffd0f6907d42cec630978303612561aa98df182b137fb41a5b505b  spec/runtime-v1.md
 26b94d43b40c537b49747a23befb5e53187dbba07cb0aae399350e7f3dd42527  spec/report-peer-v1.md
 7cc4eb2a75af280535da80a2955e14af83e95b1842ad4339b9b51536c2d797ee  spec/peer-store-v1.md
 f2c1c9300b27ab7607fad510baf5380b6d4e050e483a422a3046d19b76be8de6  spec/report-cache-v1.md
-7d8e9bbc76d84ba028f053006ee3815a98398f1bde989f9a5e33c2a607bc053a  spec/security-v1.md
+000b63ff5b4627053315b4054502082528acff5eee8cc8132b94cd12d191fcdf  spec/security-v1.md
 851b2c3306943ab32f1a6184bd6a593364e3ddf17d00ffde500222c2413d5267  spec/state-store-v1.md
 3e97171eda23b646b27ed21a26dffe9cb3a285636a558fc96e9b202076b3eb53  spec/v1.md
 4b28b7ce8b1d5192e8ee25aae4f8df4911ab3b7833df1d3324bff47aeaeb1c38  spec/source-v1.md

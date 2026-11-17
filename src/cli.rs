@@ -632,7 +632,7 @@ mod imp {
         };
         writeln!(
             out,
-            "Approve only if the other device shows the same code: {sas}\nApproving lets that device read aggregate usage (tokens, cost, model and client by day, hour and agent) of the approved scan scope until you revoke it or it expires."
+            "Approve only if the other device shows the same code: {sas}\nApproving lets that device read aggregate usage (tokens, cost, model and client by day, hour and agent) of the approved scan scope until you revoke it; it does not expire on its own. Approving also ends any earlier grant of that device."
         )?;
         let answer = ask(
             input,
