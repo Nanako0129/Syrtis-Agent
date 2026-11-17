@@ -66,7 +66,7 @@ The request carries no peer identity. Binding a grant to the paired static keys 
 | Enable | Only disabled to enabled |
 | Create offer | Enabled, no clock anomaly, ≤5 active, 1–900 second lifetime, unused ID, and strictly live at effective now |
 | Claim | No clock anomaly; the presented secret must reproduce the stored `secretHash` under constant-time comparison, and a wrong secret leaves the offer active so a guess cannot consume it; active-offer CAS to consumed; one awaiting pending; same initiator retry returns the same pending and generation only while that pending is still awaiting approval; a terminal pending and a different initiator both get no metadata |
-| Approve | No clock anomaly; current pending ID and generation, unexpired, exact disclosure; allocate `nextAuthEpoch`, then increment; the new grant records `createdAt`, the pending claim's `initiatorStatic`, and the responder static key supplied by the caller |
+| Approve | No clock anomaly; current pending ID and generation, unexpired, exact disclosure; allocate `nextAuthEpoch`, then increment; the new grant records `createdAt`, the pending claim's `initiatorStatic`, and the responder static key supplied by the caller. This row is the reference transition alone; the runtime's `pairing::approve` (DR-3a) applies Revoke to each active grant of the same `initiatorStatic` and then this transition, in one commit (`spec/pairing-v1.md`, "Approval") |
 | Reject or expiry | Terminal record; never authority |
 | Revoke | One immutable commit raises deny floor, re-epochs survivors, terminates target |
 | Disable/reset/uninstall | One commit raises deny floor, disables sharing, leaves no active grant |

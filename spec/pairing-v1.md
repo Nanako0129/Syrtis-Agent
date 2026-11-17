@@ -148,16 +148,21 @@ Answered from one snapshot. Sharing being off does not refuse it: the bound stat
 
 ## Approval
 
-`pairing::approve(store, pendingId, sasGeneration, disclosureExact, osNowSeconds)` reads this agent's static from one snapshot, derives `grantId`, sets the expiry to 100 years (`GRANT_LIFETIME_MS`) after the effective now, and commits the frozen `approve_pending` through `transition`. The control command that calls it is `SA-2B2c`; the App and the CLI reach it only through that command.
+`pairing::approve(store, pendingId, sasGeneration, disclosureExact, osNowSeconds)` reads this agent's static from one snapshot, derives `grantId`, sets the expiry to 100 years (`GRANT_LIFETIME_MS`) after the effective now, and commits, in one `transition`, the revocations below followed by the frozen `approve_pending`. The control command that calls it is `SA-2B2c`; the App and the CLI reach it only through that command.
 
 The lifetime is that long on purpose (DR-3a): an expiry that ended access every 30 days made the owner re-pair each device, and expiry is not how access is meant to end. Revocation is: it needs no clock, takes effect on the next authorization, and is the owner's explicit decision.
 
-One device, one grant (DR-3a). After that commit, `approve` revokes every other `active` grant whose `initiatorStatic` equals the new grant's, with the frozen `revoke_commit` (record time: the new grant's `createdAt`), so re-pairing a device ends its older grants and the sixteen-active-grant limit counts it once. Order and failure:
+One device, one grant (DR-3a). Inside that transition, before `approve_pending`, every `active` grant whose `initiatorStatic` is the pending's is revoked with the frozen `revoke_commit` (record time: the effective now, which is also the new grant's `createdAt`). The transition is all or nothing:
 
-- It is a second `transition`, after the new grant is durable. Its failure cannot remove the new grant: `approve` returns the error (control answers with the store-error map), the new grant stays `active`, and the older grants of that initiator all stay `active` (one transition revokes all of them or none); the owner can revoke them by hand. A retried `approve` of the same pending is refused, since it is no longer awaiting approval.
-- When the initiator has no other active grant, nothing more is written.
-- Grants of other initiators are not revoked. As with any revocation, `revoke_commit` raises the deny floor and renumbers their `authEpoch`; their receivers learn the new epoch from Grant status (`spec/report-peer-v1.md`, code 2).
-- The approval is checked against the limits before the older grants are revoked, so a producer holding sixteen active grants refuses the re-pairing even when one of them belongs to the same initiator; revoke that one first.
+- If `approve_pending` refuses (wrong generation, an expired or no longer awaiting pending, a disclosure that is not exact, a clock anomaly, sharing off, a limit) or the commit fails, nothing is revoked, no grant is created and the pending is left as it was; `approve` returns the error. A pending still awaiting approval can then be approved again. There is no state in which `approve` failed and the new grant exists.
+- The revocations come first, so the device's own grant does not count against the sixteen-active-grant limit: re-pairing a device succeeds at sixteen, while a seventeenth distinct initiator is refused. Each revocation also adds a terminal record before `approve_pending` checks the record table, so with the table one record short of full a re-pairing is refused where a first pairing would not be.
+- `revoke_commit` renumbers the remaining active grants and raises the deny floor before the new grant exists; `approve_pending` then gives the new grant the next `authEpoch`, above the deny floor, and nothing renumbers it afterwards. Grant status therefore answers the receiver with the new grant's final epoch.
+- Two awaiting pendings of one initiator, approved one after the other or at the same time, end with exactly one active grant: the one approved last.
+
+Accepted limits:
+
+- The older grant ends when the owner approves, not when the receiver takes up the new grant. Approving a request that the receiver has abandoned (it stopped polling, or never stored the grant) leaves that device without access until it pairs again.
+- Every approval that revokes renumbers `authEpoch` for the other devices' grants, as any revocation does. Each of those receivers is refused once with code 2 and must refresh through Grant status (`spec/report-peer-v1.md`). Nothing in this crate does that refresh; the embedding app does.
 
 A receiver that removes the producer on its own side (`PeerStore::remove`, `Runtime::remove_peer`) only forgets the record: the producer's grant stays `active`, and that receiver's static can keep reading until the producer revokes the grant or approves a new one for the same static.
 

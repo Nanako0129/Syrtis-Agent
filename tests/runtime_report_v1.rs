@@ -1563,6 +1563,34 @@ mod disk {
         assert_eq!(fetched.records, stub_records(Endpoint::Graph));
     }
 
+    /// DR-3a (e): the same receiver pairs twice over the wire. The second
+    /// approval revokes the first grant and creates the new one in one
+    /// commit, so the new grant takes its `authEpoch` after the
+    /// renumbering and keeps it: the epoch the receiver got from Grant
+    /// status during the poll is the stored one, above the deny floor, and
+    /// the new record is served at once (no `CheckGrantStatus`). The old
+    /// record is `Revoked`.
+    #[test]
+    fn re_pairing_confirms_the_new_grants_final_epoch() {
+        let node = Node::new(canonical);
+        let receiver = Receiver::new();
+        let first = node.pair(1, &receiver);
+        node.clock.advance(GRANT_REFILL);
+        let second = node.pair(2, &receiver);
+        let stored = node.grant_state(second.grant_id);
+        assert_eq!(second.auth_epoch, stored.auth_epoch);
+        assert!(stored.auth_epoch > node.store.state().unwrap().reference.deny_floor);
+        assert_eq!(node.grant_state(first.grant_id).state, GrantState::Revoked);
+        node.clock.advance(GRANT_REFILL);
+        let fetched = receiver.fetch(&second, Endpoint::Graph).unwrap();
+        assert_eq!(fetched.records, stub_records(Endpoint::Graph));
+        node.clock.advance(GRANT_REFILL);
+        assert_eq!(
+            receiver.fetch(&first, Endpoint::Graph).err(),
+            Some(FetchError::Revoked)
+        );
+    }
+
     /// SA-2B2b2 acceptance (6): with two fetches in flight (each producer's
     /// source held), a third is refused at once and connects nowhere; once
     /// the two finish, a fetch goes ahead.
