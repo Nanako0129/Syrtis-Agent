@@ -454,6 +454,12 @@ fn write_handshake(
     write_all(stream, &bytes, deadline)
 }
 
+/// The longest single `recv` on Windows (`read_exact`): how late a stalled
+/// read notices `Listener::stop`. Below the 1 s stop bound, with room for
+/// the accept poll and the joins.
+#[cfg(windows)]
+const WINDOWS_READ_SLICE: Duration = Duration::from_millis(250);
+
 /// Each system call gets the time left until `deadline`, so a peer that
 /// trickles bytes cannot extend it.
 fn read_exact(
@@ -463,8 +469,18 @@ fn read_exact(
 ) -> Result<(), NoiseError> {
     let mut filled = 0;
     while filled < buffer.len() {
+        let timeout = deadline.remaining()?;
+        // Windows does not wake a `recv` that is already blocked when
+        // `Listener::stop` shuts the socket down from another thread
+        // (windows-latest run 44887602263: `stop` waited out the 10 s
+        // handshake). Each call there waits at most `WINDOWS_READ_SLICE`,
+        // so the next call sees the shutdown and fails. A timed-out `recv`
+        // returns no data, so the retry loses nothing. Writes are not
+        // sliced: a timed-out send may already have sent part of its bytes.
+        #[cfg(windows)]
+        let timeout = timeout.min(WINDOWS_READ_SLICE);
         stream
-            .set_read_timeout(Some(deadline.remaining()?))
+            .set_read_timeout(Some(timeout))
             .map_err(|_| NoiseError::Io)?;
         #[cfg(test)]
         tests::READ_CALLS.with(|calls| calls.set(calls.get() + 1));
