@@ -170,6 +170,11 @@ pub(crate) mod seams {
     /// Skips the `FILE_PERSISTENT_ACLS` volume check (Windows).
     #[cfg(target_os = "windows")]
     pub(crate) const PERSISTENT_ACLS: u32 = 1 << 16;
+    /// Opens the intermediate directories a `SecureRoot` holds with
+    /// `FILE_SHARE_DELETE`, so holding them no longer stops a rename
+    /// (Windows).
+    #[cfg(target_os = "windows")]
+    pub(crate) const HOLD: u32 = 1 << 17;
 
     // Objects whose owner classification a test may force to "foreign".
     pub(crate) const HOME: u32 = 1 << 0;

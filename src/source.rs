@@ -289,7 +289,27 @@ impl EngineSource {
     /// first (`source_change_commit`), or this is `Refused(Conflict)` and
     /// nothing is written. A record that cannot be read or decoded is
     /// returned as that error; nothing is written.
+    ///
+    /// Not on Windows: there the only public entry is [`Self::approve_for`],
+    /// which names the digest the owner was shown (`spec/source-v1.md`).
+    #[cfg(not(windows))]
     pub fn approve(&self, store: &StateStore) -> Result<(), StorageError> {
+        self.approve_unchecked(store)
+    }
+
+    /// `approve` only for the inputs the owner was shown: `digest` must be
+    /// this source's [`Self::owner_inputs_sha256`], or this is
+    /// `Refused(Invalid)` and nothing is written. Every platform.
+    pub fn approve_for(&self, store: &StateStore, digest: &str) -> Result<(), StorageError> {
+        if digest != self.owner_inputs_sha256 {
+            return Err(StorageError::Refused(SecurityError::Invalid));
+        }
+        self.approve_unchecked(store)
+    }
+
+    /// The body of `approve`, for in-crate callers that
+    /// compared the digest themselves (`agent.rs`).
+    pub(crate) fn approve_unchecked(&self, store: &StateStore) -> Result<(), StorageError> {
         let _approving = self
             .approving
             .lock()

@@ -416,6 +416,11 @@ mod imp {
         /// generation (after a reset, or a crash between those two steps):
         /// `approve` only. Already approved: nothing is written. Control
         /// `scopeApprove` runs the same body, under the same lock.
+        ///
+        /// Not on Windows: there the only entry is
+        /// [`approve_scope_for`](Self::approve_scope_for), which names the
+        /// digest the owner was shown (`spec/agent-v1.md`).
+        #[cfg(not(windows))]
         pub fn approve_scope(&self) -> Result<(), StorageError> {
             approve_scope(self.runtime.store(), &self.source, &self.approving)
         }
@@ -426,8 +431,8 @@ mod imp {
             &self.disclosure
         }
 
-        /// [`approve_scope`](Self::approve_scope) only for the inputs the
-        /// owner was shown: `digest` must be this agent's
+        /// `approve_scope` only for the inputs the owner was shown (every
+        /// platform; the only entry on Windows): `digest` must be this agent's
         /// `scope_disclosure().owner_inputs_sha256`, or this is
         /// `Refused(Invalid)` and nothing is written. The same check as
         /// control `scopeApprove`.
@@ -679,10 +684,10 @@ mod imp {
         let generation = store.state()?.reference.source_scope_generation;
         match source.scope_record()? {
             Some(record) if record.inputs_match && record.generation == generation => Ok(()),
-            Some(record) if record.inputs_match => source.approve(store),
+            Some(record) if record.inputs_match => source.approve_unchecked(store),
             _ => {
                 store.transition(|state| state.source_change_commit())?;
-                source.approve(store)
+                source.approve_unchecked(store)
             }
         }
     }
