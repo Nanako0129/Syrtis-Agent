@@ -353,7 +353,7 @@
       "var": null
     }
   ],
-  "derivedFrom": "tokscale-core CLIENTS (src/clients.rs) and the hard-coded extra roots of scan_all_clients_resolved_inner (src/scanner.rs:1401-1794) and its helpers; remote contexts resolve env-var roots to home/<fallbackRelative> (src/source_context.rs:1197); a remote scan admits roots below home, config dir, data dir, the XDG data root, the source cache and the settings paths (admits_scan_root, src/source_context.rs:757-772)",
+  "derivedFrom": "tokscale-core CLIENTS (src/clients.rs) and the hard-coded extra roots of scan_all_clients_resolved_inner (src/scanner.rs:1401-1794) and its helpers; remote contexts resolve env-var roots to home/<fallbackRelative> (src/source_context.rs:1197); a remote scan admits roots below home, config dir, data dir, the XDG data root, the source cache and the settings paths (admits_scan_root, src/source_context.rs:757-786)",
   "engineSha": "2378f31a258b4875349a2d857338e3ed63fa60d8",
   "extraRoots": [
     {
