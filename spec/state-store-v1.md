@@ -133,7 +133,7 @@ FlushFileBuffers(the same, now renamed, handle)    -- shim step SyncDir
 
 ### Environment
 
-`LOCALAPPDATA` is ignored: a child process with `LOCALAPPDATA` set elsewhere resolves the same root (`localappdata_does_not_change_the_root`, `tests/runtime_storage_windows_v1.rs`). The known folder is asked with the process token; `userprofile_does_not_change_the_root` asserts that a child with `USERPROFILE` set elsewhere also resolves the same root. That assertion is evidence only once windows-latest CI has run it; if it fails there, this sentence changes, not the code. Other environment variables are not measured, so on Windows no claim is made that every environment variable is ignored: a process that can set this agent's environment runs as the same user, which is a same-user non-claim.
+`LOCALAPPDATA` is ignored: a child process with `LOCALAPPDATA` set elsewhere resolves the same root (`localappdata_does_not_change_the_root`, `tests/runtime_storage_windows_v1.rs`). The known folder is asked with the process token; `userprofile_does_not_change_the_root` asserts that a child with `USERPROFILE` set elsewhere also resolves the same root; measured on windows-latest (run 44863236471: `userprofile_does_not_change_the_root … ok`). Other environment variables are not measured, so on Windows no claim is made that every environment variable is ignored: a process that can set this agent's environment runs as the same user, which is a same-user non-claim.
 
 ### Windows non-claims
 

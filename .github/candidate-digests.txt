@@ -307,25 +307,48 @@
 # AgentConfig::xdg_data_home (None from AgentConfig::new), xdgDataHome in
 # the owner-inputs digest only when set (so every existing digest is
 # unchanged), and the disclosure line shown only when it is set.
-4eb5d2ca0aa2906676095dd4d2450d142f15fd6e8cdfbff774ee9d7cbf2e9373  spec/cache-store-v1.md
+#
+# W3b (2026-11-21): the agent starts on Windows, embedded in an app.
+# tokscale-core moved from [target.'cfg(unix)'.dependencies] to
+# [dependencies] and socket2 =0.6.5 joined the Windows table (both already
+# in the lock; the lock gained one dependency edge, syrtis-agent ->
+# socket2, and no package, so the lock baseline fixture is unchanged). tests/dependency_provenance_v1.rs
+# changed on purpose: its header says so, and its manifest test now pins
+# the three dependency tables line by line (the engine in [dependencies],
+# libc alone under unix, windows-sys and socket2 under windows) with a
+# control that the engine moved back is seen. Specs changed on purpose:
+# spec/agent-v1.md (AgentConfig.scan_home, default_scan_roots,
+# with_scan_roots, scope_disclosure and approve_scope_for, the Windows
+# section and known limits, uninstall leaving state on Windows, the test
+# platforms), spec/source-v1.md (the engine on every target; the engine
+# facts on Windows read at 2378f31a: no environment, known-folder or
+# registry read on the remote path, junction handling, SQLite opens; the
+# junction non-claim), spec/runtime-v1.md (the Windows bind with
+# SO_EXCLUSIVEADDRUSE, the IPv4-mapped bind host, the TIME_WAIT rebind
+# recorded by a test, the test platforms), spec/cli-v1.md (Windows runs
+# the library, not the binary), spec/cache-store-v1.md (the stale "no
+# secure root on Windows" sentence), spec/control-v1.md (the W2 tests run
+# on Windows), spec/state-store-v1.md (the USERPROFILE assertion is now
+# measured: windows-latest run 44863236471).
+510d1b9231917e9cb60b96c3f270151f79bed770b969e651884dcfe866d9854a  spec/cache-store-v1.md
 055a5c81aade6aec75c8f43bccb8128ab22ca1691b15b690ca833d0005176a2f  spec/install-v1.md
-15d25e02b0c12487fca662e0cae5bd0c5be64d2c9c9d5cdc0f868e86cbd88f0b  spec/cli-v1.md
-f14f436dccb81dfec157fa0aba8e141427bed6f9788834a91e76008705c387d1  spec/control-v1.md
+374ab375565ca696da3b0068a258bbb6aa0525305535ce9aad5774f3cae6eda2  spec/cli-v1.md
+af07a9a2e8c93f33814c8b35f48c28b8c9f0d5b159e8a26b08de658e04035b9f  spec/control-v1.md
 c6cfaf6793ab2d9319c461ac538c8d9e95428fdf2eebe54f630e6337673b3580  spec/pairing-v1.md
-5b44f472d89efa4f4e381ea8eabf1cd533e6b7e9d448a02a8ce1499b11a109ee  spec/runtime-v1.md
+943b473ab60848430a4ce22f4cc93fc15f66b1910086b7d7f242bfdd019afc4a  spec/runtime-v1.md
 26b94d43b40c537b49747a23befb5e53187dbba07cb0aae399350e7f3dd42527  spec/report-peer-v1.md
 7cc4eb2a75af280535da80a2955e14af83e95b1842ad4339b9b51536c2d797ee  spec/peer-store-v1.md
 f2c1c9300b27ab7607fad510baf5380b6d4e050e483a422a3046d19b76be8de6  spec/report-cache-v1.md
 d42f2711c5e7f8d820af9e95691ce0ab926564af95f7e442997dad3d879290cc  spec/security-v1.md
-1305c76ef1673ed007d2b15a6a7fe142d557b50f83a35ad511f911d2bfad35be  spec/state-store-v1.md
+8b160e5ced2f6b6072003754d906208a357c1a15e96f9198f38c1209cff96235  spec/state-store-v1.md
 3e97171eda23b646b27ed21a26dffe9cb3a285636a558fc96e9b202076b3eb53  spec/v1.md
-c0fc80a530fedc517818f90beafd74e865ff477a36ae9cf906cf2120db11d9dd  spec/source-v1.md
-1260a005ce9a25885555e4b78caa20e1f588fe84500d4bd3a419bd191b2535b1  spec/agent-v1.md
+5779a4e6f4376737f4264208b076502d150709885dd858a80de0eebcd263ddf2  spec/source-v1.md
+deae8a27fc5cd558dc3d0bf26795e911ff019fab92f6e11349445c36ae0639c2  spec/agent-v1.md
 ff21cbcfdd6aedfb68ac1b3cfda056663203f2c7f08fd05a856dc5dbe5e4c25a  src/cache.rs
 8b0add8d4fde2253edebdddd448d381559d63ff630f0e9d2f9faad8d9625567f  src/canonical.rs
 7f3d545bf38d846fd2cad5ebfc77d1ff865d42fad68001dd3e7af2282a1e96ef  src/report.rs
 c255e3a9c3c282d604324163bae814180983d1c36d28979cb33f1f97963c479c  src/security.rs
-ec4e8e38afd05bc70d9215fc37c9c21c232ceaa23701e5ccfd68707bcf40202a  tests/dependency_provenance_v1.rs
+d485f5dda33db2786c1db9ed785858fac782b2ff9b13b0ae7d4ff4ccfbc8d482  tests/dependency_provenance_v1.rs
 c9d617dc9bf0f082b1ded0f9713b4b25019d53c27da3222cf10313b9d26d948b  tests/fixtures/v1/cache/body.sha256
 fb83883b05cfae1d1c43e99ef176d0c030f730821e4b948a0af44db00948e056  tests/fixtures/v1/cache/filename.txt
 b66991a435b5e89814a1486b3a354119b240adf8fa17d09e28a578f5039c5733  tests/fixtures/v1/cache/key.json

@@ -3,28 +3,37 @@
 //! listener items (`spec/runtime-v1.md`), through the public API with two
 //! runtimes paired over loopback in temp roots.
 //!
-//! macOS and Linux only (a secure root is needed). Acceptance (3c) needs a
-//! failure seam and is a unit test in `src/runtime.rs`.
+//! macOS, Linux and Windows (`W3b`; a secure root is needed). Control
+//! commands go over the control socket on macOS and Linux and through
+//! `Runtime::control` on Windows, which has no socket. The symlinked cache
+//! file test stays Unix-only. Acceptance (3c) needs a failure seam and is a
+//! unit test in `src/runtime.rs`.
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+mod support;
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod disk {
+    #[cfg(not(windows))]
+    use std::os::unix::fs::symlink;
     use std::{
         fs,
         io::{ErrorKind, Read},
         net::{TcpListener, TcpStream},
-        os::unix::fs::{PermissionsExt, symlink},
         path::PathBuf,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicI64, AtomicUsize, Ordering},
+            atomic::{AtomicI64, Ordering},
         },
         thread,
         time::{Duration, Instant},
     };
 
     use serde_json::{Value, json};
+    #[cfg(not(windows))]
+    use syrtis_agent::{control::Client, state_store::Secret32};
     use syrtis_agent::{
-        control::{Client, Command, LISTEN_CONFIGURE, OFFER_CREATE, OK, REVOKE},
+        control::{Command, LISTEN_CONFIGURE, OFFER_CREATE, OK, REVOKE},
         noise::StaticKey,
         pairing::{ClaimAttempts, Clock, PairingClient, approve, derive_grant_id},
         peer_store::{PeerRecord, PeerState},
@@ -33,7 +42,6 @@ mod disk {
         runtime::{Options, PullError, Runtime, RuntimeError},
         secure_fs::{SecureRoot, StorageError},
         security::{MemoryLedger, PendingApproval, hex_encode},
-        state_store::Secret32,
     };
 
     const NOW: i64 = 1_700_000_000;
@@ -79,21 +87,13 @@ mod disk {
         }
     }
 
-    /// A short temporary home in `/tmp`; only what this helper created is
-    /// removed.
+    /// A short temporary home (`support::new_home`); only what this helper
+    /// created is removed.
     struct TempHome(PathBuf);
 
     impl TempHome {
         fn new() -> Self {
-            static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let path = PathBuf::from(format!(
-                "/tmp/sp-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&path).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-            Self(path)
+            Self(super::support::new_home("sp"))
         }
 
         fn root(&self) -> PathBuf {
@@ -198,14 +198,20 @@ mod disk {
             Self::start(home, clock, period).unwrap()
         }
 
+        /// A control command: over the socket, or in-process on Windows.
         fn call(&self, id: u16, body: Value) -> Value {
-            let token = *self.runtime.store().state().unwrap().control_token.expose();
-            let reply = Client::new(
-                Secret32::new(token),
-                self.runtime.socket_path().to_path_buf(),
-            )
-            .call(&Command { id, body })
-            .unwrap();
+            #[cfg(not(windows))]
+            let reply = {
+                let token = *self.runtime.store().state().unwrap().control_token.expose();
+                Client::new(
+                    Secret32::new(token),
+                    self.runtime.socket_path().to_path_buf(),
+                )
+                .call(&Command { id, body })
+                .unwrap()
+            };
+            #[cfg(windows)]
+            let reply = self.runtime.control(&Command { id, body }).unwrap();
             assert_eq!(reply.code, OK);
             reply.data
         }
@@ -376,11 +382,15 @@ mod disk {
                 .unwrap();
         };
         let record = || runtime.peers().peers().unwrap()[0].clone();
+        // Which file `peers.json` is: its inode; Windows, where std has
+        // no stable file ID, its last write time (a replace writes a new
+        // temp file and renames it over the name).
         let peers_file = || {
-            use std::os::unix::fs::MetadataExt;
-            fs::metadata(pair.receiver.home.root().join("peers.json"))
-                .unwrap()
-                .ino()
+            let metadata = fs::metadata(pair.receiver.home.root().join("peers.json")).unwrap();
+            #[cfg(not(windows))]
+            return std::os::unix::fs::MetadataExt::ino(&metadata) as u128;
+            #[cfg(windows)]
+            return std::os::windows::fs::MetadataExt::last_write_time(&metadata) as u128;
         };
         assert!(!runtime.ever_answered(&pair.producer_static));
         let before = record();
@@ -604,6 +614,7 @@ mod disk {
     /// Acceptance (5): a cache file swapped for a symlink: the runtime
     /// still starts (without a cache), `pull` succeeds, `last_good` is
     /// `None`, and the symlink's target is untouched.
+    #[cfg(not(windows))]
     #[test]
     fn a_symlinked_cache_file_leaves_the_runtime_without_a_cache() {
         let pair = pair(None, SLOW);

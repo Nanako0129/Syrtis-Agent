@@ -901,12 +901,18 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+/// macOS, Linux and Windows (`W3b`). Control commands go over the control
+/// socket on macOS and Linux and through `Runtime::control` on Windows; the
+/// socket variant of the held-hook test stays macOS/Linux.
+#[cfg(all(
+    test,
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 mod tests {
     use std::{
         fs,
         net::{TcpListener, TcpStream},
-        os::unix::fs::PermissionsExt,
+        path::PathBuf,
         sync::{
             atomic::{AtomicUsize, Ordering},
             mpsc,
@@ -917,8 +923,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    #[cfg(not(windows))]
+    use crate::{control::Client, state_store::Secret32};
     use crate::{
-        control::{Client, LISTEN_CONFIGURE, OFFER_CREATE, REVOKE},
+        control::{LISTEN_CONFIGURE, OFFER_CREATE, REVOKE},
         noise::StaticKey,
         pairing::{ClaimAttempts, PairingClient, approve},
         report::{AgentsRecord, Endpoint, ReportRequest, ReportResponse, encode_response},
@@ -927,22 +935,31 @@ mod tests {
             Step,
             seams::{self, Reset},
         },
-        state_store::Secret32,
     };
 
-    /// A short temporary home, so the socket path fits `sun_path`.
+    /// A short temporary home: below `/tmp` on macOS and Linux, so the
+    /// socket path fits `sun_path`, mode `0700`; on Windows below the temp
+    /// directory, with the DACL it inherits there (no socket, no mode).
     struct ShortHome(PathBuf);
 
     impl ShortHome {
         fn new() -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let path = PathBuf::from(format!(
-                "/tmp/sru-{}-{}",
+            #[cfg(not(windows))]
+            let base = PathBuf::from("/tmp");
+            #[cfg(windows)]
+            let base = std::env::temp_dir();
+            let path = base.join(format!(
+                "sru-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir(&path).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            #[cfg(not(windows))]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
             Self(path)
         }
     }
@@ -970,6 +987,7 @@ mod tests {
     /// takes the slot mutex). `stop()` cannot return while the hook is
     /// held, and once released, it returns with neither the old nor the
     /// new port listening: no listener outlives `stop()`.
+    #[cfg(not(windows))]
     #[test]
     fn stop_during_a_held_listen_configure_hook_leaves_no_port_open() {
         let home = ShortHome::new();
@@ -1167,11 +1185,17 @@ mod tests {
         panic!("the runtime did not start");
     }
 
+    /// A control command: over the socket, or in-process on Windows.
     fn call(runtime: &Runtime, id: u16, body: serde_json::Value) -> serde_json::Value {
-        let token = *runtime.store().state().unwrap().control_token.expose();
-        let reply = Client::new(Secret32::new(token), runtime.socket_path().to_path_buf())
-            .call(&Command { id, body })
-            .unwrap();
+        #[cfg(not(windows))]
+        let reply = {
+            let token = *runtime.store().state().unwrap().control_token.expose();
+            Client::new(Secret32::new(token), runtime.socket_path().to_path_buf())
+                .call(&Command { id, body })
+                .unwrap()
+        };
+        #[cfg(windows)]
+        let reply = runtime.control(&Command { id, body }).unwrap();
         assert_eq!(reply.code, crate::control::OK);
         reply.data
     }

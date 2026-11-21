@@ -6,7 +6,6 @@
 //! approved-scope record, copies the requested endpoint's records field by
 //! field into the frozen `report.rs` types, and encodes them. It never
 //! filters or re-aggregates what the engine returns.
-#![cfg(unix)]
 
 use std::{
     collections::{BTreeMap, BTreeSet},

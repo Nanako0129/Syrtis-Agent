@@ -61,6 +61,54 @@ pub fn bind_address(host: &str, port: u16) -> Result<SocketAddr, ListenerError> 
     Ok(SocketAddr::new(ip, port))
 }
 
+/// macOS and Linux: `std`'s bind (it sets `SO_REUSEADDR`, which there
+/// lets a port in `TIME_WAIT` be bound again but never a port in use).
+#[cfg(not(windows))]
+fn bind(address: SocketAddr) -> std::io::Result<TcpListener> {
+    TcpListener::bind(address)
+}
+
+/// Windows: `SO_EXCLUSIVEADDRUSE` before the bind, so no other socket can
+/// take the port with `SO_REUSEADDR` while this one holds it (`std` cannot
+/// set an option before its bind). `socket2::Socket::new` creates it with
+/// `WSA_FLAG_NO_HANDLE_INHERIT | WSA_FLAG_OVERLAPPED` and starts WinSock;
+/// the socket is owned by `socket` until the one conversion at the end.
+/// `IPV6_V6ONLY` keeps the Windows default (on), as `std` would.
+#[cfg(windows)]
+fn bind(address: SocketAddr) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        SO_EXCLUSIVEADDRUSE, SOCKET, SOL_SOCKET, WSAGetLastError, setsockopt,
+    };
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    let on: i32 = 1;
+    // SAFETY: `socket` is a live socket owned here for the whole call; the
+    // option value points at a live `i32` and its length is that size.
+    let result = unsafe {
+        setsockopt(
+            socket.as_raw_socket() as SOCKET,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            (&on as *const i32).cast(),
+            size_of::<i32>() as i32,
+        )
+    };
+    if result != 0 {
+        // SAFETY: reads this thread's last WinSock error; no arguments.
+        return Err(std::io::Error::from_raw_os_error(unsafe {
+            WSAGetLastError()
+        }));
+    }
+    socket.bind(&address.into())?;
+    socket.listen(128)?;
+    Ok(socket.into())
+}
+
 /// The running listener. Dropping it stops it.
 pub struct Listener {
     local_addr: SocketAddr,
@@ -100,7 +148,7 @@ impl Listener {
         let host = config.bind_host.ok_or(ListenerError::NotConfigured)?;
         let address = bind_address(&host, config.bind_port)?;
         // A `SocketAddr`, never a string: nothing reaches the resolver.
-        let listener = TcpListener::bind(address).map_err(|_| ListenerError::Bind)?;
+        let listener = bind(address).map_err(|_| ListenerError::Bind)?;
         let local_addr = listener.local_addr().map_err(|_| ListenerError::Bind)?;
         listener
             .set_nonblocking(true)
@@ -257,6 +305,93 @@ mod tests {
         assert_eq!(
             bind_address("127.0.0.1", 1_023),
             Err(ListenerError::InvalidAddress)
+        );
+    }
+}
+
+/// W3b: the Windows bind (`SO_EXCLUSIVEADDRUSE`, no handle inheritance,
+/// `IPV6_V6ONLY` on). Every failure names the address and the OS error.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::os::windows::io::AsRawSocket;
+
+    use socket2::{Domain, Protocol, Socket, Type};
+    use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+
+    use super::*;
+
+    fn loopback() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 0))
+    }
+
+    /// Another socket that sets `SO_REUSEADDR` and binds `address`: how a
+    /// second process would try to take the port.
+    fn reuse_bind(address: SocketAddr) -> std::io::Result<Socket> {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_reuse_address(true)?;
+        socket.bind(&address.into())?;
+        Ok(socket)
+    }
+
+    #[test]
+    fn exclusive_address_use_refuses_a_reuseaddr_bind_of_the_same_port() {
+        // Control: a listener made without the option lets the
+        // `SO_REUSEADDR` socket bind its port, so the refusal below comes
+        // from `SO_EXCLUSIVEADDRUSE` and nothing else.
+        let plain = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        plain.bind(&loopback().into()).unwrap();
+        plain.listen(128).unwrap();
+        let plain_address = plain.local_addr().unwrap().as_socket().unwrap();
+        let control = reuse_bind(plain_address);
+        assert!(
+            control.is_ok(),
+            "control: an SO_REUSEADDR bind of {plain_address} next to a listener without \
+             SO_EXCLUSIVEADDRUSE was refused: {:?}",
+            control.err()
+        );
+
+        let listener = bind(loopback()).unwrap();
+        let address = listener.local_addr().unwrap();
+        match reuse_bind(address) {
+            Ok(_) => panic!(
+                "an SO_REUSEADDR bind of {address} succeeded next to the agent's listener \
+                 (SO_EXCLUSIVEADDRUSE missing)"
+            ),
+            Err(error) => eprintln!("SO_REUSEADDR bind of {address} refused: {error:?}"),
+        }
+        // A plain second bind is refused too.
+        assert!(
+            TcpListener::bind(address).is_err(),
+            "plain bind of {address}"
+        );
+    }
+
+    #[test]
+    fn the_listening_socket_is_not_inheritable() {
+        let listener = bind(loopback()).unwrap();
+        let mut flags = 0u32;
+        // SAFETY: the socket is a live handle owned by `listener`; `flags`
+        // is an out parameter.
+        let ok = unsafe { GetHandleInformation(listener.as_raw_socket() as HANDLE, &mut flags) };
+        assert_ne!(
+            ok,
+            0,
+            "GetHandleInformation failed: {:?}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(flags & HANDLE_FLAG_INHERIT, 0, "handle flags {flags:#x}");
+    }
+
+    /// SR P3-2: with `IPV6_V6ONLY` on (the Windows default), an IPv4-mapped
+    /// bind host cannot be bound: it fails closed rather than binding IPv4.
+    #[test]
+    fn an_ipv4_mapped_bind_host_fails_closed() {
+        let address = bind_address("::ffff:127.0.0.1", 50_000).unwrap();
+        let result = bind(SocketAddr::new(address.ip(), 0));
+        assert!(
+            result.is_err(),
+            "{address} bound as {:?}",
+            result.map(|listener| listener.local_addr())
         );
     }
 }

@@ -6,15 +6,15 @@ This document fixes `Agent` (`src/agent.rs`), the one entry point that assembles
 
 This module computes no usage number. The engine computes every record (`EngineSource`); `combine` only orders, filters and hands records to the frozen `merge_*` functions of `src/report.rs`. Pairing, grants, authorization and `source_change_commit` are the frozen transitions of `src/security.rs`, reached through `StateStore::transition`. Nothing here reads the environment, the network beyond what `Runtime::pull` does, or any path not derived from the caller's inputs.
 
-macOS and Linux. `Agent::start` returns `Unsupported` on every target without the engine (non-unix); on other unix targets the secure root fails closed (`spec/state-store-v1.md`).
+macOS, Linux and Windows (`W3b`). On Windows the agent is embedded in the app: the runtime starts no control server (`spec/runtime-v1.md`), the app drives control through `Runtime::control`, and there is no install or CLI (section "Windows" below). On other unix targets the secure root fails closed (`spec/state-store-v1.md`); a target that is neither Unix nor Windows has no `Agent` and `Agent::start` is `Unsupported`.
 
 ## Start
 
-`Agent::start(AgentConfig { trusted_home, config_dir, data_dir, xdg_data_home, settings, state_suffix, options })`:
+`Agent::start(AgentConfig { trusted_home, scan_home, config_dir, data_dir, xdg_data_home, settings, state_suffix, options })`:
 
-1. `SecureRoot::open_under(trusted_home, state_suffix)`. `AgentConfig::new` (signature unchanged) sets `xdg_data_home` to `None`, `state_suffix` to the frozen platform suffix (`secure_fs::STATE_SUFFIX`) and `options` to `Options::default()`; a product passes `secure_fs::trusted_home()` as `trusted_home`. A test passes a temp home and a suffix without spaces.
+1. `SecureRoot::open_under(trusted_home, state_suffix)`. `AgentConfig::new` (signature unchanged) sets `scan_home` and `xdg_data_home` to `None`, `state_suffix` to the frozen platform suffix (`secure_fs::STATE_SUFFIX`) and `options` to `Options::default()`; a product passes `secure_fs::trusted_home()` as `trusted_home`. A test passes a temp home and a suffix without spaces.
 2. The agent keeps `trusted_home`; `uninstall` uses it (below), so the install objects and the secure root are always below the same home.
-3. `Runtime::start_with_scope`, whose `make_source` builds the one `EngineSource` of this root from the state store's own root, with `home = trusted_home`, `config_dir`, `data_dir`, `xdg_data_home` and `settings` (`EngineSource::new_with_xdg_data_home`). `xdg_data_home` is an optional separate XDG data root (`spec/source-v1.md`, "Separate XDG data root"): an owner input in the scope digest, so a caller that sets it must show it in its scope disclosure (it reads it back as `Agent::source().xdg_data_home()`, or computes the digest with `source::owner_inputs_sha256_with_xdg_data_home`). `None` scans and hashes as before it existed, so an approved scope stays approved. Control `status` reads that source's scan record (`spec/source-v1.md`, "Scan record") and `scopeApproved` (below); control `scopeApprove` runs the scope approval (below). The control server starts before the source exists: until it does, `scopeApproved` is false and `scopeApprove` is `internal`.
+3. `Runtime::start_with_scope`, whose `make_source` builds the one `EngineSource` of this root from the state store's own root, with `home = scan_home` (or `trusted_home` when `scan_home` is `None`, every macOS and Linux caller), `config_dir`, `data_dir`, `xdg_data_home` and `settings` (`EngineSource::new_with_xdg_data_home`). `xdg_data_home` is an optional separate XDG data root (`spec/source-v1.md`, "Separate XDG data root"): an owner input in the scope digest, so a caller that sets it must show it in its scope disclosure (it reads it back as `Agent::source().xdg_data_home()`, or computes the digest with `source::owner_inputs_sha256_with_xdg_data_home`). `None` scans and hashes as before it existed, so an approved scope stays approved. Control `status` reads that source's scan record (`spec/source-v1.md`, "Scan record") and `scopeApproved` (below); control `scopeApprove` runs the scope approval (below). The control server starts before the source exists: until it does, `scopeApproved` is false and `scopeApprove` is `internal`. In the same step the agent builds its scope disclosure (below) from the same values and checks that its digest equals the source's `owner_inputs_sha256`; a difference fails the start (`Runtime(Store(Refused(Invalid)))`), so a disclosure can never show other inputs than the ones hashed.
 
 The inputs are fixed for the agent's life. To change a scan setting the caller stops the agent and starts a new one with the new settings; the approved scope then no longer matches (below).
 
@@ -33,6 +33,8 @@ The inputs are fixed for the agent's life. To change a scan setting the caller s
 | Same digest and generation | Nothing is written. |
 
 **Through control (`SA-2C2b`).** Both bodies are functions in `agent.rs` over the state store, the agent's `EngineSource` and one `approving` mutex; `Agent::scope_approved` and `approve_scope` call them, and so do the two hooks `Agent::start` passes to the runtime. Control `status` reports `scopeApproved` with the same function, so it is true exactly when the record conditions `report` checks hold. Control `scopeApprove{ownerInputsSha256}` first compares the digest with the running source's (`EngineSource::owner_inputs_sha256`, computed once at start): another value is `Refused(Invalid)`, `invalid`, nothing written, because the owner consented to the inputs they were shown and the running agent may have been started with others (`SA-0G`). An equal digest runs the table above under the same mutex as `approve_scope`.
+
+**Bound to what the owner was shown (`W3b`, SR P1-1).** `Agent::scope_disclosure() -> &ScopeDisclosure` returns the exact strings hashed into `ownerInputsSha256` (`home`, `configDir`, `dataDir`, `xdgDataHome` when set, `sourceCacheDir`, `extraScanPaths`, `excludedScanPaths`, `opencodeDbPaths`: UTF-8 path strings as given, lists sorted and deduplicated, maps by client) and that digest (`owner_inputs_sha256`). `Agent::approve_scope_for(digest)` is `approve_scope` behind the check control `scopeApprove` makes: a digest other than the running source's is `Refused(Invalid)` and nothing is written; an equal one runs the table above under the same mutex. A caller shows the disclosure's strings as they are (no canonicalization, case folding or path round trip) and approves with its digest; it never computes a digest itself. `approve_scope()` stays for callers that show nothing (the macOS app goes through control `scopeApprove`, which has the check).
 
 The record is removed only by `uninstall` with `purge` (below). `reset` keeps it: removing it without moving the generation would let a later `approve` put new inputs under grants that are still valid.
 
@@ -85,7 +87,7 @@ Not classified with certainty:
 
 ## Uninstall
 
-`Agent::uninstall(self, purge)`, in this order (the install objects are looked for below the `trusted_home` the agent was started with):
+`Agent::uninstall(self, purge)`, in this order (the install objects are looked for below the `trusted_home` the agent was started with). On Windows `install::uninstall` is `Unsupported` (no install exists in this version): step 1 stops the runtime, step 3 returns `Install(Unsupported)`, and nothing is removed: uninstalling the Windows app leaves the agent's state (`LocalAppData\Nyanako\Syrtis Agent`, including `source-cache` and `source-scope.json`) in place (owner decision; whether the installer removes it is decided with the installer).
 
 1. `Runtime::into_store`: stops the runtime and takes the only handle to the state store. Another live handle: `Storage(Busy)`, and nothing is removed (the runtime is stopped).
 2. The terminal timestamp: the effective now (`max(osNow, wall)`), or the durable wall while the clock is unreadable or anomalous.
@@ -96,6 +98,22 @@ Not classified with certainty:
 `Agent::uninstall_stopped(trusted_home, state_suffix, purge)` (`SA-2C2b` review) is the same uninstall without a running agent, for the standalone menu: `SecureRoot::open_under` (another holder: `Storage(Busy)`, nothing removed), `StateStore::open` at the OS clock (a root without `state.json` gets a fresh one first, as at any start, which the durable uninstall then disables and a purge removes), then steps 2–5 above, with the system clock for step 2. It starts no runtime, control server, listener, housekeeping or engine source. `Agent::uninstall` runs the same steps 2–5 through one shared function after step 1.
 
 `AgentUninstallReport::manual_repair()` is true when step 3 marked anything, step 4 failed, or the state was purged and the scope record was not removed. The secure root's owner lock is held until the function returns.
+
+## Windows (`W3b`)
+
+The app builds its config with `AgentConfig::with_scan_roots(secure_fs::trusted_home()?, agent::default_scan_roots()?, settings)`:
+
+- `secure_fs::trusted_home()`: the secure root's base, the LocalAppData known folder of the process token (flags 0; a local drive path only, `spec/state-store-v1.md`). The root is `<base>\Nyanako\Syrtis Agent`.
+- `agent::default_scan_roots() -> Result<ScanRoots, StorageError>` (`cfg(windows)`): `home` = the Profile known folder, `config_dir` = RoamingAppData, `data_dir` = LocalAppData, `xdg_data_home` = `home\.local\share` (derived from the same `home` value). Each folder comes from `SHGetKnownFolderPath` with the process token and `KF_FLAG_DONT_VERIFY` (never NULL or the default-user token, never `KF_FLAG_CREATE`; one helper, `secure_fs::known_folder`, which `trusted_home` also uses). Each must be absolute, not verbatim (no `\\?\`), with a drive or UNC prefix and no `.` or `..`; normally `X:\…`, UNC when a folder is redirected. Anything else is `UnsafeState`. Nothing is created or opened.
+- On Windows the state base and the scan home are therefore two values; `AgentConfig.scan_home` carries the second. Unix callers leave it `None`.
+- The scope digest covers all four roots (W3a's `xdgDataHome` is always set here); the app shows `Agent::scope_disclosure()` and approves with `approve_scope_for` (above).
+- Control commands go through `Runtime::control` (`spec/control-v1.md`, "In-process entry"); `control::Server`, `control::call`, `install`, `Agent::uninstall` (above) and the CLI are `Unsupported`.
+
+Known limits on Windows:
+
+- No environment variable is followed: `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `HOME`, `HOMEDRIVE`, `HOMEPATH`, `TMP`, `TEMP`, `XDG_*` and `TOKSCALE_CONFIG_DIR` change neither the defaults (`windows_roots::environment_variables_do_not_move_the_default_scan_roots`) nor the scan (`spec/source-v1.md`). An owner who points a tool at another directory with an environment variable is not scanned there (the same limit as on macOS).
+- Uninstalling the app leaves the agent's state (above).
+- Junctions and symbolic links inside the scan roots are handled by the engine as it handles symlinks on Unix (`spec/source-v1.md`, "Engine facts on Windows"); a same-user process that plants one is outside the threat model.
 
 ## Acceptance map (`tests/agent_v1.rs` unless noted)
 
@@ -117,6 +135,12 @@ Not classified with certainty:
 | `SA-2C2b` (3) `scopeApprove`: digest check, full approval | `live::scope_approve_over_control_needs_the_running_digest_and_ends_earlier_grants` |
 | `SA-2C2b` (4) `scopeApproved` agrees with `report` | `live::status_scope_approved_matches_what_report_serves` |
 | W3a: a scope approved without a separate XDG data root is not approved with one; `approve_scope` commits once | `live::a_separate_xdg_data_home_needs_its_own_approval` |
+| W3b (SR P1-1): a scan home other than the state base is scanned; the disclosure re-hashes to the running digest; `approve_scope_for` with any other digest writes nothing | `live::approve_scope_for_binds_the_approval_to_the_disclosed_roots` |
+| W3b: Windows defaults are four plain absolute known folders, X below home | `windows_roots::the_default_scan_roots_are_four_plain_absolute_known_folders` (Windows) |
+| W3b: environment variables do not move the defaults | `windows_roots::environment_variables_do_not_move_the_default_scan_roots` (Windows) |
+| W3b: on Windows `uninstall` is `Install(Unsupported)` and removes nothing | `live::e2e_four_endpoints_merge_to_the_producer_fixture_and_nothing_after_uninstall` (its Windows branch) |
+
+Every `live::` test runs on macOS, Linux and Windows except these, which stay macOS/Linux: `scope_approve_over_control_needs_the_running_digest_and_ends_earlier_grants` and `status_scope_approved_matches_what_report_serves` (control `scopeApprove` is not an in-process command; Windows approves through `approve_scope_for`), the three uninstall tests of item (8) (no install on Windows), and `a_source_cache_that_cannot_be_cleared_only_marks_manual_repair` (a Unix symlink; the Windows junction case is a `secure_fs::windows` unit test).
 
 ## Non-claims
 

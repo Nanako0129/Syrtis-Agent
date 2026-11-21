@@ -84,6 +84,8 @@ use windows_sys::{
     },
 };
 
+use windows_sys::core::GUID;
+
 use super::{Step, StorageError, shim};
 
 #[cfg(test)]
@@ -124,18 +126,33 @@ pub(crate) struct Staged<'a> {
 /// `LOCALAPPDATA` is not read. It must be a plain drive path (`X:\…`); UNC,
 /// verbatim and device paths fail closed.
 pub fn trusted_home() -> Result<PathBuf, StorageError> {
+    let path = known_folder(&FOLDERID_LocalAppData, 0)?;
+    nt_path(&path)?;
+    // The frozen root rule (`security::resolve_secure_root`) takes `X:\…`
+    // only, not the verbatim `\\?\X:\…` that `open_under` also accepts.
+    let plain_drive = matches!(
+        path.components().next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))
+    );
+    if !plain_drive {
+        return Err(StorageError::UnsafeState);
+    }
+    Ok(path)
+}
+
+/// The known folder `id` of this process's own token
+/// (`SHGetKnownFolderPath(id, flags, <process token>)`), as the call returns
+/// it. Never NULL or the default-user token, so no environment variable and
+/// no other user's profile is consulted; the caller checks the path's form.
+/// `flags` is `0` for the state base and `KF_FLAG_DONT_VERIFY` for scan
+/// roots; `KF_FLAG_CREATE` is never passed, so nothing is created.
+pub(crate) fn known_folder(id: &GUID, flags: u32) -> Result<PathBuf, StorageError> {
     let token = process_token(TOKEN_QUERY | TOKEN_IMPERSONATE | TOKEN_DUPLICATE)?;
     let mut raw: *mut u16 = ptr::null_mut();
-    // SAFETY: the GUID is a static; `token` is a live token handle owned by
-    // this function; `raw` is an out pointer the call fills.
-    let result = unsafe {
-        SHGetKnownFolderPath(
-            &FOLDERID_LocalAppData,
-            0,
-            token.as_raw_handle() as HANDLE,
-            &mut raw,
-        )
-    };
+    // SAFETY: `id` is a live GUID reference; `token` is a live token handle
+    // owned by this function; `raw` is an out pointer the call fills.
+    let result =
+        unsafe { SHGetKnownFolderPath(id, flags, token.as_raw_handle() as HANDLE, &mut raw) };
     let path = if result == S_OK && !raw.is_null() {
         // SAFETY: on success `raw` is a NUL-terminated wide string allocated
         // by the call; it is read up to its NUL (bounded) before the free.
@@ -151,20 +168,7 @@ pub fn trusted_home() -> Result<PathBuf, StorageError> {
     // SAFETY: the documentation requires freeing the buffer whether or not
     // the call succeeded; NULL is accepted. Nothing reads `raw` afterwards.
     unsafe { CoTaskMemFree(raw as *const c_void) };
-    let Some(path) = path else {
-        return Err(fail("SHGetKnownFolderPath", result));
-    };
-    nt_path(&path)?;
-    // The frozen root rule (`security::resolve_secure_root`) takes `X:\…`
-    // only, not the verbatim `\\?\X:\…` that `open_under` also accepts.
-    let plain_drive = matches!(
-        path.components().next(),
-        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))
-    );
-    if !plain_drive {
-        return Err(StorageError::UnsafeState);
-    }
-    Ok(path)
+    path.ok_or_else(|| fail("SHGetKnownFolderPath", result))
 }
 
 /// The production root path. Computes only: nothing is opened or created.
@@ -313,8 +317,6 @@ impl SecureRoot {
     /// path-based consumer creates inside inherit owner-only access. `name`
     /// follows the agent file-name rule. Whoever opens the returned path
     /// later resolves it again (`spec/source-v1.md`, non-claims).
-    // ponytail: the only callers (source.rs, agent.rs) are cfg(unix) until W3.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn private_subdir(&self, name: &str) -> Result<PathBuf, StorageError> {
         let wide_name = file_name(name)?;
         let descriptor = Descriptor::owner_only(&self.user, true)?;
