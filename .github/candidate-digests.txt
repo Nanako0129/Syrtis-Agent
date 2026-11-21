@@ -341,7 +341,8 @@
 # delete-child on LocalAppData, so the agent could not start). Changed on
 # purpose: spec/state-store-v1.md (the base keeps only sanity checks; the
 # intermediate, root and file rules are unchanged; the held intermediate
-# and the path-identity check; the MEASURED rename lines, not yet recorded;
+# and the path-identity check; the three MEASURED rename results of
+# windows-latest run 44905015471, stated as measurements on that runner;
 # the refused pre-existing Nyanako and its remedy; the three residual risks
 # of another writer of the base, including the restore paragraph),
 # spec/agent-v1.md (the macOS app approves through its FFI's own digest
@@ -359,7 +360,7 @@ e519125a763a240223d6b88153a3fb111896e520b053afd8b5533a21ce8c76ba  spec/runtime-v
 7cc4eb2a75af280535da80a2955e14af83e95b1842ad4339b9b51536c2d797ee  spec/peer-store-v1.md
 f2c1c9300b27ab7607fad510baf5380b6d4e050e483a422a3046d19b76be8de6  spec/report-cache-v1.md
 d42f2711c5e7f8d820af9e95691ce0ab926564af95f7e442997dad3d879290cc  spec/security-v1.md
-7437085ec1e66c1cef0e68339e8c9cbd21f54464b6f622df34a76a239ddfd729  spec/state-store-v1.md
+7c2dea964159c4a049eb8c470d56be49519f40f92efca5e3a7f2afb0a9f038ad  spec/state-store-v1.md
 3e97171eda23b646b27ed21a26dffe9cb3a285636a558fc96e9b202076b3eb53  spec/v1.md
 cf2c9ebcc6269a8b37541c6f8a59906fee7184608593e1012a34b7ff9f2c8b4a  spec/source-v1.md
 414b9c2304d417dbce772b9f51b347bd569d0b2799a53d88db017a08ecf0a3ae  spec/agent-v1.md
