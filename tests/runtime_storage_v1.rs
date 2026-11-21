@@ -1,7 +1,9 @@
 //! SA-2B1a storage acceptance through the public API only.
 //!
 //! Guard-bypass negative controls need test-only seams, so they live in the
-//! unit tests of `src/state_store.rs` and `src/secure_fs/unix.rs`.
+//! unit tests of `src/state_store.rs`, `src/secure_fs/unix.rs` and
+//! `src/secure_fs/windows.rs`. The `disk` module runs on macOS, Linux and
+//! Windows; Windows-only checks are in `tests/runtime_storage_windows_v1.rs`.
 
 use std::collections::BTreeSet;
 
@@ -215,7 +217,7 @@ fn secrets_never_appear_in_debug_output() {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 #[test]
 fn platforms_without_a_secure_implementation_fail_closed() {
     use syrtis_agent::secure_fs::{SecureRoot, StorageError, default_root_path, trusted_home};
@@ -231,10 +233,11 @@ fn platforms_without_a_secure_implementation_fail_closed() {
     assert_eq!(trusted_home().err(), Some(StorageError::UnsafeState));
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod disk {
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::{
-        os::unix::fs::{MetadataExt, PermissionsExt},
         path::{Path, PathBuf},
         process::Command,
         sync::atomic::{AtomicUsize, Ordering},
@@ -271,6 +274,9 @@ mod disk {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             std::fs::create_dir(&path).unwrap();
+            // Windows: it inherits the temp directory's ACEs and is checked
+            // as the base.
+            #[cfg(unix)]
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
             Self { path }
         }
@@ -623,6 +629,9 @@ mod disk {
         open(&home);
     }
 
+    /// Unix modes; the Windows owner-only DACL and junction checks are in
+    /// `src/secure_fs/windows.rs` and `tests/runtime_storage_windows_v1.rs`.
+    #[cfg(unix)]
     #[test]
     fn the_root_layout_is_owner_only() {
         let home = TempHome::new();
@@ -944,6 +953,8 @@ mod disk {
         let home = trusted_home().unwrap();
         let platform = if cfg!(target_os = "macos") {
             Platform::MacOs
+        } else if cfg!(windows) {
+            Platform::Windows
         } else {
             Platform::Linux
         };
@@ -955,13 +966,15 @@ mod disk {
             private_permissions: true,
         };
         let frozen = resolve_secure_root(platform, home.to_str(), None, all_verified).unwrap();
-        assert_eq!(format!("{}/", path.display()), frozen);
+        let separator = if cfg!(windows) { '\\' } else { '/' };
+        assert_eq!(format!("{}{separator}", path.display()), frozen);
         let from_child = child(
             "home",
             Path::new("/"),
             &[
                 ("HOME", "/tmp/syrtis-attacker-home"),
                 ("XDG_STATE_HOME", "/tmp/syrtis-attacker-state"),
+                ("LOCALAPPDATA", "C:\\syrtis-attacker-localappdata"),
             ],
             "HOME",
         );

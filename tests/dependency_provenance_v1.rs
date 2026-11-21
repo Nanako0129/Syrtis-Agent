@@ -14,6 +14,12 @@
 //! `tokscale-core` is the one dependency allowed as a git dependency, and
 //! only as `{ git = ENGINE_GIT, rev = "<40 lowercase hex>" }`; its lock
 //! source must name the same SHA (`check_engine_lock`).
+//!
+//! SA-2B1b (W1) added `windows-sys` under `[target.'cfg(windows)'.dependencies]`
+//! at `=0.61.2`, a version already in the baseline (with the `windows-link
+//! 0.2.1` it uses), so the lock gained no package. A package outside the
+//! baseline is now accepted only by its full (name, version, source,
+//! checksum) tuple, and the allowlist must equal the set the lock adds.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -24,11 +30,21 @@ const MANIFEST: &str = include_str!("../Cargo.toml");
 const BASELINE: &str = include_str!("fixtures/v1/runtime/storage/cargo-lock-baseline.json");
 const PROVENANCE: &str = include_str!("fixtures/v1/security/provenance.json");
 
-/// Packages this slice may add beyond the baseline. Empty: `libc 0.2.189` was
-/// already in the `793f3d9` lock as a transitive dependency, and every
-/// package `tokscale-core` brings is in the baseline itself (an allowlist
-/// compares names only).
-const NEW_PACKAGE_ALLOWLIST: &[&str] = &[];
+/// A package outside the baseline that the lock may hold, as its full
+/// (name, version, source, checksum) tuple.
+type Allowed = (
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    Option<&'static str>,
+);
+
+/// Packages the lock may hold beyond the baseline. Empty, and it must equal
+/// what the lock adds (`the_lock_keeps_every_baseline_package…`):
+/// `libc 0.2.189` was already in the `793f3d9` lock, every package
+/// `tokscale-core` brings is in the baseline itself, and `windows-sys
+/// 0.61.2` (SA-2B1b) with `windows-link 0.2.1` were in the baseline too.
+const NEW_PACKAGE_ALLOWLIST: &[Allowed] = &[];
 
 /// The only dependency that may come from git, and the only URL it may use.
 const ENGINE: &str = "tokscale-core";
@@ -106,8 +122,9 @@ fn baseline() -> Vec<Package> {
 }
 
 /// Every baseline package must still be in the lock with the same source and
-/// checksum; every other package must be on the allowlist.
-fn check_lock(lock_text: &str, baseline: &[Package], allowlist: &[&str]) -> Result<(), String> {
+/// checksum; every other package must match an allowlist tuple exactly and
+/// come from a source (a path dependency has none and is never accepted).
+fn check_lock(lock_text: &str, baseline: &[Package], allowlist: &[Allowed]) -> Result<(), String> {
     let lock = parse_lock(lock_text)?;
     let mut by_identity = BTreeMap::new();
     for package in &lock {
@@ -128,9 +145,17 @@ fn check_lock(lock_text: &str, baseline: &[Package], allowlist: &[&str]) -> Resu
         .iter()
         .map(|package| (package.name.as_str(), package.version.as_str()))
         .collect();
+    let allowed = |package: &Package| {
+        package.source.is_some()
+            && allowlist.iter().any(|&(name, version, source, checksum)| {
+                package.name == name
+                    && package.version == version
+                    && package.source.as_deref() == source
+                    && package.checksum.as_deref() == checksum
+            })
+    };
     for package in &lock {
-        if !known.contains(&(package.name.as_str(), package.version.as_str()))
-            && !allowlist.contains(&package.name.as_str())
+        if !known.contains(&(package.name.as_str(), package.version.as_str())) && !allowed(package)
         {
             return Err(format!(
                 "package not in baseline or allowlist: {} {}",
@@ -144,11 +169,12 @@ fn check_lock(lock_text: &str, baseline: &[Package], allowlist: &[&str]) -> Resu
 /// The only tables the manifest may contain, spelled exactly. Anything else
 /// (`[features]`, `[profile.*]`, `[patch.*]`, `[replace]`, `[workspace]`, a
 /// dotted or quoted spelling, a header with a trailing comment) is refused
-/// rather than skipped. SA-2B1b extends this list for its Windows table.
-const TABLES: [&str; 4] = [
+/// rather than skipped. SA-2B1b added the Windows table.
+const TABLES: [&str; 5] = [
     "package",
     "dependencies",
     "target.'cfg(unix)'.dependencies",
+    "target.'cfg(windows)'.dependencies",
     "dev-dependencies",
 ];
 /// `[package]` keys. `build`, `links`, `workspace` and the rest are refused.
@@ -440,6 +466,28 @@ fn the_lock_keeps_every_baseline_package_and_adds_none_unlisted() {
         "baseline must cover the whole lock: the 50 packages of 793f3d9 and the 209 tokscale-core brings"
     );
     check_lock(LOCK, &baseline, NEW_PACKAGE_ALLOWLIST).unwrap();
+    // The allowlist is exactly what the lock adds beyond the baseline.
+    let known: BTreeSet<(&str, &str)> = baseline
+        .iter()
+        .map(|p| (p.name.as_str(), p.version.as_str()))
+        .collect();
+    let added: BTreeSet<(String, String, Option<String>, Option<String>)> = parse_lock(LOCK)
+        .unwrap()
+        .into_iter()
+        .filter(|p| !known.contains(&(p.name.as_str(), p.version.as_str())))
+        .map(|p| (p.name, p.version, p.source, p.checksum))
+        .collect();
+    let listed: BTreeSet<(String, String, Option<String>, Option<String>)> = NEW_PACKAGE_ALLOWLIST
+        .iter()
+        .map(|&(n, v, s, c)| (n.into(), v.into(), s.map(Into::into), c.map(Into::into)))
+        .collect();
+    assert_eq!(added, listed);
+    // SA-2B1b's dependency resolved to a baseline package.
+    assert!(
+        baseline
+            .iter()
+            .any(|p| p.name == "windows-sys" && p.version == "0.61.2")
+    );
 }
 
 #[test]
@@ -551,17 +599,56 @@ fn the_lock_checker_rejects_a_changed_checksum_or_version() {
         r#"baseline package missing: ("curve25519-dalek", "4.1.3")"#
     );
 
-    let extra = format!(
-        "{LOCK}\n[[package]]\nname = \"windows-sys\"\nversion = \"0.59.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{}\"\n",
-        "1".repeat(64)
-    );
+    // A new package whose name is not in the lock: refused by the empty
+    // allowlist.
+    const PROBE: &str = "syrtis-provenance-probe";
+    const REGISTRY: &str = "registry+https://github.com/rust-lang/crates.io-index";
+    assert!(!LOCK.contains(PROBE));
+    let checksum = "1".repeat(64);
+    let package = |version: &str, source: Option<&str>, checksum: Option<&str>| {
+        let mut text =
+            format!("{LOCK}\n[[package]]\nname = \"{PROBE}\"\nversion = \"{version}\"\n");
+        if let Some(source) = source {
+            text.push_str(&format!("source = \"{source}\"\n"));
+        }
+        if let Some(checksum) = checksum {
+            text.push_str(&format!("checksum = \"{checksum}\"\n"));
+        }
+        text
+    };
+    let extra = package("0.0.1", Some(REGISTRY), Some(&checksum));
+    let refused =
+        |version: &str| format!("package not in baseline or allowlist: {PROBE} {version}");
     assert_eq!(
         check_lock(&extra, &baseline, NEW_PACKAGE_ALLOWLIST).unwrap_err(),
-        "package not in baseline or allowlist: windows-sys 0.59.0"
+        refused("0.0.1")
     );
-    // Control: the same addition passes once allowlisted, so the rejection
-    // above came from the allowlist and nothing else.
-    check_lock(&extra, &baseline, &["windows-sys"]).unwrap();
+    // Control: the same addition passes once its exact tuple is listed, so
+    // the rejection above came from the allowlist and nothing else.
+    let allowlist: &[Allowed] = &[(
+        PROBE,
+        "0.0.1",
+        Some(REGISTRY),
+        Some("1111111111111111111111111111111111111111111111111111111111111111"),
+    )];
+    assert_eq!(allowlist[0].3, Some(checksum.as_str()));
+    check_lock(&extra, &baseline, allowlist).unwrap();
+    // The tuple, not the name: a changed checksum, a changed version, and
+    // a path dependency (no source, no checksum) are each refused.
+    let cases = [
+        (
+            package("0.0.1", Some(REGISTRY), Some(&"2".repeat(64))),
+            "0.0.1",
+        ),
+        (package("0.0.2", Some(REGISTRY), Some(&checksum)), "0.0.2"),
+        (package("0.0.1", None, None), "0.0.1"),
+    ];
+    for (tampered, version) in cases {
+        assert_eq!(
+            check_lock(&tampered, &baseline, allowlist).unwrap_err(),
+            refused(version)
+        );
+    }
 }
 
 #[test]
@@ -570,6 +657,9 @@ fn the_manifest_pins_every_dependency_and_snow_exactly_once() {
     assert!(
         MANIFEST.contains("[target.'cfg(unix)'.dependencies]\nlibc = { version = \"=0.2.189\"")
     );
+    assert!(MANIFEST.contains(
+        "[target.'cfg(windows)'.dependencies]\nwindows-sys = { version = \"=0.61.2\", default-features = false, features = ["
+    ));
 }
 
 #[test]
@@ -582,6 +672,17 @@ fn the_manifest_checker_rejects_unpinned_patched_or_duplicated_dependencies() {
         (
             MANIFEST.replace("version = \"=0.2.189\"", "version = \"0.2.189\""),
             "libc: version 0.2.189 is not an exact pin",
+        ),
+        (
+            MANIFEST.replace("version = \"=0.61.2\"", "version = \"=0.61\""),
+            "windows-sys: version =0.61 is not an exact pin",
+        ),
+        (
+            MANIFEST.replace(
+                "[target.'cfg(windows)'.dependencies]",
+                "[target.'cfg(target_os = \"windows\")'.dependencies]",
+            ),
+            "table not allowed: [target.'cfg(target_os = \"windows\")'.dependencies]",
         ),
         (
             format!("{MANIFEST}\n[patch.crates-io]\nsha2 = {{ path = \"../sha2\" }}\n"),

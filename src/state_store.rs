@@ -345,7 +345,10 @@ impl StateStore {
         if bytes.len() > STATE_FILE_MAX_BYTES {
             return Err(StorageError::Refused(SecurityError::Invalid));
         }
-        #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+        #[cfg(all(
+            test,
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        ))]
         if seams::bypassed(seams::EARLY_SWAP) {
             *self.write()? = Some(next.clone());
         }
@@ -369,7 +372,10 @@ impl StateStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let current = self.write()?;
-        #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+        #[cfg(all(
+            test,
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        ))]
         if seams::bypassed(seams::EXCLUSIVE_GUARD) {
             // The negative control removes all exclusion: the turnstile too.
             drop(turnstile);
@@ -406,7 +412,10 @@ fn counters_never_go_backwards(
     new: &ReferenceState,
     wall: WallMay,
 ) -> Result<(), StorageError> {
-    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(
+        test,
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
     if seams::bypassed(seams::COUNTERS) {
         return Ok(());
     }
@@ -440,7 +449,10 @@ fn finish(
 }
 
 fn stick(current: &mut Option<StoredState>) {
-    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(
+        test,
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
     if seams::bypassed(seams::NO_STICKY) {
         return;
     }
@@ -897,13 +909,13 @@ mod seams {
 
     use super::Check;
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     pub(super) const EXCLUSIVE_GUARD: u32 = 1 << 0;
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     pub(super) const EARLY_SWAP: u32 = 1 << 1;
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     pub(super) const NO_STICKY: u32 = 1 << 2;
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     pub(super) const COUNTERS: u32 = 1 << 3;
 
     thread_local! {
@@ -911,11 +923,11 @@ mod seams {
         static SKIP: Cell<u32> = const { Cell::new(0) };
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     pub(super) fn bypass(flags: u32) {
         BYPASS.with(|cell| cell.set(flags));
     }
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     pub(super) fn bypassed(flag: u32) -> bool {
         BYPASS.with(|cell| cell.get() & flag != 0)
     }
@@ -935,7 +947,7 @@ mod seams {
     pub(super) struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
             bypass(0);
             skip(&[]);
         }
@@ -1160,7 +1172,7 @@ mod tests {
         assert!(!bind_host_valid("192.168.1.20", 1_023));
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     mod disk {
         use std::{
             io,
@@ -1266,8 +1278,14 @@ mod tests {
             store
         }
 
+        #[cfg(unix)]
         fn enospc() -> io::Error {
             io::Error::from_raw_os_error(libc::ENOSPC)
+        }
+
+        #[cfg(windows)]
+        fn enospc() -> io::Error {
+            io::Error::from_raw_os_error(windows_sys::Win32::Foundation::ERROR_DISK_FULL as i32)
         }
 
         #[test]
@@ -1385,7 +1403,15 @@ mod tests {
                     .status()
                     .unwrap();
                 // Killed by SIGABRT, not a clean or test-failure exit.
+                #[cfg(unix)]
                 assert_eq!(status.code(), None, "{step:?}: {status:?}");
+                // `std::process::abort` is `__fastfail`: STATUS_STACK_BUFFER_OVERRUN.
+                #[cfg(windows)]
+                assert_eq!(
+                    status.code(),
+                    Some(0xC000_0409_u32 as i32),
+                    "{step:?}: {status:?}"
+                );
                 let reopened = open(&home.path).unwrap().state().unwrap();
                 let new = matches!(step, Step::SyncDir);
                 assert_eq!(reopened.reference.sharing_enabled, new, "{step:?}");
