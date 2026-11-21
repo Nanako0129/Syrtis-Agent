@@ -23,9 +23,9 @@
 //!
 //! W3b moved `tokscale-core` from `[target.'cfg(unix)'.dependencies]` to
 //! `[dependencies]` (the engine now builds for Windows too; `libc` stays
-//! Unix-only) and added `socket2 =0.6.5` under the Windows table (the
-//! listener's `SO_EXCLUSIVEADDRUSE` bind). `socket2 0.6.5` was in the
-//! baseline already, so the lock again gained no package, only edges.
+//! Unix-only); the lock gained no package and no edge. (A `socket2`
+//! dependency for an `SO_EXCLUSIVEADDRUSE` bind was added and removed again
+//! in the same slice, after windows-latest run 44886137738.)
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -673,7 +673,7 @@ fn table<'a>(manifest: &'a str, name: &str) -> Vec<&'a str> {
 fn the_manifest_pins_every_dependency_and_snow_exactly_once() {
     check_manifest(MANIFEST).unwrap();
     // W3b: the engine is a dependency on every target; the Unix table is
-    // `libc` alone; the Windows table is `windows-sys` and `socket2`.
+    // `libc` alone; the Windows table is `windows-sys` alone.
     assert!(
         table(MANIFEST, "dependencies")
             .iter()
@@ -685,14 +685,10 @@ fn the_manifest_pins_every_dependency_and_snow_exactly_once() {
         ["libc = { version = \"=0.2.189\", default-features = false }"]
     );
     let windows = table(MANIFEST, "target.'cfg(windows)'.dependencies");
-    assert_eq!(windows.len(), 2, "{windows:?}");
+    assert_eq!(windows.len(), 1, "{windows:?}");
     assert!(windows[0].starts_with(
         "windows-sys = { version = \"=0.61.2\", default-features = false, features = ["
     ));
-    assert_eq!(
-        windows[1],
-        "socket2 = { version = \"=0.6.5\", default-features = false }"
-    );
     // Control: with the engine moved back under the Unix table the manifest
     // still passes `check_manifest`, and `table` sees the move.
     let engine = table(MANIFEST, "dependencies")

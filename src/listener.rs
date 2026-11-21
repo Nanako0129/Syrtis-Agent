@@ -61,54 +61,6 @@ pub fn bind_address(host: &str, port: u16) -> Result<SocketAddr, ListenerError> 
     Ok(SocketAddr::new(ip, port))
 }
 
-/// macOS and Linux: `std`'s bind (it sets `SO_REUSEADDR`, which there
-/// lets a port in `TIME_WAIT` be bound again but never a port in use).
-#[cfg(not(windows))]
-fn bind(address: SocketAddr) -> std::io::Result<TcpListener> {
-    TcpListener::bind(address)
-}
-
-/// Windows: `SO_EXCLUSIVEADDRUSE` before the bind, so no other socket can
-/// take the port with `SO_REUSEADDR` while this one holds it (`std` cannot
-/// set an option before its bind). `socket2::Socket::new` creates it with
-/// `WSA_FLAG_NO_HANDLE_INHERIT | WSA_FLAG_OVERLAPPED` and starts WinSock;
-/// the socket is owned by `socket` until the one conversion at the end.
-/// `IPV6_V6ONLY` keeps the Windows default (on), as `std` would.
-#[cfg(windows)]
-fn bind(address: SocketAddr) -> std::io::Result<TcpListener> {
-    use socket2::{Domain, Protocol, Socket, Type};
-    use std::os::windows::io::AsRawSocket;
-    use windows_sys::Win32::Networking::WinSock::{
-        SO_EXCLUSIVEADDRUSE, SOCKET, SOL_SOCKET, WSAGetLastError, setsockopt,
-    };
-    let socket = Socket::new(
-        Domain::for_address(address),
-        Type::STREAM,
-        Some(Protocol::TCP),
-    )?;
-    let on: i32 = 1;
-    // SAFETY: `socket` is a live socket owned here for the whole call; the
-    // option value points at a live `i32` and its length is that size.
-    let result = unsafe {
-        setsockopt(
-            socket.as_raw_socket() as SOCKET,
-            SOL_SOCKET,
-            SO_EXCLUSIVEADDRUSE,
-            (&on as *const i32).cast(),
-            size_of::<i32>() as i32,
-        )
-    };
-    if result != 0 {
-        // SAFETY: reads this thread's last WinSock error; no arguments.
-        return Err(std::io::Error::from_raw_os_error(unsafe {
-            WSAGetLastError()
-        }));
-    }
-    socket.bind(&address.into())?;
-    socket.listen(128)?;
-    Ok(socket.into())
-}
-
 /// The running listener. Dropping it stops it.
 pub struct Listener {
     local_addr: SocketAddr,
@@ -148,7 +100,9 @@ impl Listener {
         let host = config.bind_host.ok_or(ListenerError::NotConfigured)?;
         let address = bind_address(&host, config.bind_port)?;
         // A `SocketAddr`, never a string: nothing reaches the resolver.
-        let listener = bind(address).map_err(|_| ListenerError::Bind)?;
+        // Every platform: `std`'s bind. On Windows no socket option is set
+        // (`W3b`, `spec/runtime-v1.md`, "Bind").
+        let listener = TcpListener::bind(address).map_err(|_| ListenerError::Bind)?;
         let local_addr = listener.local_addr().map_err(|_| ListenerError::Bind)?;
         listener
             .set_nonblocking(true)
@@ -309,66 +263,106 @@ mod tests {
     }
 }
 
-/// W3b: the Windows bind (`SO_EXCLUSIVEADDRUSE`, no handle inheritance,
-/// `IPV6_V6ONLY` on). Every failure names the address and the OS error.
+/// W3b: what the Windows bind (plain `std`) is measured to do. Every
+/// failure names the address and the OS error.
 #[cfg(all(test, windows))]
 mod windows_tests {
-    use std::os::windows::io::AsRawSocket;
+    use std::{net::Ipv4Addr, os::windows::io::AsRawSocket};
 
-    use socket2::{Domain, Protocol, Socket, Type};
-    use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+    use windows_sys::Win32::{
+        Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT},
+        Networking::WinSock::{
+            AF_INET, INVALID_SOCKET, IPPROTO_TCP, SO_REUSEADDR, SOCK_STREAM, SOCKADDR, SOCKADDR_IN,
+            SOL_SOCKET, WSAGetLastError, bind, closesocket, setsockopt, socket,
+        },
+    };
 
     use super::*;
 
-    fn loopback() -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], 0))
+    /// WinSock's `WSAEACCES` and `WSAEADDRINUSE`.
+    const REFUSED: [i32; 2] = [10013, 10048];
+
+    /// The product's bind call on an ephemeral loopback port.
+    fn product_listener() -> TcpListener {
+        TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap()
     }
 
-    /// Another socket that sets `SO_REUSEADDR` and binds `address`: how a
-    /// second process would try to take the port.
-    fn reuse_bind(address: SocketAddr) -> std::io::Result<Socket> {
-        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
-        socket.set_reuse_address(true)?;
-        socket.bind(&address.into())?;
-        Ok(socket)
-    }
-
-    #[test]
-    fn exclusive_address_use_refuses_a_reuseaddr_bind_of_the_same_port() {
-        // Control: a listener made without the option lets the
-        // `SO_REUSEADDR` socket bind its port, so the refusal below comes
-        // from `SO_EXCLUSIVEADDRUSE` and nothing else.
-        let plain = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
-        plain.bind(&loopback().into()).unwrap();
-        plain.listen(128).unwrap();
-        let plain_address = plain.local_addr().unwrap().as_socket().unwrap();
-        let control = reuse_bind(plain_address);
-        assert!(
-            control.is_ok(),
-            "control: an SO_REUSEADDR bind of {plain_address} next to a listener without \
-             SO_EXCLUSIVEADDRUSE was refused: {:?}",
-            control.err()
-        );
-
-        let listener = bind(loopback()).unwrap();
-        let address = listener.local_addr().unwrap();
-        match reuse_bind(address) {
-            Ok(_) => panic!(
-                "an SO_REUSEADDR bind of {address} succeeded next to the agent's listener \
-                 (SO_EXCLUSIVEADDRUSE missing)"
-            ),
-            Err(error) => eprintln!("SO_REUSEADDR bind of {address} refused: {error:?}"),
+    /// A raw socket that sets `SO_REUSEADDR` and binds `127.0.0.1:port`,
+    /// as a second process taking the port would: `Ok(())` when the bind
+    /// succeeded, else the WinSock error of the failing step. WinSock is
+    /// already started (the `std` listener above started it).
+    fn reuse_bind(port: u16) -> Result<(), (&'static str, i32)> {
+        // SAFETY: plain WinSock calls on a socket this function owns and
+        // closes on every path; every pointer is to a live local of the
+        // stated length.
+        unsafe {
+            let raw = socket(i32::from(AF_INET), SOCK_STREAM, IPPROTO_TCP);
+            if raw == INVALID_SOCKET {
+                return Err(("socket", WSAGetLastError()));
+            }
+            let on: i32 = 1;
+            let set = setsockopt(
+                raw,
+                SOL_SOCKET,
+                SO_REUSEADDR,
+                (&on as *const i32).cast(),
+                size_of::<i32>() as i32,
+            );
+            let result = if set != 0 {
+                Err(("setsockopt(SO_REUSEADDR)", WSAGetLastError()))
+            } else {
+                let mut address = SOCKADDR_IN {
+                    sin_family: AF_INET,
+                    sin_port: port.to_be(),
+                    ..Default::default()
+                };
+                address.sin_addr.S_un.S_addr = u32::from(Ipv4Addr::LOCALHOST).to_be();
+                let bound = bind(
+                    raw,
+                    (&address as *const SOCKADDR_IN).cast::<SOCKADDR>(),
+                    size_of::<SOCKADDR_IN>() as i32,
+                );
+                if bound != 0 {
+                    Err(("bind", WSAGetLastError()))
+                } else {
+                    Ok(())
+                }
+            };
+            closesocket(raw);
+            result
         }
-        // A plain second bind is refused too.
-        assert!(
-            TcpListener::bind(address).is_err(),
-            "plain bind of {address}"
+    }
+
+    /// Measured on windows-latest (run 44886137738): next to a listener
+    /// bound the way the product binds (`std`, no socket option), a second
+    /// socket that sets `SO_REUSEADDR` cannot bind the same address. The
+    /// accepted refusals are `WSAEACCES` (10013, what that run showed) and
+    /// `WSAEADDRINUSE` (10048); which one is printed. Control: once the
+    /// listener is dropped the same raw bind succeeds, so the refusal is
+    /// the listener's, not the helper's.
+    #[test]
+    fn a_reuseaddr_bind_next_to_the_listener_is_refused() {
+        let listener = product_listener();
+        let port = listener.local_addr().unwrap().port();
+        match reuse_bind(port) {
+            Ok(()) => panic!("an SO_REUSEADDR bind of 127.0.0.1:{port} took the listener's port"),
+            Err((step, code)) => {
+                eprintln!("SO_REUSEADDR bind next to the listener: {step} failed with {code}");
+                assert_eq!(step, "bind", "{step} failed with {code}");
+                assert!(REFUSED.contains(&code), "bind failed with {code}");
+            }
+        }
+        drop(listener);
+        assert_eq!(
+            reuse_bind(port),
+            Ok(()),
+            "control: 127.0.0.1:{port} after the drop"
         );
     }
 
     #[test]
     fn the_listening_socket_is_not_inheritable() {
-        let listener = bind(loopback()).unwrap();
+        let listener = product_listener();
         let mut flags = 0u32;
         // SAFETY: the socket is a live handle owned by `listener`; `flags`
         // is an out parameter.
@@ -382,12 +376,13 @@ mod windows_tests {
         assert_eq!(flags & HANDLE_FLAG_INHERIT, 0, "handle flags {flags:#x}");
     }
 
-    /// SR P3-2: with `IPV6_V6ONLY` on (the Windows default), an IPv4-mapped
-    /// bind host cannot be bound: it fails closed rather than binding IPv4.
+    /// SR P3-2: with `IPV6_V6ONLY` on (the Windows default, which `std`
+    /// keeps), an IPv4-mapped bind host cannot be bound: it fails closed
+    /// rather than binding IPv4.
     #[test]
     fn an_ipv4_mapped_bind_host_fails_closed() {
         let address = bind_address("::ffff:127.0.0.1", 50_000).unwrap();
-        let result = bind(SocketAddr::new(address.ip(), 0));
+        let result = TcpListener::bind(SocketAddr::new(address.ip(), 0));
         assert!(
             result.is_err(),
             "{address} bound as {:?}",

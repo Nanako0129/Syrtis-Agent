@@ -1671,7 +1671,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "snow",
- "socket2",
  "tokscale-core",
  "unicode-normalization",
  "windows-sys 0.61.2",

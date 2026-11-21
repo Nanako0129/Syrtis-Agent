@@ -6,7 +6,7 @@
 //! Windows (`W3b`). The bind re-validation (acceptance 3, unit half) and
 //! the low-order static check (acceptance 8) are unit tests in
 //! `src/listener.rs` and `src/noise.rs`, which run on all three platforms;
-//! so do the Windows `SO_EXCLUSIVEADDRUSE` tests there. Every listener
+//! so do the Windows bind tests there (`windows_tests`). Every listener
 //! binds 127.0.0.1 only.
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -363,8 +363,8 @@ mod disk {
     /// closed first (`stop` shuts every in-flight socket down, so the
     /// producer side holds the `TIME_WAIT`) is stopped, and a new listener
     /// is started on the same port at once. macOS and Linux (`std` sets
-    /// `SO_REUSEADDR`): the rebind succeeds, asserted. Windows
-    /// (`SO_EXCLUSIVEADDRUSE`): not asserted either way; the outcome is
+    /// `SO_REUSEADDR`): the rebind succeeds, asserted. Windows (`std` sets
+    /// no option there): not asserted either way; the outcome is
     /// written to the raw stderr (not captured by the test harness), so a CI
     /// log records it, and a refusal must be `Bind`, never another error.
     #[test]
