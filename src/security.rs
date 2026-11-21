@@ -98,10 +98,10 @@ pub const PAIR_URL_MAX: usize = 8_192;
 /// checked twice against two bounds and the looser check could never fire.
 pub const PAIR_OFFER_JSON_MAX: usize = 4_096;
 
-/// Largest tolerated backward step of the OS clock, in seconds.
+/// Largest tolerated backward step of the OS clock, in seconds. A reading
+/// later than the durable wall is always accepted, however far: forward motion
+/// is the normal passage of time, including days with the agent not running.
 pub const MAX_CLOCK_ROLLBACK_SECONDS: i64 = 300;
-/// Largest tolerated forward jump of the OS clock, in seconds.
-pub const MAX_CLOCK_FORWARD_SECONDS: i64 = 86_400;
 
 /// Creation stops one record short of [`MAX_RECORDS`]. The reserved slot is
 /// what lets a full state still record a termination; see [`MAX_RECORDS`].
@@ -933,8 +933,7 @@ pub struct ClockStatus {
 pub fn clock_status(os_now: i64, last_accepted: i64) -> ClockStatus {
     ClockStatus {
         effective_now: os_now.max(last_accepted),
-        anomaly: os_now < last_accepted.saturating_sub(MAX_CLOCK_ROLLBACK_SECONDS)
-            || os_now > last_accepted.saturating_add(MAX_CLOCK_FORWARD_SECONDS),
+        anomaly: os_now < last_accepted.saturating_sub(MAX_CLOCK_ROLLBACK_SECONDS),
     }
 }
 
@@ -1009,12 +1008,12 @@ pub struct ReferenceState {
 impl ReferenceState {
     /// Builds a state from the install-time wall clock, in seconds.
     ///
-    /// The domain is strictly positive. A zero wall would make every real Unix
-    /// timestamp read as a forward jump of decades and refuse every clock-bound
-    /// transition, and no in-crate transition can lower a counter again. A
-    /// *future* wall is fail-closed the same way and is deliberate: recovery is
-    /// the runtime's job (`SA-2B`), which discards the state and rebuilds it
-    /// from a correct clock.
+    /// The domain is strictly positive: zero or negative is not a wall clock
+    /// reading. A *future* wall is fail-closed and is deliberate: every honest
+    /// reading is then a rollback, the state refuses every clock-bound
+    /// transition until real time catches up, and no in-crate transition can
+    /// lower a counter. Recovery is the runtime's job (`SA-2B`), which discards
+    /// the state and rebuilds it from a correct clock.
     pub fn new(install_wall_unix_seconds: i64) -> Result<Self, SecurityError> {
         if install_wall_unix_seconds <= 0 {
             return Err(SecurityError::Invalid);
@@ -1435,8 +1434,8 @@ impl ReferenceState {
 
     /// Advances the wall: `os_now_seconds` is a checked clock reading.
     ///
-    /// Refused outright while the clock is anomalous, so a rolled-back or
-    /// jumped clock cannot age records out of the audit trail early.
+    /// Refused outright while the clock is anomalous, so a rolled-back clock
+    /// cannot age records out of the audit trail early.
     pub fn compact_terminals(&self, os_now_seconds: i64) -> Result<Self, SecurityError> {
         const NINETY_DAYS_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
         let (accepted_wall, effective_now_ms) = self.accept_clock(os_now_seconds)?;

@@ -895,9 +895,9 @@ mod disk {
         eventually("wall advanced", || node.wall() == NOW + 130);
     }
 
-    /// Acceptance (8), clock: a round with an anomalous clock (a day and a
-    /// half ahead of the wall) writes nothing, and the next sane round
-    /// expires what is due.
+    /// Acceptance (8), clock: a round with an anomalous clock (rolled back
+    /// 1,000 s, past the 300 s tolerance) writes nothing, and the next sane
+    /// round expires what is due.
     #[test]
     fn an_anomalous_round_is_skipped_and_the_next_sane_one_sweeps() {
         let node = Node::new(FAST);
@@ -907,7 +907,7 @@ mod disk {
         rounds(&node, 1);
         let before = node.state_bytes();
 
-        node.clock.set_os(NOW + 129_600);
+        node.clock.set_os(NOW - 1_000);
         rounds(&node, 4);
         assert_eq!(node.offer_state(offer), OfferState::Active);
         assert_eq!(node.wall(), NOW);
@@ -918,6 +918,28 @@ mod disk {
             node.offer_state(offer) == OfferState::Expired
         });
         assert_eq!(node.wall(), NOW + 700);
+    }
+
+    /// A clock 48 h ahead of the wall (the app or the Mac was off for two
+    /// days) is time passing: housekeeping carries the wall there on its
+    /// own, and an offer can be created at the new time.
+    #[test]
+    fn a_clock_two_days_ahead_is_accepted_and_offers_still_work() {
+        let node = Node::new(FAST);
+        node.configure(free_port());
+        node.runtime.enable_sharing().unwrap();
+        rounds(&node, 1);
+        assert_eq!(node.wall(), NOW);
+
+        let later = NOW + 48 * 3_600;
+        node.clock.set_os(later);
+        eventually("housekeeping carried the wall to the new time", || {
+            node.wall() == later
+        });
+
+        let response = node.call(OFFER_CREATE, json!({"ttlSeconds": 600}));
+        assert_eq!(response.code, OK, "offerCreate: {:?}", response.data);
+        assert_eq!(node.wall(), later);
     }
 
     /// Acceptance (8), store: once a commit fails (the root is made

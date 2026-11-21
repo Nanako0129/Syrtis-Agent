@@ -1046,7 +1046,7 @@ fn authorization_state_clock_and_crash_points() {
     assert!(!uninstalled.sharing_enabled);
 
     assert!(clock_status(1_000, 1_301).anomaly);
-    assert!(clock_status(87_000, 1).anomaly);
+    assert!(!clock_status(87_000, 1).anomaly);
     assert_eq!(clock_status(900, 1_000).effective_now, 1_000);
     // A rolled-back OS clock does not revive an expired grant: the durable wall
     // wins, and the state's wall is the one the grant was issued against.
@@ -1095,10 +1095,8 @@ fn authorization_state_clock_and_crash_points() {
 
 #[test]
 fn state_construction_requires_a_positive_install_wall_clock() {
-    // Not "0 means unchecked": a zero wall would make every real Unix timestamp
-    // look like a forward jump of decades, and no transition can lower a
-    // counter again, so the state would refuse every clock-bound transition
-    // forever. It is refused at construction instead.
+    // Not "0 means unchecked": zero or negative is not a wall clock reading,
+    // so it is refused at construction rather than silently accepted.
     assert_eq!(ReferenceState::new(0).unwrap_err(), SecurityError::Invalid);
     assert_eq!(ReferenceState::new(-1).unwrap_err(), SecurityError::Invalid);
     assert_eq!(
@@ -1259,22 +1257,22 @@ fn record_timestamps_never_advance_the_durable_wall() {
 }
 
 #[test]
-fn clock_anomaly_thresholds_are_exact_at_both_edges() {
+fn clock_anomaly_threshold_is_exact_and_forward_has_no_edge() {
     // Literals, not the constants: an expectation read out of the value under
     // test moves with it, and a widened tolerance would stay green.
     assert_eq!(MAX_CLOCK_ROLLBACK_SECONDS, 300);
-    assert_eq!(MAX_CLOCK_FORWARD_SECONDS, 86_400);
     let wall = WALL_SECONDS;
     assert!(!clock_status(wall - 300, wall).anomaly);
     assert!(clock_status(wall - 301, wall).anomaly);
-    assert!(!clock_status(wall + 86_400, wall).anomaly);
-    assert!(clock_status(wall + 86_401, wall).anomaly);
+    // There is no forward edge: any later reading is time passing.
+    assert!(!clock_status(wall + 86_401, wall).anomaly);
+    assert!(!clock_status(i64::MAX, wall).anomaly);
 
-    // Same four values at a transition, which is where the policy is enforced.
+    // Same values at a transition, which is where the policy is enforced.
     // Each offer is built live at its own effective now, so the only thing that
-    // can differ between the four cases is the clock verdict.
+    // can differ between the cases is the clock verdict.
     let state = enabled_state();
-    for (index, (offset, allowed)) in [(-300, true), (-301, false), (86_400, true), (86_401, false)]
+    for (index, (offset, allowed)) in [(-300, true), (-301, false), (86_400, true), (86_401, true)]
         .into_iter()
         .enumerate()
     {
@@ -1289,26 +1287,45 @@ fn clock_anomaly_thresholds_are_exact_at_both_edges() {
     }
 }
 
-/// Walks the durable wall forward the way a running agent would.
-///
-/// A pure state machine cannot advance its own clock between transitions, so a
-/// test that needs a state ninety days older must take the steps. That is the
-/// structural ceiling recorded in `spec/security-v1.md`, not a defect.
-/// Every step must move the wall, or the loop is what fails rather than the
-/// assertion that wanted the aged state: a compaction that stopped writing the
-/// wall would spin here forever and time CI out instead of turning a test red.
-fn advance_wall(mut state: ReferenceState, seconds: i64) -> ReferenceState {
+/// Moves the durable wall forward by one checkpoint, as a running agent's
+/// housekeeping would after the clock has advanced `seconds`.
+fn advance_wall(state: ReferenceState, seconds: i64) -> ReferenceState {
     let target = state.last_accepted_wall_unix_seconds() + seconds;
-    while state.last_accepted_wall_unix_seconds() < target {
-        let before = state.last_accepted_wall_unix_seconds();
-        let step = (before + MAX_CLOCK_FORWARD_SECONDS).min(target);
-        state = state.compact_terminals(step).unwrap();
-        assert!(
-            state.last_accepted_wall_unix_seconds() > before,
-            "compaction did not advance the durable wall past {before}"
+    let state = state.compact_terminals(target).unwrap();
+    assert_eq!(state.last_accepted_wall_unix_seconds(), target);
+    state
+}
+
+#[test]
+fn a_reading_far_ahead_of_the_wall_is_time_passing_not_an_anomaly() {
+    // The failure this pins: a laptop agent not running for more than a day
+    // came back to a wall it could never advance again, and offer creation,
+    // claims and approvals were refused until a reset dropped every grant.
+    let day = 24 * 60 * 60;
+    for ahead in [2 * day, 30 * day, 10 * 365 * day] {
+        let later = WALL_SECONDS + ahead;
+        assert!(!clock_status(later, WALL_SECONDS).anomaly, "{ahead}");
+
+        let mut offer = offer_record([0xd0; 16], later * 1_000 + 600_000);
+        offer.created_at_ms = later * 1_000;
+        let offered = enabled_state().create_offer(offer, later).unwrap();
+        assert_eq!(offered.last_accepted_wall_unix_seconds(), later, "{ahead}");
+
+        let checkpointed = enabled_state().compact_terminals(later).unwrap();
+        assert_eq!(
+            checkpointed.last_accepted_wall_unix_seconds(),
+            later,
+            "{ahead}"
+        );
+
+        // Rollback is measured from the new wall.
+        assert_eq!(
+            checkpointed
+                .compact_terminals(later - MAX_CLOCK_ROLLBACK_SECONDS - 1)
+                .unwrap_err(),
+            SecurityError::Unauthorized
         );
     }
-    state
 }
 
 #[test]
@@ -1357,17 +1374,6 @@ fn compaction_and_cleanup_refuse_an_anomalous_clock() {
     assert_eq!(
         revoked
             .mark_cleanup_complete([0xe5; 16], rolled_back)
-            .unwrap_err(),
-        SecurityError::Unauthorized
-    );
-    let jumped = WALL_SECONDS + MAX_CLOCK_FORWARD_SECONDS + 1;
-    assert_eq!(
-        revoked.compact_terminals(jumped).unwrap_err(),
-        SecurityError::Unauthorized
-    );
-    assert_eq!(
-        revoked
-            .mark_cleanup_complete([0xe5; 16], jumped)
             .unwrap_err(),
         SecurityError::Unauthorized
     );

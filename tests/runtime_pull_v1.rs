@@ -539,7 +539,7 @@ mod disk {
         assert_eq!(last_good(), None);
     }
 
-    /// A clock anomaly (here a jump far past the entry's expiry) neither
+    /// A clock anomaly (here rolled back past the 300 s tolerance) neither
     /// reads nor deletes the entry: `last_good` is `None` while it lasts and
     /// the same body is back once the clock is sane again.
     #[test]
@@ -560,7 +560,7 @@ mod disk {
                 .unwrap()
                 .map(|cached| cached.body().to_vec())
         };
-        receiver.clock.set_os(NOW + 10 * 86_400);
+        receiver.clock.set_os(NOW - 1_000);
         assert_eq!(last_good(), None);
         assert_eq!(receiver.home.rcache().len(), 1);
         receiver.clock.set_os(NOW + 100);
