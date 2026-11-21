@@ -287,6 +287,16 @@ mod engine {
         })
     }
 
+    /// `source.approve(store)`. On Windows that entry is not public
+    /// (`spec/source-v1.md`), so this goes through `approve_for` with the
+    /// source's own digest.
+    fn approve(source: &EngineSource, store: &StateStore) -> Result<(), StorageError> {
+        #[cfg(windows)]
+        return source.approve_for(store, source.owner_inputs_sha256());
+        #[cfg(not(windows))]
+        source.approve(store)
+    }
+
     fn generation(store: &StateStore) -> u64 {
         store.state().unwrap().reference.source_scope_generation
     }
@@ -419,7 +429,7 @@ mod engine {
         let store = open_store(&home.path);
         let source = source(&store, &home.path, ScannerSettings::default());
         write_pricing(source.pricing_dir());
-        source.approve(&store).unwrap();
+        approve(&source, &store).unwrap();
         let generation = generation(&store);
 
         let graph: Vec<GraphRecord> = records(
@@ -511,7 +521,7 @@ mod engine {
         write_sessions(&home.path);
         let store = open_store(&home.path);
         let source = source(&store, &home.path, ScannerSettings::default());
-        source.approve(&store).unwrap();
+        approve(&source, &store).unwrap();
         let generation = generation(&store);
         let dir = source.pricing_dir().to_path_buf();
         let asked = request(Endpoint::Graph, generation);
@@ -558,11 +568,37 @@ mod engine {
         let generation = generation(&store);
         assert!(!home.root().join(SCOPE_FILE).exists());
         assert!(denied(&source, generation));
-        source.approve(&store).unwrap();
+        approve(&source, &store).unwrap();
         assert!(home.root().join(SCOPE_FILE).exists());
         for endpoint in ENDPOINTS {
             report(&source, endpoint, generation);
         }
+    }
+
+    /// `approve_for` (every platform) writes the record only for this
+    /// source's own digest: another digest is `Refused(Invalid)` and
+    /// writes nothing.
+    #[test]
+    fn approve_for_writes_only_for_the_sources_own_digest() {
+        let home = TempDir::new("approve-for");
+        write_sessions(&home.path);
+        let store = open_store(&home.path);
+        let source = source(&store, &home.path, ScannerSettings::default());
+        let digest = source.owner_inputs_sha256().to_owned();
+        let mut wrong = digest.clone();
+        wrong.replace_range(..1, if digest.starts_with('0') { "1" } else { "0" });
+        for other in [wrong.as_str(), "", &digest.to_uppercase()] {
+            assert_eq!(
+                source.approve_for(&store, other),
+                Err(StorageError::Refused(SecurityError::Invalid)),
+                "{other:?}"
+            );
+            assert!(!home.root().join(SCOPE_FILE).exists(), "{other:?}");
+        }
+        assert!(denied(&source, generation(&store)));
+        source.approve_for(&store, &digest).unwrap();
+        assert!(home.root().join(SCOPE_FILE).exists());
+        report(&source, Endpoint::Graph, generation(&store));
     }
 
     /// Acceptance (2): a changed `ScannerSettings` field or custom root is a
@@ -574,7 +610,7 @@ mod engine {
         write_sessions(&home.path);
         let store = open_store(&home.path);
         let original = source(&store, &home.path, ScannerSettings::default());
-        original.approve(&store).unwrap();
+        approve(&original, &store).unwrap();
         let first = generation(&store);
         report(&original, Endpoint::Graph, first);
 
@@ -597,7 +633,7 @@ mod engine {
             store
                 .transition(|state| state.source_change_commit())
                 .unwrap();
-            changed.approve(&store).unwrap();
+            approve(&changed, &store).unwrap();
             let now = generation(&store);
             report(&changed, Endpoint::Graph, now);
             assert!(denied(&original, now));
@@ -792,7 +828,7 @@ mod engine {
 
         let without = source(&store, &home.path, ScannerSettings::default());
         assert_eq!(without.xdg_data_home(), None);
-        without.approve(&store).unwrap();
+        approve(&without, &store).unwrap();
         let first = generation(&store);
         assert_eq!(opencode(&without, first), None);
 
@@ -811,7 +847,7 @@ mod engine {
         store
             .transition(|state| state.source_change_commit())
             .unwrap();
-        with.approve(&store).unwrap();
+        approve(&with, &store).unwrap();
         let now = generation(&store);
         assert_eq!(now, first + 1);
         assert_eq!(opencode(&with, now), Some(410));
@@ -825,9 +861,11 @@ mod engine {
     fn approve_after_an_input_change_needs_an_advanced_generation() {
         let home = TempDir::new("gen");
         let store = open_store(&home.path);
-        source(&store, &home.path, ScannerSettings::default())
-            .approve(&store)
-            .unwrap();
+        approve(
+            &source(&store, &home.path, ScannerSettings::default()),
+            &store,
+        )
+        .unwrap();
         let before = std::fs::read(home.root().join(SCOPE_FILE)).unwrap();
         let mut settings = ScannerSettings::default();
         settings
@@ -835,19 +873,21 @@ mod engine {
             .insert("claude".into(), vec![home.path.join("custom")]);
         let changed = source(&store, &home.path, settings);
         assert_eq!(
-            changed.approve(&store),
+            approve(&changed, &store),
             Err(StorageError::Refused(SecurityError::Conflict))
         );
         assert_eq!(std::fs::read(home.root().join(SCOPE_FILE)).unwrap(), before);
         // Re-approving the same inputs at the same generation is allowed.
-        source(&store, &home.path, ScannerSettings::default())
-            .approve(&store)
-            .unwrap();
+        approve(
+            &source(&store, &home.path, ScannerSettings::default()),
+            &store,
+        )
+        .unwrap();
 
         let other = TempDir::new("other");
         let other_store = open_store(&other.path);
         assert_eq!(
-            changed.approve(&other_store),
+            approve(&changed, &other_store),
             Err(StorageError::Refused(SecurityError::Invalid))
         );
         assert_eq!(std::fs::read(home.root().join(SCOPE_FILE)).unwrap(), before);
@@ -861,14 +901,14 @@ mod engine {
         write_sessions(&home.path);
         let store = open_store(&home.path);
         let source = source(&store, &home.path, ScannerSettings::default());
-        source.approve(&store).unwrap();
+        approve(&source, &store).unwrap();
         let first = generation(&store);
         report(&source, Endpoint::Graph, first);
         store
             .transition(|state| state.source_change_commit())
             .unwrap();
         assert!(denied(&source, first + 1));
-        source.approve(&store).unwrap();
+        approve(&source, &store).unwrap();
         report(&source, Endpoint::Graph, first + 1);
     }
 
@@ -879,7 +919,7 @@ mod engine {
         write_sessions(&home.path);
         let store = open_store(&home.path);
         let source = source(&store, &home.path, ScannerSettings::default());
-        source.approve(&store).unwrap();
+        approve(&source, &store).unwrap();
         let generation = generation(&store);
         assert_eq!(
             source.report(&request(Endpoint::Graph, generation), None, Instant::now()),
@@ -917,7 +957,7 @@ mod engine {
             ScannerSettings::default(),
         )
         .unwrap();
-        source.approve(&store).unwrap();
+        approve(&source, &store).unwrap();
         let generation = generation(&store);
         let graph: Vec<GraphRecord> = records(
             &report(&source, Endpoint::Graph, generation),
@@ -968,7 +1008,7 @@ mod engine {
         let outside = TempDir::new("decoy");
         let store = open_store(&home.path);
         let source = source(&store, &home.path, ScannerSettings::default());
-        source.approve(&store).unwrap();
+        approve(&source, &store).unwrap();
         let generation = generation(&store);
 
         write_variant(&home.path, &outside.path.join("config"));
@@ -1156,7 +1196,7 @@ mod engine {
         let store = open_store(&home);
         let source = source(&store, &home, ScannerSettings::default());
         write_pricing(source.pricing_dir());
-        source.approve(&store).unwrap();
+        approve(&source, &store).unwrap();
         let generation = generation(&store);
         match mode.as_str() {
             "ENV" => {
@@ -1353,7 +1393,7 @@ mod engine {
             ScannerSettings::default(),
         )
         .unwrap();
-        source.approve(&store).unwrap();
+        approve(&source, &store).unwrap();
         let generation = generation(&store);
         let before = temp_entries();
         for (n, body) in all_bodies(&source, generation).iter().enumerate() {

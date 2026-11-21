@@ -36,9 +36,9 @@ use windows_sys::{
             FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS,
             FILE_RENAME_REPLACE_IF_EXISTS, FILE_SYNCHRONOUS_IO_NONALERT, FileBasicInformation,
             FileDirectoryInformation, FileDispositionInformationEx, FileFsAttributeInformation,
-            FileFsDeviceInformation, FileRenameInformationEx, FileStandardInformation,
-            NtCreateFile, NtQueryDirectoryFile, NtQueryInformationFile, NtQuerySecurityObject,
-            NtQueryVolumeInformationFile, NtSetInformationFile,
+            FileFsDeviceInformation, FileIdInformation, FileRenameInformationEx,
+            FileStandardInformation, NtCreateFile, NtQueryDirectoryFile, NtQueryInformationFile,
+            NtQuerySecurityObject, NtQueryVolumeInformationFile, NtSetInformationFile,
         },
         System::SystemServices::{
             FILE_FS_DEVICE_INFORMATION, FILE_REMOTE_DEVICE, FILE_REMOTE_DEVICE_VSMB,
@@ -107,9 +107,17 @@ pub struct SecureRoot {
     dir: File,
     _lock: Lock,
     /// `home/suffix…` as passed to [`SecureRoot::open_under`]. Nothing in this
-    /// module ever reopens anything by it.
+    /// module reopens anything by it except the identity check at the end
+    /// of `open_under`.
     path: PathBuf,
     user: Sid,
+    /// Every intermediate directory between the base and the root (today
+    /// `Nyanako`), opened without `FILE_SHARE_DELETE` and kept open for this
+    /// value's life: no one can open it with `DELETE`, so it cannot be
+    /// renamed or deleted while the agent runs, and the path the engine and
+    /// the app open by name keeps leading to `dir`. Declared last, so it is
+    /// closed after the lock is released.
+    _held: Vec<File>,
 }
 
 /// A temp file written and flushed, not yet renamed over its target. It keeps
@@ -188,15 +196,21 @@ impl SecureRoot {
     ///
     /// `home` must be an absolute drive path; it is opened by its NT path
     /// (`\??\X:\…`), following a junction or symlink at any level, and
-    /// checked on the handle: a directory owned by the current user, SYSTEM
-    /// or Administrators, a DACL that grants no other SID a write-type right,
-    /// a volume with persistent ACLs that is not a network volume. Every
-    /// component below it is opened relative to its parent's handle with
-    /// `FILE_OPEN_REPARSE_POINT`, created with the owner-only descriptor when
-    /// missing, and must not be a reparse point. Intermediate directories
-    /// follow the base's owner and DACL rule; the last one, the agent root,
-    /// must be owned by the current user with a protected DACL whose every
-    /// ACE names only the current user.
+    /// checked on the handle: a directory on a volume with persistent ACLs
+    /// that is not a network volume, plus the base sanity checks of
+    /// [`check_descriptor`] (other SIDs may hold write-type rights on it:
+    /// W4, `spec/state-store-v1.md`). Every component below it is opened
+    /// relative to its parent's handle with `FILE_OPEN_REPARSE_POINT`,
+    /// created with the owner-only descriptor when missing, and must not be
+    /// a reparse point. Intermediate directories are owned by the current
+    /// user, SYSTEM or Administrators and grant no other SID a write-type
+    /// right; they are opened without `FILE_SHARE_DELETE` and held for the
+    /// life of the returned value. The last one, the agent root, must be
+    /// owned by the current user with a protected DACL whose every ACE
+    /// names only the current user. Last, before the lock, the root is
+    /// opened again by its path (the same no-follow descent, nothing
+    /// created) and must be the same file (volume serial and file ID) as
+    /// the handle held.
     pub fn open_under(home: &Path, suffix: &[&str]) -> Result<Self, StorageError> {
         let path = suffix
             .iter()
@@ -210,31 +224,42 @@ impl SecureRoot {
         check_dir(&dir, Object::Home, &user)?;
         check_volume(&dir)?;
         let descriptor = Descriptor::owner_only(&user, true)?;
+        let mut held = Vec::with_capacity(suffix.len() - 1);
         for (index, component) in suffix.iter().enumerate() {
             let name = component_name(component)?;
             shim(Step::Descend(index), || Ok(())).map_err(|_| StorageError::UnsafeState)?;
+            let root = index + 1 == suffix.len();
             let open = Open {
+                share: if root { SHARE_ALL } else { held_share() },
                 disposition: FILE_OPEN_IF,
                 options: DIR_OPTIONS | nofollow(),
                 ..DIR_OPEN
             };
             let next = nt_create(Some(&dir), &name, open, explicit(&descriptor))
                 .map_err(|s| fail("open component", s))?;
-            if index + 1 == suffix.len() {
+            if root {
                 check_dir(&next, Object::Root, &user)?;
                 check_volume(&next)?;
             } else {
                 check_dir(&next, Object::Intermediate, &user)?;
             }
-            dir = next;
+            let parent = std::mem::replace(&mut dir, next);
+            if index > 0 {
+                held.push(parent);
+            }
         }
         drop(descriptor);
+        // `Descend(suffix.len())`: the test-only point between the descent
+        // and the re-open by path.
+        shim(Step::Descend(suffix.len()), || Ok(())).map_err(|_| StorageError::UnsafeState)?;
+        same_file(&dir, &reopen_by_path(&base, suffix)?)?;
         let lock = acquire_lock(&dir, &user)?;
         Ok(Self {
             dir,
             _lock: lock,
             path,
             user,
+            _held: held,
         })
     }
 
@@ -669,6 +694,18 @@ fn explicit<'d, 'u>(descriptor: &'d Descriptor<'u>) -> Option<&'d Descriptor<'u>
     Some(descriptor)
 }
 
+/// The share mode of a held intermediate directory: read and write, not
+/// delete. While it is open, any open asking for `DELETE` (which a rename
+/// or a delete of that directory needs) fails with a sharing violation.
+/// A test may bypass it (`HOLD`) to measure what Windows does without it.
+fn held_share() -> u32 {
+    #[cfg(test)]
+    if seams::bypassed(seams::HOLD) {
+        return SHARE_ALL;
+    }
+    FILE_SHARE_READ | FILE_SHARE_WRITE
+}
+
 const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 /// Every handle is synchronous (so `std::fs::File` I/O works on it), and
 /// none is ever created inheritable (`OBJ_INHERIT` is never set).
@@ -689,8 +726,8 @@ const BASE_OPEN: Open = DIR_OPEN;
 
 /// Right bits that let a holder add, delete, replace or re-permission an
 /// entry below a directory. An allow ACE granting any of them to a SID
-/// other than the current user, SYSTEM or Administrators makes the base or
-/// an intermediate directory unsafe.
+/// other than the current user, SYSTEM or Administrators makes an
+/// intermediate directory unsafe (not the base: W4).
 const WRITE_RIGHTS: u32 = FILE_ADD_FILE
     | FILE_ADD_SUBDIRECTORY
     | FILE_DELETE_CHILD
@@ -836,6 +873,53 @@ fn nt_path(home: &Path) -> Result<Vec<u16>, StorageError> {
         path.push(u16::from(b'\\'));
     }
     Ok(path)
+}
+
+/// The agent root reached again by its path: `base` (the NT path of the
+/// home) opened as in `open_under`, then every component of `suffix`
+/// opened relative to its parent with `FILE_OPEN` and
+/// `FILE_OPEN_REPARSE_POINT`. Nothing is created or checked here; the
+/// caller compares the result's identity with the handle it holds, which
+/// passed every check. A missing component is `UnsafeState`.
+fn reopen_by_path(base: &[u16], suffix: &[&str]) -> Result<File, StorageError> {
+    let mut dir = nt_create(None, base, BASE_OPEN, None).map_err(|s| fail("reopen home", s))?;
+    for component in suffix {
+        let open = Open {
+            options: DIR_OPTIONS | nofollow(),
+            ..DIR_OPEN
+        };
+        dir = nt_create(Some(&dir), &component_name(component)?, open, None)
+            .map_err(|s| fail("reopen component by path", s))?;
+    }
+    Ok(dir)
+}
+
+/// `UnsafeState` unless `held` and `reopened` are the same file: equal
+/// volume serial number and 128-bit file ID (`FileIdInformation`). Test
+/// builds print both identities when they differ.
+fn same_file(held: &File, reopened: &File) -> Result<(), StorageError> {
+    let (held, reopened) = (file_id(held)?, file_id(reopened)?);
+    #[cfg(test)]
+    if held != reopened {
+        eprintln!(
+            "secure_fs::windows: the root path leads to volume/file {reopened:#x?}, \
+             the held root is {held:#x?}"
+        );
+    }
+    guard(
+        held == reopened,
+        0,
+        "the root path leads to the held root",
+        StorageError::UnsafeState,
+    )
+}
+
+/// `FILE_ID_INFORMATION` of an open handle: `VolumeSerialNumber` (u64),
+/// then the 128-bit `FileId`.
+fn file_id(handle: &File) -> Result<[u64; 3], StorageError> {
+    let mut buffer = [0u64; 3];
+    query_information(handle, &mut buffer, FileIdInformation)?;
+    Ok(buffer)
 }
 
 /// The current user's SID, from the process token's `TokenUser`. The SID
@@ -1031,9 +1115,17 @@ fn check_security(handle: &File, object: Object, user: &Sid) -> Result<(), Stora
 
 /// The owner and DACL rules (`spec/state-store-v1.md`, "Windows"):
 ///
-/// - Base and intermediate: owner is the current user, SYSTEM or
-///   Administrators; every ACE is an allow or deny ACE; no allow ACE that is
-///   not inherit-only grants a [`WRITE_RIGHTS`] bit to any other SID.
+/// - Base: owner is the current user, SYSTEM or Administrators; every ACE
+///   is an allow or deny ACE. Other SIDs MAY hold write-type rights (W4:
+///   OpenAI's Codex sandbox puts inheritable Modify and delete-child ACEs
+///   for its principals on the user profile, which LocalAppData inherits).
+///   These remaining base checks are sanity checks, not security
+///   properties: what such a writer can do to the agent's state is listed
+///   in the spec's non-claims, and nothing the agent creates inherits the
+///   base's ACEs (every object gets an explicit protected descriptor).
+/// - Intermediate: owner is the current user, SYSTEM or Administrators;
+///   every ACE is an allow or deny ACE; no allow ACE that is not
+///   inherit-only grants a [`WRITE_RIGHTS`] bit to any other SID.
 /// - Agent root, private subdirectory, agent file: owner is the current user;
 ///   the DACL is protected; every ACE is an allow or deny ACE naming the
 ///   current user.
@@ -1091,7 +1183,14 @@ fn check_descriptor(
             "a protected current-user-only DACL",
             StorageError::UnsafeState,
         ),
-        Object::Home | Object::Intermediate => guard(
+        // Sanity check only (see above): no write rule for the base.
+        Object::Home => guard(
+            aces.iter().all(|ace| ace.known),
+            0,
+            "only allow and deny ACEs",
+            StorageError::UnsafeState,
+        ),
+        Object::Intermediate => guard(
             aces.iter().all(|ace| {
                 ace.known
                     && (ace.kind != ACCESS_ALLOWED_ACE_TYPE as u8
@@ -1619,10 +1718,14 @@ fn temp_name(name: &str) -> Result<Vec<u16>, StorageError> {
 /// failing call with its status code (`guard`, `fail`), so a CI log names it.
 #[cfg(test)]
 mod tests {
-    use std::{os::windows::fs::OpenOptionsExt, process::Command};
+    use std::{io::Write as _, os::windows::fs::OpenOptionsExt, process::Command};
 
     use windows_sys::Win32::{
-        Security::{AddAccessDeniedAceEx, CreateWellKnownSid, WinBuiltinUsersSid, WinWorldSid},
+        Foundation::ERROR_SHARING_VIOLATION,
+        Security::{
+            AddAccessDeniedAceEx, CreateWellKnownSid, INHERITED_ACE, WinBuiltinUsersSid,
+            WinWorldSid,
+        },
         Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT},
     };
 
@@ -1729,6 +1832,8 @@ mod tests {
         owner_is_user: bool,
         /// (ACE flags, names the user) per ACE.
         aces: Vec<(u8, bool)>,
+        /// (ACE flags, mask) of every ACE naming BUILTIN\Users.
+        users: Vec<(u8, u32)>,
     }
 
     /// The owner and DACL of `path`, read through a path-based test-only
@@ -1775,6 +1880,13 @@ mod tests {
             aces: aces
                 .iter()
                 .map(|ace| (ace.flags, ace.known && same_sid(ace.sid, user.as_ptr())))
+                .collect(),
+            users: aces
+                .iter()
+                .filter(|ace| {
+                    ace.known && unsafe { IsWellKnownSid(ace.sid, WinBuiltinUsersSid) } != 0
+                })
+                .map(|ace| (ace.flags, ace.mask))
                 .collect(),
         }
     }
@@ -1837,6 +1949,207 @@ mod tests {
         icacls(&library, &["/grant", &format!("{USERS}:(OI)(CI)(IO)(W)")]);
         icacls(&library, &["/grant", &format!("{USERS}:(RX)")]);
         drop(open(&home).unwrap());
+    }
+
+    /// `icacls <path> /grant BUILTIN\Users:(OI)(CI)(M,DC)`: Modify plus
+    /// delete-child, inheritable, the shape OpenAI's Codex sandbox puts on
+    /// the user profile for its principals (W4, measured on host 188).
+    fn grant_inheritable_modify(path: &Path) {
+        icacls(path, &["/grant", &format!("{USERS}:(OI)(CI)(M,DC)")]);
+    }
+
+    /// A new directory `name` below `parent`, which carries
+    /// [`grant_inheritable_modify`]: the base INHERITS the grant, as
+    /// LocalAppData inherits it from the profile. Asserted, so the fixture
+    /// is the measured shape.
+    fn inheriting_base(parent: &TempHome, name: &str) -> PathBuf {
+        let base = parent.path.join(name);
+        std::fs::create_dir(&base).unwrap();
+        let users = summary(&base).users;
+        assert!(
+            users
+                .iter()
+                .any(|&(flags, mask)| flags & INHERITED_ACE as u8 != 0
+                    && mask & FILE_DELETE_CHILD != 0
+                    && mask & DELETE != 0),
+            "the base did not inherit the Users grant: {users:x?}"
+        );
+        base
+    }
+
+    fn open_at(base: &Path) -> Result<SecureRoot, StorageError> {
+        retry_busy(|| SecureRoot::open_under(base, SUFFIX))
+    }
+
+    /// W4 (1): a base that grants another principal Modify and delete-child
+    /// by inheritance opens, and every object the agent creates below it
+    /// (both directories, the root, `owner.lock`, a staged and published
+    /// `state.json`) has a protected DACL naming only the user, with no
+    /// trace of that grant. Negative control: created without the explicit
+    /// descriptor (`EXPLICIT_SD`), the first directory inherits the grant,
+    /// so the "no trace" assertion can fail (and the intermediate rule
+    /// refuses it).
+    #[test]
+    fn a_base_others_may_modify_still_yields_owner_only_objects() {
+        let parent = TempHome::new();
+        grant_inheritable_modify(&parent.path);
+        let base = inheriting_base(&parent, "base");
+        let root =
+            open_at(&base).unwrap_or_else(|e| panic!("open_under below {base:?} failed: {e:?}"));
+        write_state(&root, b"{}");
+        let mut path = base.clone();
+        for component in SUFFIX {
+            path = path.join(component);
+            assert_owner_only(&path, true);
+            assert_eq!(summary(&path).users, [], "{path:?}");
+        }
+        for file in ["state.json", "owner.lock"] {
+            assert_owner_only(&path.join(file), false);
+            assert_eq!(summary(&path.join(file)).users, [], "{file}");
+        }
+        drop(root);
+
+        let fresh = inheriting_base(&parent, "fresh");
+        let _reset = Reset;
+        seams::bypass(seams::EXPLICIT_SD);
+        assert_eq!(open_at(&fresh).err(), Some(StorageError::UnsafeState));
+        seams::bypass(0);
+        let inherited = summary(&fresh.join(SUFFIX[0])).users;
+        assert!(
+            inherited
+                .iter()
+                .any(|&(_, mask)| mask & FILE_DELETE_CHILD != 0),
+            "control: without the explicit descriptor the grant is inherited: {inherited:x?}"
+        );
+    }
+
+    /// W4 (1) is the base only: below an inheriting base, the same grant
+    /// on an existing intermediate directory still fails closed (only
+    /// `INTERMEDIATE` admits it), and so does an intermediate owned by
+    /// another SID (only `OWNER` admits it).
+    #[test]
+    fn the_base_relaxation_does_not_reach_the_intermediate() {
+        let parent = TempHome::new();
+        grant_inheritable_modify(&parent.path);
+        let base = inheriting_base(&parent, "base");
+        drop(open_at(&base).unwrap());
+        grant_inheritable_modify(&base.join(SUFFIX[0]));
+        fails_closed_only_by(INTERMEDIATE, StorageError::UnsafeState, || open_at(&base));
+
+        let other = inheriting_base(&parent, "other");
+        let _reset = Reset;
+        seams::force_foreign(seams::INTERMEDIATE_DIR);
+        fails_closed_only_by(OWNER, StorageError::UnsafeState, || open_at(&other));
+    }
+
+    /// A path-based open of `path` asking for `DELETE` (what a rename or a
+    /// delete of it needs), sharing everything.
+    fn open_for_delete(path: &Path) -> io::Result<File> {
+        std::fs::OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(SHARE_ALL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    }
+
+    /// W4 hardening A: while a root is held, every intermediate directory
+    /// refuses an open for `DELETE` with a sharing violation, so a
+    /// path-based rename of it fails. Negative control: with the hold
+    /// bypassed (`HOLD`) the same open succeeds while a root is held; after
+    /// the root is dropped it succeeds, and so does the rename. Prints the
+    /// rename results as `MEASURED` lines, past the test harness's output
+    /// capture (only the failure with the hold is asserted; the others are
+    /// what this runner does).
+    #[test]
+    fn a_held_root_keeps_its_intermediates_from_being_renamed() {
+        let home = TempHome::new();
+        let root = open(&home).unwrap();
+        let library = home.path.join(SUFFIX[0]);
+        for depth in 1..SUFFIX.len() {
+            let path = SUFFIX[..depth]
+                .iter()
+                .fold(home.path.clone(), |p, c| p.join(c));
+            let refused = open_for_delete(&path);
+            assert_eq!(
+                refused.as_ref().err().and_then(io::Error::raw_os_error),
+                Some(ERROR_SHARING_VIOLATION as i32),
+                "DELETE open of the held {path:?}: {refused:?}"
+            );
+        }
+        let moved = home.path.join("moved");
+        let renamed = std::fs::rename(&library, &moved);
+        let _ = writeln!(
+            io::stderr(),
+            "MEASURED W4: std::fs::rename (MoveFileExW) of the intermediate while a root is held: {renamed:?}"
+        );
+        assert!(renamed.is_err(), "the held intermediate was renamed");
+        let base_moved = PathBuf::from(format!("{}-moved", home.path.display()));
+        let base_renamed = std::fs::rename(&home.path, &base_moved);
+        let _ = writeln!(
+            io::stderr(),
+            "MEASURED W4: std::fs::rename of the base (not held) while a root is held: {base_renamed:?}"
+        );
+        if base_renamed.is_ok() {
+            std::fs::rename(&base_moved, &home.path).unwrap();
+        }
+        drop(root);
+        drop(open_for_delete(&library).unwrap());
+        std::fs::rename(&library, &moved).unwrap();
+        std::fs::rename(&moved, &library).unwrap();
+
+        let other = TempHome::new();
+        let _reset = Reset;
+        seams::bypass(seams::HOLD);
+        let unheld = open(&other).unwrap();
+        seams::bypass(0);
+        let other_library = other.path.join(SUFFIX[0]);
+        let admitted = open_for_delete(&other_library);
+        assert!(
+            admitted.is_ok(),
+            "control: without the hold a DELETE open succeeds: {admitted:?}"
+        );
+        drop(admitted);
+        let renamed = std::fs::rename(&other_library, other.path.join("moved"));
+        let _ = writeln!(
+            io::stderr(),
+            "MEASURED W4: std::fs::rename of the intermediate while a root is held, hold bypassed (the root and owner.lock handles still open): {renamed:?}"
+        );
+        drop(unheld);
+    }
+
+    /// W4 hardening B: a hook retargets the base junction to another, fully
+    /// agent-created tree between the descent and the re-open by path, so
+    /// the root's path no longer leads to the root handle held: refused.
+    /// Controls: without the swap the same open succeeds, and afterwards
+    /// the decoy tree itself opens, so the refusal is the identity check's.
+    #[test]
+    fn a_root_path_that_leads_elsewhere_fails_closed() {
+        let real = TempHome::new();
+        drop(open(&real).unwrap());
+        let decoy = decoy_home();
+        let holder = TempHome::new();
+        let link = holder.path.join("base");
+        junction(&link, &real.path);
+        drop(open_at(&link).unwrap());
+
+        let _reset = Reset;
+        let (hook_link, target) = (link.clone(), decoy.path.clone());
+        let mut swapped = false;
+        seams::set_hook(Some(Box::new(move |step| {
+            if step == Step::Descend(SUFFIX.len()) && !swapped {
+                swapped = true;
+                std::fs::remove_dir(&hook_link).unwrap();
+                junction(&hook_link, &target);
+            }
+            Ok(())
+        })));
+        assert_eq!(
+            SecureRoot::open_under(&link, SUFFIX).err(),
+            Some(StorageError::UnsafeState)
+        );
+        seams::set_hook(None);
+        assert!(is_link(&link));
+        drop(open_at(&link).unwrap());
     }
 
     /// A NULL DACL (everyone, everything) on an intermediate directory fails
@@ -2535,7 +2848,8 @@ mod tests {
 
     /// The owner and DACL rules on in-memory descriptors, each refusal
     /// next to the closest accepted shape: ACE types (contract (c)), the
-    /// write-type rule and inherit-only exemption (d), the protected
+    /// write-type rule and inherit-only exemption (d) on an intermediate
+    /// directory, and its absence on the base (W4), the protected
     /// user-only rule (e), owner sets, a NULL DACL (b).
     #[test]
     fn in_memory_descriptors_follow_the_owner_and_dacl_rules() {
@@ -2602,11 +2916,28 @@ mod tests {
                 GENERIC_WRITE,
                 GENERIC_ALL,
             ] {
+                // W4: the base admits another SID's write-type right; an
+                // intermediate still refuses it.
+                let expected = match object {
+                    Object::Home => ok,
+                    _ => unsafe_state,
+                };
                 let write = [(false, 0, right, users)];
                 assert_eq!(
                     check(u, &write, false, None, object),
-                    unsafe_state,
-                    "{right:#x}"
+                    expected,
+                    "{object:?} {right:#x}"
+                );
+                let inheritable = [(
+                    false,
+                    OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+                    right,
+                    users,
+                )];
+                assert_eq!(
+                    check(u, &inheritable, false, None, object),
+                    expected,
+                    "{object:?} inheritable {right:#x}"
                 );
                 let inherit_only = [(false, INHERIT_ONLY_ACE | OBJECT_INHERIT_ACE, right, users)];
                 assert_eq!(

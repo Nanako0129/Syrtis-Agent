@@ -528,6 +528,16 @@ mod live {
         }
     }
 
+    /// `agent.approve_scope()`. On Windows that entry is not public
+    /// (`spec/agent-v1.md`), so this goes through `approve_scope_for` with
+    /// the digest the agent discloses.
+    fn approve_scope(agent: &Agent) -> Result<(), StorageError> {
+        #[cfg(windows)]
+        return agent.approve_scope_for(&agent.scope_disclosure().owner_inputs_sha256);
+        #[cfg(not(windows))]
+        agent.approve_scope()
+    }
+
     fn generation(agent: &Agent) -> u64 {
         agent
             .runtime()
@@ -617,7 +627,7 @@ mod live {
         let clock = TestClock::new();
         let (producer_home, receiver_home) = (TempHome::new(), TempHome::new());
         let producer = producer(&producer_home, &clock);
-        producer.approve_scope().unwrap();
+        approve_scope(&producer).unwrap();
         let receiver = start(&receiver_home, &clock, ScannerSettings::default());
         let producer_static = pair(producer.runtime(), &receiver, &clock);
 
@@ -693,7 +703,7 @@ mod live {
         let clock = TestClock::new();
         let (producer_home, receiver_home) = (TempHome::new(), TempHome::new());
         let producer = producer(&producer_home, &clock);
-        producer.approve_scope().unwrap();
+        approve_scope(&producer).unwrap();
         let receiver = start(&receiver_home, &clock, ScannerSettings::default());
         let producer_static = pair(producer.runtime(), &receiver, &clock);
         let fresh = pull_all(&receiver, &clock, Endpoint::Models);
@@ -723,7 +733,7 @@ mod live {
         assert!(is_empty(&refused));
 
         let before = generation(&producer);
-        producer.approve_scope().unwrap();
+        approve_scope(&producer).unwrap();
         assert!(producer.scope_approved());
         assert_eq!(generation(&producer), before + 1);
         let old_grant = pull_all(&receiver, &clock, Endpoint::Graph);
@@ -842,7 +852,7 @@ mod live {
         let clock = TestClock::new();
         let (producer_home, receiver_home) = (TempHome::new(), TempHome::new());
         let producer = producer(&producer_home, &clock);
-        producer.approve_scope().unwrap();
+        approve_scope(&producer).unwrap();
         let receiver = start(&receiver_home, &clock, ScannerSettings::default());
         let producer_static = pair(producer.runtime(), &receiver, &clock);
         assert_eq!(
@@ -890,7 +900,7 @@ mod live {
         );
 
         let before = generation(&producer);
-        producer.approve_scope().unwrap();
+        approve_scope(&producer).unwrap();
         assert!(producer.scope_approved());
         assert_eq!(generation(&producer), before + 1);
         assert_ne!(
@@ -925,7 +935,7 @@ mod live {
         };
         let before = stamp();
         let generation_now = generation(&producer);
-        producer.approve_scope().unwrap();
+        approve_scope(&producer).unwrap();
         assert_eq!(stamp(), before);
         assert_eq!(generation(&producer), generation_now);
         assert_eq!(
@@ -946,7 +956,7 @@ mod live {
         let clock = TestClock::new();
         let home = TempHome::new();
         let agent = start(&home, &clock, ScannerSettings::default());
-        agent.approve_scope().unwrap();
+        approve_scope(&agent).unwrap();
         assert!(agent.scope_approved());
         let digest = agent.source().owner_inputs_sha256().to_owned();
         drop(agent);
@@ -975,7 +985,7 @@ mod live {
                 .report(&request(Endpoint::Graph, before), None, far())
                 .is_err()
         );
-        agent.approve_scope().unwrap();
+        approve_scope(&agent).unwrap();
         assert_eq!(generation(&agent), before + 1);
         assert!(agent.scope_approved());
     }
@@ -988,7 +998,7 @@ mod live {
         let clock = TestClock::new();
         let (producer_home, receiver_home) = (TempHome::new(), TempHome::new());
         let producer = producer(&producer_home, &clock);
-        producer.approve_scope().unwrap();
+        approve_scope(&producer).unwrap();
         let now = clock.os_now_seconds().unwrap();
         producer.runtime().store().reset(now, now * 1_000).unwrap();
         let after_reset = generation(&producer);
@@ -1001,7 +1011,7 @@ mod live {
                 .is_err()
         );
 
-        producer.approve_scope().unwrap();
+        approve_scope(&producer).unwrap();
         assert!(producer.scope_approved());
         assert_eq!(generation(&producer), after_reset);
         let receiver = start(&receiver_home, &clock, ScannerSettings::default());
@@ -1035,7 +1045,7 @@ mod live {
         assert_eq!(denied.peers[0].status, PartStatus::Refused);
         never(&producer);
 
-        producer.approve_scope().unwrap();
+        approve_scope(&producer).unwrap();
         pair(producer.runtime(), &receiver, &clock);
         pull_all(&receiver, &clock, Endpoint::Agents);
         let status = call(producer.runtime(), STATUS, json!({}));
@@ -1078,7 +1088,7 @@ mod live {
         let (producer_home, receiver_home, other_home) =
             (TempHome::new(), TempHome::new(), TempHome::new());
         let producer = producer(&producer_home, &clock);
-        producer.approve_scope().unwrap();
+        approve_scope(&producer).unwrap();
         let receiver = start(&receiver_home, &clock, ScannerSettings::default());
         let producer_static = pair(producer.runtime(), &receiver, &clock);
         let fresh = pull_all(&receiver, &clock, Endpoint::Hourly);
@@ -1208,7 +1218,7 @@ mod live {
     #[cfg(not(windows))]
     fn served(producer_home: &TempHome, receiver_home: &TempHome, clock: &Arc<TestClock>) -> Agent {
         let producer = producer(producer_home, clock);
-        producer.approve_scope().unwrap();
+        approve_scope(&producer).unwrap();
         let receiver = start(receiver_home, clock, ScannerSettings::default());
         pair(producer.runtime(), &receiver, clock);
         pull_all(&receiver, clock, Endpoint::Graph);

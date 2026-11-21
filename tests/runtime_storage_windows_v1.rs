@@ -212,6 +212,40 @@ fn an_intermediate_granting_users_write_fails_closed() {
     assert_eq!(home.open().err(), Some(StorageError::UnsafeState));
 }
 
+/// W4: a base that INHERITS an ACE granting BUILTIN\Users Modify and
+/// delete-child (the shape OpenAI's Codex sandbox leaves on the profile)
+/// opens; the same grant on the existing intermediate directory is still
+/// refused.
+#[test]
+fn a_base_others_may_modify_opens_but_such_an_intermediate_does_not() {
+    let parent = TempHome::new();
+    run(
+        "icacls",
+        &[
+            parent.path.as_os_str(),
+            "/grant".as_ref(),
+            "*S-1-5-32-545:(OI)(CI)(M,DC)".as_ref(),
+        ],
+    );
+    let base = parent.path.join("base");
+    std::fs::create_dir(&base).unwrap();
+    let root = SecureRoot::open_under(&base, SUFFIX)
+        .unwrap_or_else(|e| panic!("open_under below {base:?} failed: {e:?}"));
+    drop(root);
+    run(
+        "icacls",
+        &[
+            base.join(SUFFIX[0]).as_os_str(),
+            "/grant".as_ref(),
+            "*S-1-5-32-545:(OI)(CI)(M,DC)".as_ref(),
+        ],
+    );
+    assert_eq!(
+        SecureRoot::open_under(&base, SUFFIX).err(),
+        Some(StorageError::UnsafeState)
+    );
+}
+
 /// The lock holds against a second opener while the first is open, and is
 /// released on drop.
 #[test]

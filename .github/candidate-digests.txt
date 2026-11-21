@@ -335,6 +335,20 @@
 # secure root on Windows" sentence), spec/control-v1.md (the W2 tests run
 # on Windows), spec/state-store-v1.md (the USERPROFILE assertion is now
 # measured: windows-latest run 44863236471).
+#
+# W4 (2026-11-21): the Windows state base may be writable by other accounts
+# (measured: OpenAI's Codex sandbox principals inherit Modify and
+# delete-child on LocalAppData, so the agent could not start). Changed on
+# purpose: spec/state-store-v1.md (the base keeps only sanity checks; the
+# intermediate, root and file rules are unchanged; the held intermediate
+# and the path-identity check; the MEASURED rename lines, not yet recorded;
+# the refused pre-existing Nyanako and its remedy; the three residual risks
+# of another writer of the base, including the restore paragraph),
+# spec/agent-v1.md (the macOS app approves through its FFI's own digest
+# check and approve_scope(), not control scopeApprove; on Windows only
+# approve_scope_for and EngineSource::approve_for are public; hiding the
+# unchecked entries only prevents mistakes; the Windows known limit),
+# spec/source-v1.md (the scope record is written by approve or approve_for).
 510d1b9231917e9cb60b96c3f270151f79bed770b969e651884dcfe866d9854a  spec/cache-store-v1.md
 055a5c81aade6aec75c8f43bccb8128ab22ca1691b15b690ca833d0005176a2f  spec/install-v1.md
 374ab375565ca696da3b0068a258bbb6aa0525305535ce9aad5774f3cae6eda2  spec/cli-v1.md
@@ -345,10 +359,10 @@ e519125a763a240223d6b88153a3fb111896e520b053afd8b5533a21ce8c76ba  spec/runtime-v
 7cc4eb2a75af280535da80a2955e14af83e95b1842ad4339b9b51536c2d797ee  spec/peer-store-v1.md
 f2c1c9300b27ab7607fad510baf5380b6d4e050e483a422a3046d19b76be8de6  spec/report-cache-v1.md
 d42f2711c5e7f8d820af9e95691ce0ab926564af95f7e442997dad3d879290cc  spec/security-v1.md
-8b160e5ced2f6b6072003754d906208a357c1a15e96f9198f38c1209cff96235  spec/state-store-v1.md
+7437085ec1e66c1cef0e68339e8c9cbd21f54464b6f622df34a76a239ddfd729  spec/state-store-v1.md
 3e97171eda23b646b27ed21a26dffe9cb3a285636a558fc96e9b202076b3eb53  spec/v1.md
-5779a4e6f4376737f4264208b076502d150709885dd858a80de0eebcd263ddf2  spec/source-v1.md
-deae8a27fc5cd558dc3d0bf26795e911ff019fab92f6e11349445c36ae0639c2  spec/agent-v1.md
+cf2c9ebcc6269a8b37541c6f8a59906fee7184608593e1012a34b7ff9f2c8b4a  spec/source-v1.md
+414b9c2304d417dbce772b9f51b347bd569d0b2799a53d88db017a08ecf0a3ae  spec/agent-v1.md
 ff21cbcfdd6aedfb68ac1b3cfda056663203f2c7f08fd05a856dc5dbe5e4c25a  src/cache.rs
 8b0add8d4fde2253edebdddd448d381559d63ff630f0e9d2f9faad8d9625567f  src/canonical.rs
 7f3d545bf38d846fd2cad5ebfc77d1ff865d42fad68001dd3e7af2282a1e96ef  src/report.rs
