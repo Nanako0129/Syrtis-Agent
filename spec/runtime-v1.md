@@ -6,7 +6,7 @@ This document fixes the agent runtime: what `Runtime::start` assembles, the orde
 
 Every state change is one `StateStore::transition` closure over frozen `ReferenceState` transitions (`src/security.rs`), `StateStore::checkpoint`, or a control command (`spec/control-v1.md`). The runtime adds no transition, no cryptography and no wire format. Not in this slice: real report sources (`SA-2B3cd`), the producer cache (not wired; `spec/cache-store-v1.md` keeps the role), install (`SA-2C1`), Windows. The CLI is `spec/cli-v1.md`.
 
-macOS and Linux only. Elsewhere the control server fails closed (`Unsupported`), so `Runtime::start` fails with `Control(Unsupported)` before any thread runs.
+Platforms. On macOS and Linux the runtime starts its control server, and a server that does not start fails `Runtime::start` (`RuntimeError::Control`). On Windows the runtime starts no control server, decided at compile time (`cfg(windows)`), and its commands run through `Runtime::control` only (`W2`, below); `control::Server::start`, `control::Client::call`, install and the CLI menu stay `Unsupported` there, and `Runtime::socket_path` does not exist (it is compiled on macOS and Linux only). Every other platform: the control server fails closed (`Unsupported`), so `Runtime::start` fails with `Control(Unsupported)` before any thread runs. Windows storage itself is `W1`; until it lands, `Runtime::start` fails there at step 1.
 
 ## Assembly
 
@@ -18,7 +18,7 @@ macOS and Linux only. Elsewhere the control server fails closed (`Unsupported`),
 
 1. Reads the OS clock (`options.clock`), opens `StateStore` in `root` (a new state's install wall is that reading), and opens `PeerStore` in the same root, under the same owner lock.
 2. Creates one memory ledger, one pairing rate limiter and one `Reports` (with `source`) for the process; every listener the runtime starts shares them. Opens the receiver `CacheStore` (`spec/cache-store-v1.md`) in the same root on that ledger. If it does not open (`UnsafeState`, `Busy`, anything else), the runtime runs without a cache until the next start: `pull` still works, nothing is cached, `last_good` is `None`. It is not retried.
-3. Starts exactly one control server on that store, with its own three hooks: `shutdown`, `listenConfigure` and `sharingSet` (below), plus the caller's scan and scope hooks. A second server on the same store would unlink the first one's socket, so the runtime never starts another.
+3. Builds one control dispatcher on that store (`spec/control-v1.md`, "In-process entry"), with its own three hooks: `shutdown`, `listenConfigure` and `sharingSet` (below), plus the caller's scan and scope hooks, and keeps it in `Runtime` itself, never in the state the hooks, the listener and housekeeping share. Except on Windows, it then starts exactly one control server serving that dispatcher. A second server on the same store would unlink the first one's socket, so the runtime never starts another.
 4. Starts the peer listener when the stored `bindHost` is set, passes `listener::bind_address` and binds. Unset, refused or unbindable: no listener, and the runtime runs on; `status` answers.
 5. Starts the housekeeping thread, whose first round runs at once.
 
@@ -43,13 +43,20 @@ The control `shutdown` hook sets a flag and wakes `wait()`. It never stops anyth
 `stop()`, serialized and idempotent, in this order:
 
 1. Asks for shutdown (wakes `wait()`).
-2. Stops the control server, which joins every connection thread, so no hook runs after this step.
+1a. Takes the dispatcher's write guard: waits for every command in flight, on the socket and in-process, then marks it stopped, so `Runtime::control` returns `ControlError::Stopped` from then on and runs nothing.
+2. Stops the control server (none on Windows), which joins every connection thread, so no hook runs after this step.
 3. Takes the listener mutex, sets `stopping`, stops and joins the listener.
 4. Halts the housekeeping thread and joins it; its last act is one final checkpoint.
 
 It returns only after every thread has ended. Dropping the runtime calls `stop()`.
 
-`into_store(self)` (`SA-2C2a`) clones the store's `Arc`, calls `stop()`, drops the runtime and unwraps the `Arc`. After `stop()` no runtime thread or hook holds a clone, so the only other holder can be a caller's clone of `store()`; then it is `Err(Busy)`, the clone it took is dropped, and nothing else happens (the runtime is stopped either way). `install::uninstall` takes the store by value through this. The control socket file stays; the next start replaces it (`spec/control-v1.md`, "Socket"). Step 2 alone already prevents a hook from starting a listener after step 3; the `stopping` flag is a second, independent guard.
+`into_store(self)` (`SA-2C2a`) clones the store's `Arc`, calls `stop()`, drops the runtime and unwraps the `Arc`. After `stop()` no runtime thread holds a clone, and the dispatcher's hooks go with the runtime when it is dropped, so the only other holder can be a caller's clone of `store()`; then it is `Err(Busy)`, the clone it took is dropped, and nothing else happens (the runtime is stopped either way). `install::uninstall` takes the store by value through this. The control socket file stays; the next start replaces it (`spec/control-v1.md`, "Socket"). Step 2 alone already prevents a hook from starting a listener after step 3; the `stopping` flag is a second, independent guard.
+
+## In-process control (`W2`)
+
+`Runtime::control(&self, command: &Command) -> Result<Response, ControlError>` runs one control command on the runtime's dispatcher, the one its control server serves: the eight commands `status`, `offerCreate`, `offerCancel`, `pendingList`, `approve`, `reject`, `revoke`, `listenConfigure`, each giving the same code and data as over the socket; every other ID is `invalid` with nothing run. It keeps the frozen command validator, both size limits and the frozen response validator, and skips the MAC, the peer check, the slots and the deadline, because the caller is the process that owns the runtime. The full rule set is `spec/control-v1.md`, "In-process entry".
+
+Caller notes: there is no deadline (a commit or a hook can block), so it must not be called on a UI thread; before `approve`, showing the owner the SAS and getting their match confirmation is the caller's duty; `Runtime::socket_path` exists on macOS and Linux only. A hook (`listenConfigure`, scan, scope, `sharingSet`, `scopeApprove`) runs under the dispatcher's read guard and must never call `Runtime::control` or `Runtime::stop`. After `stop` (step 1a) a call is `ControlError::Stopped`.
 
 ## Sharing entry points (F-7)
 
@@ -121,6 +128,7 @@ Nothing depends on the sweep for authority: claim, approval, Pair and Grant stat
 | 10 | `without_a_bindable_host_the_runtime_runs_control_without_a_listener` |
 | control filter | `status_and_pending_list_leave_out_what_has_expired` |
 | `SA-2C2b` `sharingSet` through the gate | `tests/runtime_control_v1.rs` `sharing_set_runs_the_runtime_gate_and_maps_its_errors` |
+| `W2` in-process control, stop step 1a, the macOS/Linux start failure | `spec/control-v1.md`, the `W2` acceptance table |
 
 `SA-2B3b` (`tests/runtime_pull_v1.rs` unless noted):
 

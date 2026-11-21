@@ -1179,6 +1179,7 @@ mod disk {
             ControlError::Command,
             ControlError::ServerProof,
             ControlError::Response,
+            ControlError::Stopped,
         ];
         let outputs = [
             format!("{:?}", node.client()),

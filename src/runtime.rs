@@ -5,17 +5,20 @@
 //! It also owns the two sharing entry points no control command has: the
 //! F-7 disable composition and the enable gate. Every state change is one
 //! [`StateStore::transition`] closure over frozen `ReferenceState`
-//! transitions. macOS and Linux only: elsewhere the control server fails
-//! closed, so [`Runtime::start`] does too. Writes no log.
+//! transitions. The control socket server runs on macOS and Linux; Windows
+//! starts no server (decided at compile time) and reaches the same command
+//! dispatcher through [`Runtime::control`] only; every other platform fails
+//! closed with `Control(Unsupported)`. Writes no log.
 //!
 //! On the receiver side it owns the receiver report cache: [`Runtime::pull`]
 //! fills it, [`Runtime::last_good`] reads it, housekeeping purges what has
 //! expired.
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::path::PathBuf;
 use std::{
     fmt,
     net::SocketAddr,
-    path::PathBuf,
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread::{self, JoinHandle},
     time::Duration,
@@ -24,7 +27,9 @@ use std::{
 use crate::{
     cache::{CACHE_RETENTION_MILLIS, CacheKey, CacheRole},
     cache_store::{CacheStore, CachedBody},
-    control::{self, ControlError, ScanHook, ScanStatus, ScopeApproveHook, ScopeHook},
+    control::{
+        self, Command, ControlError, Response, ScanHook, ScanStatus, ScopeApproveHook, ScopeHook,
+    },
     listener::{Listener, bind_address},
     pairing::{Clock, RateLimiter, SystemClock},
     peer_store::{PeerRecord, PeerState, PeerStore, usable},
@@ -73,7 +78,8 @@ impl Default for Options {
 pub enum RuntimeError {
     /// The OS clock, the state store or the peer store.
     Store(StorageError),
-    /// The control server (on other platforms, `Unsupported`).
+    /// The control server (`Unsupported` on platforms other than macOS,
+    /// Linux and Windows; Windows starts no server).
     Control(ControlError),
     /// A thread could not be spawned.
     Thread,
@@ -135,7 +141,12 @@ pub struct Runtime {
     inner: Arc<Inner>,
     peers: PeerStore,
     fetches: FetchLimiter,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     socket_path: PathBuf,
+    /// The command dispatcher the control server serves, and
+    /// [`Runtime::control`] runs on. Kept here, never in [`Inner`]: nothing
+    /// handed to a `Listener` or a `ReportSource` may reach it.
+    dispatch: Arc<control::Shared>,
     control: Mutex<Option<control::Server>>,
     housekeeping: Mutex<Option<JoinHandle<()>>>,
     /// Serializes `stop`, so every caller returns only after every thread
@@ -240,7 +251,7 @@ impl Runtime {
         });
         let (on_shutdown, on_listen, on_sharing) =
             (Arc::clone(&inner), Arc::clone(&inner), Arc::clone(&inner));
-        let server = control::Server::start_with_all_hooks(
+        let dispatch = Arc::new(control::Shared::new(
             store,
             Arc::clone(&inner.clock),
             control::Hooks {
@@ -259,14 +270,27 @@ impl Runtime {
                 })),
                 scope_approve: hooks.scope_approve,
             },
-        )
-        .map_err(RuntimeError::Control)?;
+        ));
+        // Windows has no control endpoint in this version: the App runs
+        // commands in-process. Everywhere else a server that does not start
+        // fails the start (`Unsupported` off macOS and Linux).
+        #[cfg(not(windows))]
+        let server = Some(
+            control::Server::start_shared(Arc::clone(&dispatch)).map_err(RuntimeError::Control)?,
+        );
+        #[cfg(windows)]
+        let server: Option<control::Server> = None;
         let runtime = Self {
-            socket_path: server.socket_path().to_path_buf(),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            socket_path: server
+                .as_ref()
+                .map(|server| server.socket_path().to_path_buf())
+                .unwrap_or_default(),
             inner,
             peers,
             fetches: FetchLimiter::default(),
-            control: Mutex::new(Some(server)),
+            dispatch,
+            control: Mutex::new(server),
             housekeeping: Mutex::new(None),
             stop_serial: Mutex::new(()),
         };
@@ -288,9 +312,45 @@ impl Runtime {
         &self.peers
     }
 
-    /// The control socket (`control.sock` in the root).
+    /// The control socket (`control.sock` in the root). macOS and Linux
+    /// only.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub fn socket_path(&self) -> &std::path::Path {
         &self.socket_path
+    }
+
+    /// Runs one control command in-process (`W2`, `spec/control-v1.md`,
+    /// "In-process entry"): the same dispatcher, handlers and hooks as the
+    /// control socket, the same frozen `verify_control_command` on a command
+    /// envelope built as `control::Client` builds it, and a response
+    /// envelope checked with `RESPONSE_JSON_MAX` and the frozen
+    /// `verify_control_response`. Runs only the eight commands `status`,
+    /// `offerCreate`, `offerCancel`, `pendingList`, `approve`, `reject`,
+    /// `revoke` and `listenConfigure`; any other ID (`shutdown`,
+    /// `sharingSet`, `scopeApprove` included) is answered `invalid` with
+    /// nothing run: use [`stop`](Self::stop),
+    /// [`enable_sharing`](Self::enable_sharing) /
+    /// [`disable_sharing`](Self::disable_sharing) and the agent's scope
+    /// approval instead.
+    ///
+    /// No MAC, peer check, slot or deadline: the caller is the process that
+    /// owns this runtime. Caller duties:
+    ///
+    /// - It can block (a store commit, the `listenConfigure` listener
+    ///   restart, the scan and scope hooks) with no deadline; the socket
+    ///   path has 10 s. Never call it on a UI thread.
+    /// - Before `approve`, showing the owner the pairing's SAS and getting
+    ///   their confirmation that it matches is the caller's duty.
+    /// - A hook must never call `control` or [`stop`](Self::stop): it runs
+    ///   under the dispatcher's read guard.
+    ///
+    /// Errors: [`ControlError::Stopped`] after [`stop`](Self::stop) began
+    /// (nothing ran); [`ControlError::Command`] for a body that does not
+    /// encode or is over `COMMAND_JSON_MAX`; [`ControlError::Unavailable`]
+    /// when the CSPRNG is; [`ControlError::Response`] when the response
+    /// envelope fails its bound or validator (the command may have run).
+    pub fn control(&self, command: &Command) -> Result<Response, ControlError> {
+        control::run_in_process(&self.dispatch, command)
     }
 
     /// The address the peer listener is bound to, if one runs.
@@ -476,14 +536,16 @@ impl Runtime {
         );
     }
 
-    /// Stops the control server first (joining every worker that could
-    /// run a hook), then the listener, then the housekeeping thread, which
-    /// takes a final checkpoint. Returns after every thread has ended.
-    /// Idempotent. The control socket file stays; the next start replaces
-    /// it.
+    /// Waits for every command in flight (socket and in-process) and
+    /// refuses later in-process ones, stops the control server (joining
+    /// every worker that could run a hook), then the listener, then the
+    /// housekeeping thread, which takes a final checkpoint. Returns after
+    /// every thread has ended. Idempotent. The control socket file stays;
+    /// the next start replaces it.
     pub fn stop(&self) {
         let _serial = lock(&self.stop_serial);
         request_shutdown(&self.inner);
+        self.dispatch.stop();
         if let Some(mut server) = lock(&self.control).take() {
             server.stop();
         }
@@ -856,7 +918,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        control::{Client, Command, LISTEN_CONFIGURE, OFFER_CREATE, REVOKE},
+        control::{Client, LISTEN_CONFIGURE, OFFER_CREATE, REVOKE},
         noise::StaticKey,
         pairing::{ClaimAttempts, PairingClient, approve},
         report::{AgentsRecord, Endpoint, ReportRequest, ReportResponse, encode_response},
@@ -984,6 +1046,91 @@ mod tests {
         // The config was committed before the hook ran.
         assert_eq!(runtime.store().state().unwrap().config.bind_port, new_port);
         assert!(runtime.listener_addr().is_none());
+    }
+
+    /// W2 (d): the acceptance above through `Runtime::control`. `stop()`
+    /// cannot return while an in-process `listenConfigure` hook is held
+    /// (it waits for the dispatcher's write guard); once released, the
+    /// command completes `ok`, `stop()` returns with neither port
+    /// listening, and a later in-process call is `Stopped`.
+    #[test]
+    fn stop_during_a_held_in_process_listen_configure_leaves_no_port_open() {
+        let home = ShortHome::new();
+        let (old_port, new_port) = (free_port(), free_port());
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (entered_tx, release_rx) = (Mutex::new(entered_tx), Mutex::new(release_rx));
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate_armed = Arc::clone(&armed);
+        let gate: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if gate_armed.load(Ordering::SeqCst) {
+                let _ = lock(&entered_tx).send(());
+                let _ = lock(&release_rx).recv();
+            }
+        });
+        let root = SecureRoot::open_under(&home.0, &["r"]).unwrap();
+        let runtime = Arc::new(
+            Runtime::start_inner(
+                root,
+                |_| Ok(Arc::new(NoSource)),
+                Scope {
+                    scan: Arc::new(ScanStatus::default),
+                    scope: Arc::new(|_| false),
+                    scope_approve: None,
+                },
+                Options::default(),
+                Some(gate),
+            )
+            .unwrap(),
+        );
+        runtime
+            .store()
+            .set_listen_config(Some("127.0.0.1".into()), old_port, None)
+            .unwrap();
+        restart_listener(&runtime.inner);
+        assert!(listening(old_port));
+        armed.store(true, Ordering::SeqCst);
+
+        let caller = Arc::clone(&runtime);
+        let configure = thread::spawn(move || {
+            caller.control(&Command {
+                id: LISTEN_CONFIGURE,
+                body: json!({"bindHost": "127.0.0.1", "bindPort": new_port}),
+            })
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the hook was not reached");
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let stopper = Arc::clone(&runtime);
+        let stop = thread::spawn(move || {
+            stopper.stop();
+            stopped_tx.send(Instant::now()).unwrap();
+        });
+        assert!(
+            stopped_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "stop() returned while a hook was still running"
+        );
+        let released = Instant::now();
+        release_tx.send(()).unwrap();
+        let stopped = stopped_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stop() did not return");
+        assert!(stopped >= released);
+        stop.join().unwrap();
+        assert!(!listening(new_port), "the new port outlived stop()");
+        assert!(!listening(old_port), "the old port outlived stop()");
+        let reply = configure.join().unwrap().unwrap();
+        assert_eq!((reply.code, reply.data), (crate::control::OK, json!(null)));
+        assert_eq!(runtime.store().state().unwrap().config.bind_port, new_port);
+        assert!(runtime.listener_addr().is_none());
+        assert_eq!(
+            runtime.control(&Command {
+                id: crate::control::STATUS,
+                body: json!({}),
+            }),
+            Err(ControlError::Stopped)
+        );
     }
 
     /// An empty agents report echoing the request.
