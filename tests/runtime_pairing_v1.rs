@@ -3,8 +3,8 @@
 //!
 //! The loopback `TcpListener` here is a test harness, not the product
 //! listener (`SA-2B2a2`). Pure transport tests run on every platform; tests
-//! that need a secure root run on macOS and Linux only, because Windows
-//! fails closed (`tests/runtime_storage_v1.rs`). Negative controls that need
+//! that need a secure root run on macOS, Linux and Windows (`W3b`).
+//! Negative controls that need
 //! test-only seams live in the unit tests of `src/pairing.rs` and
 //! `src/noise.rs`.
 
@@ -1345,11 +1345,12 @@ fn claim_results_and_errors_never_show_the_url_or_the_secret() {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+mod support;
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod disk {
-    use std::{
-        net::Shutdown, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Instant,
-    };
+    use std::{net::Shutdown, path::PathBuf, sync::Arc, time::Instant};
 
     use syrtis_agent::{
         pairing::{ConfirmedGrant, GrantStatus, PairStatus, Producer, approve},
@@ -1394,15 +1395,9 @@ mod disk {
 
     impl TempHome {
         fn new() -> Self {
-            static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "syrtis-agent-pair-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir(&path).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-            Self { path }
+            Self {
+                path: super::support::new_home("pair"),
+            }
         }
     }
 

@@ -2,23 +2,23 @@
 //! (`src/listener.rs`, `spec/pairing-v1.md` "Listener"), over real loopback
 //! sockets through the public API.
 //!
-//! Every test here needs a secure root, so they run on macOS and Linux
-//! only: Windows fails closed (`tests/runtime_storage_v1.rs`). The bind
-//! re-validation (acceptance 3, unit half) and the low-order static check
-//! (acceptance 8) are unit tests in `src/listener.rs` and `src/noise.rs`,
-//! which run on all three platforms. Every listener binds 127.0.0.1 only.
+//! Every test here needs a secure root; they run on macOS, Linux and
+//! Windows (`W3b`). The bind re-validation (acceptance 3, unit half) and
+//! the low-order static check (acceptance 8) are unit tests in
+//! `src/listener.rs` and `src/noise.rs`, which run on all three platforms;
+//! so do the Windows bind tests there (`windows_tests`). Every listener
+//! binds 127.0.0.1 only.
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+mod support;
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod disk {
     use std::{
-        io::{ErrorKind, Read},
+        io::{ErrorKind, Read, Write},
         net::{SocketAddr, TcpListener, TcpStream},
-        os::unix::fs::PermissionsExt,
         path::PathBuf,
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
-        },
+        sync::{Arc, Mutex},
         thread,
         time::{Duration, Instant},
     };
@@ -63,15 +63,7 @@ mod disk {
 
     impl TempHome {
         fn new() -> Self {
-            static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "syrtis-agent-listen-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir(&path).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-            Self(path)
+            Self(super::support::new_home("listen"))
         }
     }
 
@@ -365,5 +357,51 @@ mod disk {
             assert!(closed_within(stream, Duration::from_millis(500)), "{n}");
         }
         assert!(refused(address.port()));
+    }
+
+    /// SR P3-1, measured: a listener that served a connection which it
+    /// closed first (`stop` shuts every in-flight socket down, so the
+    /// producer side holds the `TIME_WAIT`) is stopped, and a new listener
+    /// is started on the same port at once. macOS and Linux (`std` sets
+    /// `SO_REUSEADDR`): the rebind succeeds, asserted. Windows (`std` sets
+    /// no option there): not asserted either way; the outcome is
+    /// written to the raw stderr (not captured by the test harness), so a CI
+    /// log records it, and a refusal must be `Bind`, never another error.
+    #[test]
+    fn a_port_with_a_closed_connection_rebinds_after_stop_measured() {
+        let node = Node::new();
+        let port = free_port();
+        node.configure(LOOPBACK, port).unwrap();
+        let mut listener = node.start(Arc::default()).unwrap();
+        let mut held = TcpStream::connect((LOOPBACK, port)).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        listener.stop();
+        assert!(closed_within(&mut held, Duration::from_secs(2)));
+        drop(held);
+
+        let again = node.start(Arc::default());
+        let outcome = match &again {
+            Ok(_) => "rebound at once".to_owned(),
+            Err(error) => format!("refused: {error:?}"),
+        };
+        let _ = writeln!(
+            std::io::stderr(),
+            "MEASURED rebind of 127.0.0.1:{port} right after stop with a producer-closed \
+             connection ({}): {outcome}",
+            std::env::consts::OS
+        );
+        if cfg!(windows) {
+            assert!(
+                matches!(again, Ok(_) | Err(ListenerError::Bind)),
+                "{outcome}"
+            );
+        } else {
+            assert!(again.is_ok(), "{outcome}");
+        }
+        if let Ok(mut listener) = again {
+            assert_eq!(listener.local_addr().port(), port);
+            listener.stop();
+        }
+        assert!(refused(port));
     }
 }

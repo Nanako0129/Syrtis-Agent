@@ -1,24 +1,25 @@
 //! W2 acceptance: the in-process control entry `Runtime::control`
 //! (`spec/control-v1.md`, "In-process entry"), through the public API.
 //!
-//! Every test needs a secure root, so they run on macOS and Linux only for
-//! now: Windows storage is still fail-closed until `W1`, and `W3` extends
-//! these tests to Windows. The side-by-side test runs every command over
-//! the control socket and in-process on the same runtime. Homes live in
-//! `/tmp` with short names so the socket path fits `sun_path`. TCP
-//! listeners bind 127.0.0.1.
+//! Every test needs a secure root; they run on macOS, Linux and Windows
+//! (`W3b`). On macOS and Linux the side-by-side test runs every command
+//! over the control socket and in-process on the same runtime; Windows has
+//! no control socket, so there `Node::socket` is the in-process entry too
+//! and the test checks the fixed expectations it states. Homes come from
+//! `support::new_home` (short `/tmp` names on Unix so the socket path fits
+//! `sun_path`). TCP listeners bind 127.0.0.1.
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+mod support;
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod disk {
+    #[cfg(not(windows))]
+    use std::fs;
     use std::{
-        fs,
-        net::{TcpListener, TcpStream},
-        os::unix::fs::PermissionsExt,
+        net::TcpListener,
         path::PathBuf,
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
-        },
+        sync::{Arc, Mutex},
         thread,
         time::Duration,
     };
@@ -26,16 +27,21 @@ mod disk {
     use serde_json::{Value, json};
     use syrtis_agent::{
         control::{
-            APPROVE, COMMAND_JSON_MAX, Client, Command, ControlError, INVALID, LISTEN_CONFIGURE,
+            APPROVE, COMMAND_JSON_MAX, Command, ControlError, INVALID, LISTEN_CONFIGURE,
             OFFER_CANCEL, OFFER_CREATE, OK, PENDING_LIST, REJECT, REVOKE, Response, SCOPE_APPROVE,
-            SHARING_SET, SHUTDOWN, SOCKET_NAME, STATUS, UNAUTHORIZED,
+            SHARING_SET, SHUTDOWN, STATUS, UNAUTHORIZED,
         },
         pairing::Clock,
         report_peer::NoSource,
         runtime::{Options, Runtime, RuntimeError},
         secure_fs::{SecureRoot, StorageError},
         security::{OfferClaim, decode_fixed_hex, hex_encode, parse_pair_url},
-        state_store::{Secret32, StateStore, encode_state},
+        state_store::{StateStore, encode_state},
+    };
+    #[cfg(not(windows))]
+    use syrtis_agent::{
+        control::{Client, SOCKET_NAME},
+        state_store::Secret32,
     };
 
     const NOW: i64 = 1_700_000_000;
@@ -61,23 +67,16 @@ mod disk {
         }
     }
 
-    /// A short temporary home in `/tmp`; only what this helper created is
-    /// removed.
+    /// A short temporary home (`support::new_home`); only what this helper
+    /// created is removed.
     struct TempHome(PathBuf);
 
     impl TempHome {
         fn new() -> Self {
-            static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let path = PathBuf::from(format!(
-                "/tmp/scl-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&path).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-            Self(path)
+            Self(super::support::new_home("scl"))
         }
 
+        #[cfg(not(windows))]
         fn root(&self) -> PathBuf {
             SUFFIX
                 .iter()
@@ -87,7 +86,7 @@ mod disk {
 
     impl Drop for TempHome {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -120,8 +119,9 @@ mod disk {
             .port()
     }
 
+    #[cfg(not(windows))]
     fn listening(port: u16) -> bool {
-        TcpStream::connect((LOOPBACK, port)).is_ok()
+        std::net::TcpStream::connect((LOOPBACK, port)).is_ok()
     }
 
     struct Node {
@@ -142,6 +142,15 @@ mod disk {
             self.runtime.store()
         }
 
+        /// The control socket. Windows has none: the in-process entry, so
+        /// the comparisons below compare two in-process calls and the test
+        /// rests on its fixed expectations.
+        #[cfg(windows)]
+        fn socket(&self, id: u16, body: Value) -> Response {
+            self.local(id, body)
+        }
+
+        #[cfg(not(windows))]
         fn socket(&self, id: u16, body: Value) -> Response {
             let token = *self.store().state().unwrap().control_token.expose();
             Client::new(
@@ -393,8 +402,13 @@ mod disk {
         }
         assert_eq!(node.state_bytes(), before);
         assert!(!node.store().state().unwrap().reference.sharing_enabled);
-        // Control: over the socket, `sharingSet` runs the runtime's gate.
+        // Control: over the socket, `sharingSet` runs the runtime's gate
+        // (Windows, which has no socket: the direct method), so the state
+        // above could have changed.
+        #[cfg(not(windows))]
         assert_eq!(node.socket(SHARING_SET, json!({"enabled": true})).code, OK);
+        #[cfg(windows)]
+        node.runtime.enable_sharing().unwrap();
         assert!(node.store().state().unwrap().reference.sharing_enabled);
         assert_eq!(node.local(STATUS, json!({})).code, OK);
     }
@@ -422,6 +436,7 @@ mod disk {
     /// at the `control.sock` path fails `Runtime::start` with
     /// `Control(UnsafeSocket)`, leaves the file, and binds no port although
     /// a bindable listen address is stored.
+    #[cfg(not(windows))]
     #[test]
     fn a_non_socket_at_the_control_path_fails_the_start_and_binds_no_port() {
         let home = TempHome::new();

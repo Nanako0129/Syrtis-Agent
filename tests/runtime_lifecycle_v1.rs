@@ -2,22 +2,29 @@
 //! `spec/runtime-v1.md`) through the public API, over real Unix domain
 //! sockets and loopback TCP.
 //!
-//! Every test needs a secure root, so they run on macOS and Linux only:
-//! Windows fails closed (`tests/runtime_storage_v1.rs`). Homes live in
-//! `/tmp` with short names so the control socket path fits `sun_path`.
-//! Listeners bind 127.0.0.1 only. Acceptance (6b), first half (`stop()`
-//! while a `listenConfigure` hook is held), needs a test-only gate and is a
-//! unit test in `src/runtime.rs`.
+//! Every test needs a secure root; they run on macOS, Linux and Windows
+//! (`W3b`). Control commands go over the control socket on macOS and
+//! Linux and through `Runtime::control` on Windows, which has no socket;
+//! the tests of the `shutdown` command and the socket file, and the one
+//! that makes the root read-only with a mode, stay Unix-only. Homes come
+//! from `support::new_home` (short `/tmp` names on Unix so the control
+//! socket path fits `sun_path`). Listeners bind 127.0.0.1 only. Acceptance
+//! (6b), first half (`stop()` while a `listenConfigure` hook is held),
+//! needs a test-only gate and is a unit test in `src/runtime.rs`.
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+mod support;
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod disk {
+    #[cfg(not(windows))]
+    use std::os::unix::{
+        fs::{FileTypeExt, PermissionsExt},
+        net::UnixStream,
+    };
     use std::{
         fs,
         net::{TcpListener, TcpStream},
-        os::unix::{
-            fs::{FileTypeExt, PermissionsExt},
-            net::UnixStream,
-        },
         path::PathBuf,
         sync::{
             Arc, Mutex,
@@ -31,8 +38,8 @@ mod disk {
     use serde_json::{Value, json};
     use syrtis_agent::{
         control::{
-            APPROVE, Client, Command, LISTEN_CONFIGURE, OFFER_CREATE, OK, PENDING_LIST, Response,
-            SHUTDOWN, STATUS, UNAUTHORIZED,
+            APPROVE, Command, LISTEN_CONFIGURE, OFFER_CREATE, OK, PENDING_LIST, Response, STATUS,
+            UNAUTHORIZED,
         },
         noise::StaticKey,
         pairing::{ClaimAttempts, ClientError, Clock, PairingClient},
@@ -48,7 +55,12 @@ mod disk {
             ReferenceState, SecurityError, Terminal, TerminalKind, decode_fixed_hex, hex_encode,
             parse_pair_url,
         },
-        state_store::{Secret32, StateStore, encode_state},
+        state_store::{StateStore, encode_state},
+    };
+    #[cfg(not(windows))]
+    use syrtis_agent::{
+        control::{Client, SHUTDOWN},
+        state_store::Secret32,
     };
 
     const NOW: i64 = 1_700_000_000;
@@ -106,23 +118,17 @@ mod disk {
         }
     }
 
-    /// A temporary home in `/tmp`, short so the socket path fits
-    /// `sun_path`. Only directories this helper created are removed.
+    /// A temporary home (`support::new_home`), short so the socket path
+    /// fits `sun_path`. Only directories this helper created are removed.
     struct TempHome(PathBuf);
 
     impl TempHome {
         fn new() -> Self {
-            static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let path = PathBuf::from(format!(
-                "/tmp/sl-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&path).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-            Self(path)
+            Self(super::support::new_home("sl"))
         }
 
+        // Only the Unix-only tests use it.
+        #[cfg_attr(windows, allow(dead_code))]
         fn root(&self) -> PathBuf {
             SUFFIX
                 .iter()
@@ -132,6 +138,7 @@ mod disk {
 
     impl Drop for TempHome {
         fn drop(&mut self) {
+            #[cfg(not(windows))]
             let _ = fs::set_permissions(self.root(), fs::Permissions::from_mode(0o700));
             let _ = fs::remove_dir_all(&self.0);
         }
@@ -165,6 +172,8 @@ mod disk {
     struct Node {
         runtime: Runtime,
         clock: Arc<TestClock>,
+        // Only the Unix-only tests use it.
+        #[cfg_attr(windows, allow(dead_code))]
         home: TempHome,
     }
 
@@ -210,6 +219,7 @@ mod disk {
             self.reference().last_accepted_wall_unix_seconds()
         }
 
+        #[cfg(not(windows))]
         fn client(&self) -> Client {
             let token = *self.store().state().unwrap().control_token.expose();
             Client::new(
@@ -218,8 +228,12 @@ mod disk {
             )
         }
 
+        /// A control command: over the socket, or in-process on Windows.
         fn call(&self, id: u16, body: Value) -> Response {
-            self.client().call(&Command { id, body }).unwrap()
+            #[cfg(not(windows))]
+            return self.client().call(&Command { id, body }).unwrap();
+            #[cfg(windows)]
+            return self.runtime.control(&Command { id, body }).unwrap();
         }
 
         fn configure(&self, port: u16) {
@@ -404,6 +418,8 @@ mod disk {
     }
 
     /// Runs `f` on another thread; `Some` if it returns within `within`.
+    // Only the Unix-only tests use it.
+    #[cfg_attr(windows, allow(dead_code))]
     fn within<T: Send + 'static>(
         within: Duration,
         f: impl FnOnce() -> T + Send + 'static,
@@ -420,7 +436,9 @@ mod disk {
     /// Acceptance (1): start → `listenConfigure` and `offerCreate` over
     /// control → another node claims over the wire, the owner approves
     /// over control, the receiver confirms and pulls a report from the
-    /// stub source → the `shutdown` command ends the runtime.
+    /// stub source → the `shutdown` command ends the runtime. Windows (no
+    /// control socket, `shutdown` is not an in-process command): `stop()`
+    /// ends it, and the peer port is closed afterwards.
     #[test]
     fn the_runtime_pairs_serves_a_report_and_shuts_down_by_command() {
         let node = Arc::new(Node::new(Duration::from_secs(60)));
@@ -463,25 +481,31 @@ mod disk {
         .unwrap();
         assert_eq!(fetched.records, Records::Agents(agents()));
 
-        let waiter = Arc::clone(&node);
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            waiter.runtime.wait();
-            let _ = tx.send(());
-        });
-        assert_eq!(node.call(SHUTDOWN, json!({})).code, OK);
-        assert!(
-            rx.recv_timeout(Duration::from_secs(3)).is_ok(),
-            "wait() did not return after shutdown"
-        );
+        #[cfg(not(windows))]
+        {
+            let waiter = Arc::clone(&node);
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                waiter.runtime.wait();
+                let _ = tx.send(());
+            });
+            assert_eq!(node.call(SHUTDOWN, json!({})).code, OK);
+            assert!(
+                rx.recv_timeout(Duration::from_secs(3)).is_ok(),
+                "wait() did not return after shutdown"
+            );
+        }
+        #[cfg(windows)]
+        assert!(listening(port));
         node.runtime.stop();
-        assert!(!listening(port));
+        assert!(!listening(port), "a port was left open after stop");
     }
 
     /// Acceptance (2): after `shutdown` its reply arrives (the hook does
     /// not stop the server on the connection thread), `wait()` returns,
     /// `stop()` finishes within 3 s, the socket file stays but accepts no
     /// connection, and the peer port is closed.
+    #[cfg(not(windows))]
     #[test]
     fn shutdown_returns_wait_and_stop_closes_the_socket_and_the_port() {
         let node = Arc::new(Node::new(Duration::from_secs(60)));
@@ -946,6 +970,7 @@ mod disk {
     /// read-only, so the next checkpoint cannot stage) the store is sticky
     /// unknown; housekeeping keeps running (no panic) at its period (no
     /// spin), and `stop()` still returns.
+    #[cfg(not(windows))]
     #[test]
     fn a_sticky_store_neither_stops_nor_spins_housekeeping() {
         let node = Node::new(FAST);

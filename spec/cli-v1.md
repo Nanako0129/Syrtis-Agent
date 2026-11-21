@@ -6,7 +6,7 @@ This document fixes the standalone binary `syrtis-agent` (`SA-2C2b`): `syrtis-ag
 
 The binary adds no state, no wire format and no transition. Sharing, scope approval, offers, approvals and the listen address change only through the frozen control commands (`spec/control-v1.md`); their effects are the runtime's and the agent's (`spec/runtime-v1.md`, `spec/agent-v1.md`).
 
-macOS and Linux. On every other platform (Windows included until `SA-4`) the binary compiles; `run` and the menu print `syrtis-agent: this platform is not supported yet.` and exit 1.
+macOS and Linux. On every other platform the binary compiles; `run` and the menu print `syrtis-agent: this platform is not supported yet.` and exit 1. That includes Windows: since `W3b` the library runs there embedded in the Windows app (`spec/agent-v1.md`, "Windows"), but the standalone binary, its control socket and install are not in this version.
 
 ## Arguments and the home
 

@@ -1,20 +1,19 @@
 //! SA-2B3a acceptance: the on-disk producer and receiver caches
 //! (`spec/cache-store-v1.md`) through the public API.
 //!
-//! macOS and Linux only: elsewhere no secure root can be opened. The
+//! macOS, Linux and Windows (`W3b`): elsewhere no secure root can be
+//! opened. The swapped-file test (a symlink, a mode) stays Unix-only. The
 //! fault-injection cases need test-only seams and live in the unit tests of
 //! `src/cache_store.rs`; the `secure_fs` primitive cases live in the unit
-//! tests of `src/secure_fs/unix.rs`.
+//! tests of `src/secure_fs/unix.rs` and `src/secure_fs/windows.rs`.
 
-#![cfg(any(target_os = "macos", target_os = "linux"))]
+#![cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+
+mod support;
 
 use std::{
-    os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::Arc,
     thread,
     time::Duration,
 };
@@ -43,15 +42,9 @@ struct TempHome {
 
 impl TempHome {
     fn new() -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "syrtis-cache-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&path).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        Self { path }
+        Self {
+            path: support::new_home("cache"),
+        }
     }
 
     fn root(&self) -> PathBuf {
@@ -553,9 +546,13 @@ fn a_body_whose_three_reservations_exceed_the_ledger_is_deleted_not_busy() {
 
 /// Acceptance (7b): a file swapped after indexing (a symlink; a `0644`
 /// file) is `UnsafeState`, nothing is followed or deleted, and the store
-/// stays unknown until it is reopened.
+/// stays unknown until it is reopened. Unix-only: the swaps are a symlink
+/// and a file mode (Windows has the junction, symlink and DACL cases in the
+/// `secure_fs::windows` unit tests).
+#[cfg(not(windows))]
 #[test]
 fn a_swapped_file_is_unsafe_state_and_sticky_until_reopen() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
     for swap in ["symlink", "mode 0644"] {
         let home = TempHome::new();
         let producer = open_store(&home, CacheRole::Producer);

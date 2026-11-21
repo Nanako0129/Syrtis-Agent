@@ -4,8 +4,10 @@
 //! files it writes itself; nothing reads the real home or the network. The
 //! two tests that change the process environment or working directory run
 //! their work in a child process of this binary (`child_process_entry`).
-//! `EngineSource` and the engine dependency are `cfg(unix)`, so is this file.
-#![cfg(unix)]
+//! The engine builds on every target; the `engine` tests need a secure root
+//! and run on macOS, Linux and Windows (`W3b`). The two digest goldens use
+//! the same literals everywhere: the digest hashes strings and never asks
+//! the OS about them.
 
 use std::collections::BTreeSet;
 
@@ -143,12 +145,14 @@ fn the_environment_key_list_covers_every_client_env_root() {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+mod support;
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod engine {
     use std::{
-        os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
         process::Command,
-        sync::atomic::{AtomicUsize, Ordering},
         time::{Duration, Instant},
     };
 
@@ -182,23 +186,17 @@ mod engine {
     const SUFFIX: &[&str] = &["Library", "AppSupport", "agent"];
     const NOW: i64 = 1_700_000_000;
 
-    /// A temporary directory, `0700`. Only directories this helper created
-    /// are removed, by their exact path.
+    /// A temporary directory (`support::new_home`: `0700` on Unix). Only
+    /// directories this helper created are removed, by their exact path.
     struct TempDir {
         path: PathBuf,
     }
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "syrtis-src-{tag}-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir(&path).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-            Self { path }
+            Self {
+                path: super::support::new_home(&format!("src-{tag}")),
+            }
         }
 
         fn root(&self) -> PathBuf {
@@ -234,7 +232,7 @@ mod engine {
     }
 
     fn data_dir(home: &Path) -> PathBuf {
-        home.join(".local/share")
+        home.join(".local").join("share")
     }
 
     fn source(store: &StateStore, home: &Path, settings: ScannerSettings) -> EngineSource {
@@ -1021,14 +1019,32 @@ mod engine {
         stdout[start..].lines().next().unwrap_or("").to_owned()
     }
 
+    /// The engine's environment keys (the fixture), and on Windows the
+    /// variables a Windows lookup could read instead of the known folders
+    /// (`SR P2-2`).
     fn env_keys() -> Vec<String> {
         let doc: Value = serde_json::from_str(ENVIRONMENT_KEYS).unwrap();
-        doc["keys"]
+        let mut keys: Vec<String> = doc["keys"]
             .as_array()
             .unwrap()
             .iter()
             .map(|entry| entry["key"].as_str().unwrap().to_owned())
-            .collect()
+            .collect();
+        if cfg!(windows) {
+            keys.extend(
+                [
+                    "TMP",
+                    "TEMP",
+                    "USERPROFILE",
+                    "APPDATA",
+                    "LOCALAPPDATA",
+                    "HOMEDRIVE",
+                    "HOMEPATH",
+                ]
+                .map(str::to_owned),
+            );
+        }
+        keys
     }
 
     /// Every entry below `dir`, recursively; empty when `dir` is empty.
@@ -1073,14 +1089,17 @@ mod engine {
     /// Acceptance (5): the engine's source cache lands below the secure
     /// root, and nothing lands in `$TMPDIR`, `$XDG_RUNTIME_DIR` or the
     /// environment's home and config roots (the engine's message-cache
-    /// fallback would use `$TMPDIR/tokscale-uid-*`).
+    /// fallback would use `$TMPDIR/tokscale-uid-*`). Windows: `TMP` and
+    /// `TEMP` too, and `USERPROFILE`, `APPDATA`, `LOCALAPPDATA` below the
+    /// environment's home.
     #[test]
     fn engine_caches_stay_below_the_secure_root() {
         let home = TempDir::new("tmp");
         let tmp = TempDir::new("tmpdir");
         let runtime = TempDir::new("runtime");
         let env_home = TempDir::new("envhome");
-        let env = [
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut env = [
             ("TMPDIR", tmp.path.clone()),
             ("XDG_RUNTIME_DIR", runtime.path.clone()),
             ("HOME", env_home.path.clone()),
@@ -1090,7 +1109,19 @@ mod engine {
             ("XDG_STATE_HOME", env_home.path.join(".local/state")),
             ("TOKSCALE_CONFIG_DIR", env_home.path.join("tokscale")),
         ]
-        .map(|(key, value)| (key.to_owned(), value));
+        .map(|(key, value)| (key.to_owned(), value))
+        .to_vec();
+        #[cfg(windows)]
+        env.extend(
+            [
+                ("TMP", tmp.path.clone()),
+                ("TEMP", tmp.path.clone()),
+                ("USERPROFILE", env_home.path.clone()),
+                ("APPDATA", env_home.path.join("roaming")),
+                ("LOCALAPPDATA", env_home.path.join("local")),
+            ]
+            .map(|(key, value)| (key.to_owned(), value)),
+        );
         child("TMP", &home.path, &env, &env_home.path);
         for dir in [&tmp.path, &runtime.path, &env_home.path] {
             assert!(entries(dir).is_empty(), "{dir:?}: {:?}", entries(dir));
@@ -1169,5 +1200,190 @@ mod engine {
             }
             other => panic!("unknown mode {other}"),
         }
+    }
+
+    /// Whether a test that must not be skipped on CI runs here: true
+    /// whenever `GITHUB_ACTIONS` is set (any value), as in
+    /// `tests/dependency_provenance_v1.rs`.
+    #[cfg(windows)]
+    fn skip_must_fail_here() -> bool {
+        std::env::var_os("GITHUB_ACTIONS").is_some()
+    }
+
+    /// Files and directories a test planted outside its temp directories;
+    /// dropping it removes exactly those, files first, then each directory
+    /// it created (deepest first, only when empty), also when the test
+    /// failed. Nothing that was there before is touched.
+    #[cfg(windows)]
+    #[derive(Default)]
+    struct Planted {
+        files: Vec<PathBuf>,
+        dirs: Vec<PathBuf>,
+    }
+
+    #[cfg(windows)]
+    impl Planted {
+        /// Writes `contents` to `path`, which must not exist, creating
+        /// only the missing directories above it.
+        fn plant(&mut self, path: &Path, contents: &str) {
+            let mut missing: Vec<&Path> = path
+                .ancestors()
+                .skip(1)
+                .take_while(|dir| !dir.exists())
+                .collect();
+            missing.reverse();
+            for dir in missing {
+                std::fs::create_dir(dir).unwrap_or_else(|e| panic!("create {dir:?}: {e}"));
+                self.dirs.push(dir.to_path_buf());
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap_or_else(|e| panic!("create {path:?}: {e}"));
+            self.files.push(path.to_path_buf());
+            std::io::Write::write_all(&mut file, contents.as_bytes()).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for Planted {
+        fn drop(&mut self) {
+            for file in &self.files {
+                if let Err(error) = std::fs::remove_file(file) {
+                    eprintln!("decoy cleanup: remove {file:?}: {error}");
+                }
+            }
+            for dir in self.dirs.iter().rev() {
+                if let Err(error) = std::fs::remove_dir(dir) {
+                    eprintln!("decoy cleanup: remove {dir:?}: {error}");
+                }
+            }
+        }
+    }
+
+    /// The top-level entries of the temp directory, without the ones this
+    /// process's tests create (`support::new_home` puts the pid in each).
+    #[cfg(windows)]
+    fn temp_entries() -> BTreeSet<String> {
+        let mine = format!("-{}-", std::process::id());
+        std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.contains(&mine))
+            .collect()
+    }
+
+    /// W3b, SR P2-2: a remote scan reads only the roots it is given. A
+    /// decoy session (an OpenCode message and an Antigravity session, each
+    /// naming a unique model) is planted below this user's real
+    /// LocalAppData and RoamingAppData known folders, where a lookup of the
+    /// known folders or of `APPDATA` / `LOCALAPPDATA` would find it; the
+    /// scan roots are temp directories. The decoy is in none of the four
+    /// bodies, and nothing new appears in the temp directory. Control: the
+    /// same files below the scanned roots are reported. Only the planted
+    /// files and the directories created for them are removed, also when
+    /// an assertion fails.
+    ///
+    /// Rule: it writes below the real AppData only under `GITHUB_ACTIONS`
+    /// (`skip_must_fail_here`, the pattern of
+    /// `tests/dependency_provenance_v1.rs`). Elsewhere, on a developer's
+    /// machine that may run Syrtis, it prints `SKIPPED` and returns: a
+    /// local scan there could count the decoy, and a killed run would leave
+    /// it. On CI it always runs. The decoy stays where the engine's lanes
+    /// would read it if a scan took a real folder as a root: below each of
+    /// the two folders, `tokscale\antigravity-cache\sessions` (the config
+    /// lane) and `opencode\storage\message` (the data lane). A decoy
+    /// anywhere else would be missed by a scan that did read those folders,
+    /// and the test would prove nothing.
+    #[cfg(windows)]
+    #[test]
+    fn a_decoy_below_the_real_appdata_known_folders_is_never_scanned() {
+        if !skip_must_fail_here() {
+            eprintln!(
+                "SKIPPED off CI: a_decoy_below_the_real_appdata_known_folders_is_never_scanned \
+                 would write below the real AppData (runs under GITHUB_ACTIONS)"
+            );
+            return;
+        }
+        let roots = syrtis_agent::agent::default_scan_roots().unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let marker = format!("w3bdecoy{}x{nanos}", std::process::id());
+        let decoys = [
+            (
+                format!("opencode/storage/message/ses_{marker}/msg_{marker}.json"),
+                format!(
+                    r#"{{"id":"msg_{marker}","sessionID":"ses_{marker}","role":"assistant","modelID":"{marker}","providerID":"anthropic","tokens":{{"input":7777,"output":77,"reasoning":0,"cache":{{"read":0,"write":0}}}},"time":{{"created":2209032000000.0}}}}"#
+                ),
+            ),
+            (
+                format!("tokscale/antigravity-cache/sessions/{marker}.jsonl"),
+                format!(
+                    r#"{{"type":"usage","sessionId":"{marker}","timestamp":2209032000000,"modelId":"{marker}","input":7777,"output":77}}"#
+                ),
+            ),
+        ];
+        let mut planted = Planted::default();
+        for base in [&roots.data_dir, &roots.config_dir] {
+            for (relative, contents) in &decoys {
+                planted.plant(&base.join(relative), contents);
+            }
+        }
+
+        let home = TempDir::new("kf-home");
+        let scan = TempDir::new("kf-scan");
+        let (config, data, xdg) = (
+            scan.path.join("roaming"),
+            scan.path.join("local"),
+            scan.path.join(".local").join("share"),
+        );
+        for dir in [&config, &data, &xdg] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let store = open_store(&home.path);
+        let source = EngineSource::new_with_xdg_data_home(
+            store.root(),
+            scan.path.clone(),
+            config.clone(),
+            data.clone(),
+            Some(xdg.clone()),
+            ScannerSettings::default(),
+        )
+        .unwrap();
+        source.approve(&store).unwrap();
+        let generation = generation(&store);
+        let before = temp_entries();
+        for (n, body) in all_bodies(&source, generation).iter().enumerate() {
+            let text = String::from_utf8_lossy(body);
+            assert!(
+                !text.contains(&marker),
+                "body {n} carries the decoy planted in {roots:?}: {text}"
+            );
+        }
+        let after = temp_entries();
+        assert!(
+            after.is_subset(&before),
+            "new in the temp directory: {:?}",
+            after.difference(&before).collect::<Vec<_>>()
+        );
+
+        // Control: below the scanned roots the same files are reported.
+        for base in [&config, &data, &xdg] {
+            for (relative, contents) in &decoys {
+                write(&base.join(relative), contents);
+            }
+        }
+        let found = all_bodies(&source, generation)
+            .iter()
+            .filter(|body| String::from_utf8_lossy(body).contains(&marker))
+            .count();
+        assert!(
+            found > 0,
+            "control: the decoy files are not a reported shape"
+        );
+        drop(planted);
     }
 }

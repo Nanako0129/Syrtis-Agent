@@ -2,8 +2,8 @@
 //! public API.
 //!
 //! Codec and load-rule tests run on every platform. Tests that need a secure
-//! root run on macOS and Linux only, because Windows fails closed
-//! (`tests/runtime_storage_v1.rs`). The commit-failure test needs test-only
+//! root run on macOS, Linux and Windows (`W3b`). The commit-failure test
+//! needs test-only
 //! seams and lives in the unit tests of `src/peer_store.rs`.
 
 use std::collections::BTreeSet;
@@ -339,17 +339,19 @@ fn every_load_rule_fails_closed_and_its_control_loads() {
     assert!(decode_peers(&bytes_of(&value)).is_ok());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+mod support;
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod disk {
     use std::{
         net::{TcpListener, TcpStream},
-        os::unix::fs::PermissionsExt,
         panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
         path::{Path, PathBuf},
         process::Command,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicBool, Ordering},
         },
         thread,
         time::Duration,
@@ -382,15 +384,9 @@ mod disk {
 
     impl TempHome {
         fn new() -> Self {
-            static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "syrtis-agent-peers-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir(&path).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-            Self { path }
+            Self {
+                path: super::support::new_home("peers"),
+            }
         }
 
         fn peers_file(&self) -> PathBuf {
@@ -598,11 +594,17 @@ mod disk {
         peers.upsert(record.clone()).unwrap();
         let file = receiver_home.read_peers();
         assert_frozen_keys(&file);
-        let mode = std::fs::metadata(receiver_home.peers_file())
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600);
+        // Windows: the owner-only DACL of every created file is checked by
+        // the `secure_fs::windows` unit tests.
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(receiver_home.peers_file())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         drop((store, peers));
 
         let (store, peers) = open_both(&receiver_home.path);
@@ -614,8 +616,13 @@ mod disk {
 
     /// Acceptance (2), on disk: a file load refuses fails `open` closed
     /// (`Corrupt`, `Incompatible`), and a stale temp file is removed.
+    /// Unix-only: on Windows a file written by path inherits a DACL that is
+    /// not protected, so the secure root refuses it (`UnsafeState`) before
+    /// any decode; the load rules themselves are the codec tests above.
+    #[cfg(not(windows))]
     #[test]
     fn an_unreadable_peers_file_fails_open_closed() {
+        use std::os::unix::fs::PermissionsExt;
         let home = TempHome::new();
         drop(open_state(&home.path));
         for (bytes, error) in [
@@ -846,10 +853,15 @@ mod disk {
             ..record(1)
         };
         assert_eq!(peers.peers().unwrap(), vec![labeled.clone(), record(2)]);
-        // The same label again: no write (the file is not replaced).
+        // The same label again: no write (the file is not replaced). Which
+        // file it is: its inode; Windows, where std has no stable file ID,
+        // its last write time (a replace writes a new temp file).
         let inode = || {
-            use std::os::unix::fs::MetadataExt;
-            std::fs::metadata(home.peers_file()).unwrap().ino()
+            let metadata = std::fs::metadata(home.peers_file()).unwrap();
+            #[cfg(not(windows))]
+            return std::os::unix::fs::MetadataExt::ino(&metadata) as u128;
+            #[cfg(windows)]
+            return std::os::windows::fs::MetadataExt::last_write_time(&metadata) as u128;
         };
         let before = inode();
         peers.set_label(&[1; 32], &[1; 16], label()).unwrap();

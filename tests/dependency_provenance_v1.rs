@@ -20,6 +20,12 @@
 //! 0.2.1` it uses), so the lock gained no package. A package outside the
 //! baseline is now accepted only by its full (name, version, source,
 //! checksum) tuple, and the allowlist must equal the set the lock adds.
+//!
+//! W3b moved `tokscale-core` from `[target.'cfg(unix)'.dependencies]` to
+//! `[dependencies]` (the engine now builds for Windows too; `libc` stays
+//! Unix-only); the lock gained no package and no edge. (A `socket2`
+//! dependency for an `SO_EXCLUSIVEADDRUSE` bind was added and removed again
+//! in the same slice, after windows-latest run 44886137738.)
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -651,15 +657,55 @@ fn the_lock_checker_rejects_a_changed_checksum_or_version() {
     }
 }
 
+/// The lines of the table `[name]` in `manifest`, up to the next header.
+fn table<'a>(manifest: &'a str, name: &str) -> Vec<&'a str> {
+    let header = format!("[{name}]");
+    manifest
+        .lines()
+        .skip_while(|line| *line != header)
+        .skip(1)
+        .take_while(|line| !line.starts_with('['))
+        .filter(|line| !line.trim().is_empty())
+        .collect()
+}
+
 #[test]
 fn the_manifest_pins_every_dependency_and_snow_exactly_once() {
     check_manifest(MANIFEST).unwrap();
+    // W3b: the engine is a dependency on every target; the Unix table is
+    // `libc` alone; the Windows table is `windows-sys` alone.
     assert!(
-        MANIFEST.contains("[target.'cfg(unix)'.dependencies]\nlibc = { version = \"=0.2.189\"")
+        table(MANIFEST, "dependencies")
+            .iter()
+            .any(|line| line.starts_with("tokscale-core = { git = ")),
+        "tokscale-core is not in [dependencies]"
     );
-    assert!(MANIFEST.contains(
-        "[target.'cfg(windows)'.dependencies]\nwindows-sys = { version = \"=0.61.2\", default-features = false, features = ["
+    assert_eq!(
+        table(MANIFEST, "target.'cfg(unix)'.dependencies"),
+        ["libc = { version = \"=0.2.189\", default-features = false }"]
+    );
+    let windows = table(MANIFEST, "target.'cfg(windows)'.dependencies");
+    assert_eq!(windows.len(), 1, "{windows:?}");
+    assert!(windows[0].starts_with(
+        "windows-sys = { version = \"=0.61.2\", default-features = false, features = ["
     ));
+    // Control: with the engine moved back under the Unix table the manifest
+    // still passes `check_manifest`, and `table` sees the move.
+    let engine = table(MANIFEST, "dependencies")
+        .into_iter()
+        .find(|line| line.starts_with("tokscale-core"))
+        .unwrap();
+    let moved = MANIFEST.replace(&format!("{engine}\n"), "").replace(
+        "[target.'cfg(unix)'.dependencies]\n",
+        &format!("[target.'cfg(unix)'.dependencies]\n{engine}\n"),
+    );
+    check_manifest(&moved).unwrap();
+    assert!(
+        !table(&moved, "dependencies")
+            .iter()
+            .any(|line| line.starts_with("tokscale-core"))
+    );
+    assert_eq!(table(&moved, "target.'cfg(unix)'.dependencies").len(), 2);
 }
 
 #[test]

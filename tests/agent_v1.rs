@@ -2,10 +2,17 @@
 //! (`spec/agent-v1.md`).
 //!
 //! The `combine` tests are portable. Everything else runs two agents in
-//! temp homes (below `/tmp`, so the control socket path fits) with session
-//! files the test writes itself, paired over loopback; nothing reads the
-//! real home, starts a service, or leaves loopback. Acceptance (8b) is a
-//! unit test in `src/secure_fs/unix.rs`.
+//! temp homes (`support::new_home`: below `/tmp` on Unix, so the control
+//! socket path fits) with session files the test writes itself, paired over
+//! loopback; nothing reads the real home, starts a service, or leaves
+//! loopback. They run on macOS, Linux and Windows (`W3b`); on Windows
+//! control commands go through `Runtime::control` (no socket), and the
+//! install, control `scopeApprove` and symlink tests stay Unix-only.
+//! Acceptance (8b) is a unit test in `src/secure_fs/unix.rs`. The Windows
+//! scan-root defaults are `windows_roots` at the end.
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+mod support;
 
 use syrtis_agent::{
     merge::{FailureClass, PartStatus, PeerData, PeerPart, Report, classify, combine},
@@ -222,17 +229,18 @@ fn combine_carries_saturation() {
     assert!(!dropped.saturated);
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod live {
+    #[cfg(not(windows))]
+    use std::os::unix::fs::{MetadataExt, symlink};
     use std::{
         collections::BTreeMap,
         fs,
         net::TcpListener,
-        os::unix::fs::{MetadataExt, PermissionsExt, symlink},
         path::{Path, PathBuf},
         sync::{
             Arc, Mutex,
-            atomic::{AtomicI64, AtomicUsize, Ordering},
+            atomic::{AtomicI64, Ordering},
         },
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -240,12 +248,8 @@ mod live {
 
     use serde_json::{Value, json};
     use syrtis_agent::{
-        agent::{Agent, AgentConfig, AgentError, ScannerSettings},
-        control::{
-            Client, Command, INVALID, LISTEN_CONFIGURE, OFFER_CREATE, OK, REVOKE, Response,
-            SCOPE_APPROVE, STATUS,
-        },
-        install::{self, Outcome},
+        agent::{Agent, AgentConfig, AgentError, ScanRoots, ScannerSettings},
+        control::{Command, LISTEN_CONFIGURE, OFFER_CREATE, OK, REVOKE, Response, STATUS},
         merge::{Combined, PartStatus},
         noise::StaticKey,
         pairing::{ClaimAttempts, Clock, PairingClient, approve},
@@ -257,11 +261,17 @@ mod live {
         report_peer::{FetchError, ReportQuery, ReportSource, SourceError},
         runtime::{Options, PullError, Runtime, RuntimeError},
         secure_fs::{SecureRoot, StorageError},
+        security::SecurityError,
         security::{
             AGGREGATION_REVISION, GrantState, MemoryLedger, PEER_PROTOCOL_VERSION,
             REPORT_SCHEMA_VERSION, TZDB_REVISION, hex_encode,
         },
-        source::{SCOPE_FILE, SOURCE_CACHE_DIR},
+        source::{SCOPE_FILE, SOURCE_CACHE_DIR, owner_inputs_sha256_with_xdg_data_home},
+    };
+    #[cfg(not(windows))]
+    use syrtis_agent::{
+        control::{Client, INVALID, SCOPE_APPROVE},
+        install::{self, Outcome},
         state_store::Secret32,
     };
 
@@ -315,21 +325,14 @@ mod live {
         }
     }
 
-    /// A short temp home below the real `/tmp` (canonical, so no path
-    /// component is a symlink). Only this directory is removed.
+    /// A short temp home (`support::new_home`: below the real `/tmp` on
+    /// Unix, canonical, so no path component is a symlink). Only this
+    /// directory is removed.
     struct TempHome(PathBuf);
 
     impl TempHome {
         fn new() -> Self {
-            static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let path = fs::canonicalize("/tmp").unwrap().join(format!(
-                "sag-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&path).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-            Self(path)
+            Self(super::support::new_home("sag"))
         }
 
         fn root(&self) -> PathBuf {
@@ -390,7 +393,7 @@ mod live {
         let mut config = AgentConfig::new(
             home.to_path_buf(),
             home.join(".config"),
-            home.join(".local/share"),
+            home.join(".local").join("share"),
             settings,
         );
         config.state_suffix = SUFFIX;
@@ -429,12 +432,18 @@ mod live {
         reply.data
     }
 
-    /// One control command, whatever its code.
+    /// One control command, whatever its code: over the socket, or
+    /// in-process on Windows (no socket there).
     fn reply(runtime: &Runtime, id: u16, body: Value) -> Response {
-        let token = *runtime.store().state().unwrap().control_token.expose();
-        Client::new(Secret32::new(token), runtime.socket_path().to_path_buf())
-            .call(&Command { id, body })
-            .unwrap()
+        #[cfg(not(windows))]
+        {
+            let token = *runtime.store().state().unwrap().control_token.expose();
+            Client::new(Secret32::new(token), runtime.socket_path().to_path_buf())
+                .call(&Command { id, body })
+                .unwrap()
+        }
+        #[cfg(windows)]
+        runtime.control(&Command { id, body }).unwrap()
     }
 
     /// `scopeApproved` of control `status`.
@@ -581,6 +590,7 @@ mod live {
             .count()
     }
 
+    #[cfg(not(windows))]
     fn sharing(agent: &Agent) -> bool {
         agent
             .runtime()
@@ -591,6 +601,7 @@ mod live {
             .sharing_enabled
     }
 
+    #[cfg(not(windows))]
     fn entries(dir: &Path) -> usize {
         fs::read_dir(dir).unwrap().count()
     }
@@ -598,7 +609,9 @@ mod live {
     /// Acceptance (1), the Outcome: the receiver's merged report of each
     /// endpoint equals the producer's own records and the fixture's
     /// numbers; after the producer's uninstall (and a restart, so it
-    /// answers) the receiver gets nothing, fresh or cached.
+    /// answers) the receiver gets nothing, fresh or cached. Windows: no
+    /// install exists, so `uninstall` is `Install(Unsupported)` (the
+    /// runtime stops, nothing is removed) and the test ends there.
     #[test]
     fn e2e_four_endpoints_merge_to_the_producer_fixture_and_nothing_after_uninstall() {
         let clock = TestClock::new();
@@ -633,29 +646,44 @@ mod live {
         );
         assert!(graph.iter().any(|r| r.client == "codex"));
 
-        producer.uninstall(false).unwrap();
-        let producer = start(&producer_home, &clock, ScannerSettings::default());
-        let combined = pull_all(&receiver, &clock, Endpoint::Graph);
-        assert_eq!(status_of(&combined, &producer_static), PartStatus::Refused);
-        assert!(is_empty(&combined));
-        assert_eq!(
-            combined.peers[0].error,
-            Some(PullError::Fetch(FetchError::Revoked))
-        );
-        // The revoked answer marked the peer record and removed the cached
-        // entries: nothing is pulled or read any more.
-        for endpoint in ENDPOINTS {
-            let combined = pull_all(&receiver, &clock, endpoint);
-            assert!(combined.peers.is_empty() && is_empty(&combined));
-            assert!(
-                receiver
-                    .runtime()
-                    .last_good(&producer_static, &query(endpoint))
-                    .unwrap()
-                    .is_none()
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                producer.uninstall(false).err(),
+                Some(AgentError::Install(
+                    syrtis_agent::install::InstallError::Unsupported
+                ))
             );
+            let producer = start(&producer_home, &clock, ScannerSettings::default());
+            assert!(producer.scope_approved(), "the uninstall removed state");
+            assert_eq!(active_grants(&producer), 1);
         }
-        drop(producer);
+        #[cfg(not(windows))]
+        {
+            producer.uninstall(false).unwrap();
+            let producer = start(&producer_home, &clock, ScannerSettings::default());
+            let combined = pull_all(&receiver, &clock, Endpoint::Graph);
+            assert_eq!(status_of(&combined, &producer_static), PartStatus::Refused);
+            assert!(is_empty(&combined));
+            assert_eq!(
+                combined.peers[0].error,
+                Some(PullError::Fetch(FetchError::Revoked))
+            );
+            // The revoked answer marked the peer record and removed the cached
+            // entries: nothing is pulled or read any more.
+            for endpoint in ENDPOINTS {
+                let combined = pull_all(&receiver, &clock, endpoint);
+                assert!(combined.peers.is_empty() && is_empty(&combined));
+                assert!(
+                    receiver
+                        .runtime()
+                        .last_good(&producer_static, &query(endpoint))
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            drop(producer);
+        }
     }
 
     /// Acceptance (6): with the producer stopped, `pull_all` returns the
@@ -718,6 +746,7 @@ mod live {
     /// byte for byte); the running digest approves, moves the generation
     /// and ends the grant paired before the first approval, as
     /// `approve_scope` does.
+    #[cfg(not(windows))]
     #[test]
     fn scope_approve_over_control_needs_the_running_digest_and_ends_earlier_grants() {
         let clock = TestClock::new();
@@ -776,6 +805,7 @@ mod live {
     /// SA-2C2b acceptance (4): `status` says `scopeApproved` false before
     /// the approval, true after it, false again after a reset, and each
     /// time the source's own `report` agrees (refuses or serves).
+    #[cfg(not(windows))]
     #[test]
     fn status_scope_approved_matches_what_report_serves() {
         let clock = TestClock::new();
@@ -881,14 +911,22 @@ mod live {
             PartStatus::Fresh
         );
         let scope = producer_home.root().join(SCOPE_FILE);
-        let (ino, mtime) = {
+        // Which file, and when written: inode and mtime; Windows, where std
+        // has no stable file ID, the last write time.
+        let stamp = || {
             let meta = fs::metadata(&scope).unwrap();
-            (meta.ino(), meta.mtime_nsec())
+            #[cfg(not(windows))]
+            return (meta.ino(), meta.mtime_nsec() as u64);
+            #[cfg(windows)]
+            return (
+                0u64,
+                std::os::windows::fs::MetadataExt::last_write_time(&meta),
+            );
         };
+        let before = stamp();
         let generation_now = generation(&producer);
         producer.approve_scope().unwrap();
-        let meta = fs::metadata(&scope).unwrap();
-        assert_eq!((meta.ino(), meta.mtime_nsec()), (ino, mtime));
+        assert_eq!(stamp(), before);
         assert_eq!(generation(&producer), generation_now);
         assert_eq!(
             status_of(
@@ -1158,6 +1196,7 @@ mod live {
     }
 
     /// The installed stand-in for the running binary.
+    #[cfg(not(windows))]
     fn install_into(home: &TempHome) {
         let exe = home.0.join("exe-source");
         fs::write(&exe, b"stand-in binary").unwrap();
@@ -1166,6 +1205,7 @@ mod live {
 
     /// A paired producer that served one scan, with an extra file in its
     /// source cache, installed into its temp home.
+    #[cfg(not(windows))]
     fn served(producer_home: &TempHome, receiver_home: &TempHome, clock: &Arc<TestClock>) -> Agent {
         let producer = producer(producer_home, clock);
         producer.approve_scope().unwrap();
@@ -1187,6 +1227,7 @@ mod live {
     /// Acceptance (8): uninstall empties the source cache, ends every grant,
     /// turns sharing off and removes the installed objects; the scope
     /// record stays without `purge`.
+    #[cfg(not(windows))]
     #[test]
     fn uninstall_ends_grants_and_clears_the_source_cache() {
         let clock = TestClock::new();
@@ -1208,6 +1249,7 @@ mod live {
 
     /// Acceptance (8): with `purge`, `source-scope.json` goes too; a new
     /// start has a new identity and no approved scope.
+    #[cfg(not(windows))]
     #[test]
     fn purge_removes_the_scope_record_and_the_next_start_is_new() {
         let clock = TestClock::new();
@@ -1241,6 +1283,7 @@ mod live {
 
     /// Acceptance (8): another live handle to the state store makes
     /// uninstall fail with nothing removed.
+    #[cfg(not(windows))]
     #[test]
     fn uninstall_with_another_store_handle_fails_and_removes_nothing() {
         let clock = TestClock::new();
@@ -1270,6 +1313,7 @@ mod live {
     /// a symlink to a decoy) does not stop the uninstall: every grant is
     /// ended, sharing is off, the decoy is untouched and the report asks
     /// for manual repair.
+    #[cfg(not(windows))]
     #[test]
     fn a_source_cache_that_cannot_be_cleared_only_marks_manual_repair() {
         let clock = TestClock::new();
@@ -1299,5 +1343,215 @@ mod live {
         let producer = start(&producer_home, &clock, ScannerSettings::default());
         assert_eq!(active_grants(&producer), 0);
         assert!(!sharing(&producer));
+    }
+
+    /// W3b, SR P1-1: an agent whose scan home is not the state base
+    /// (`AgentConfig::with_scan_roots`, as on Windows). The disclosure is
+    /// the exact strings hashed: they re-hash, through the public digest
+    /// function, to the running source's digest, and they are the roots
+    /// given (the state base appears only as the source cache below it).
+    /// `approve_scope_for` with any other digest is `Refused(Invalid)` and
+    /// writes nothing (no record, then the record byte for byte); with the
+    /// disclosed digest it approves, and the sessions below the scan home
+    /// are served.
+    #[test]
+    fn approve_scope_for_binds_the_approval_to_the_disclosed_roots() {
+        let clock = TestClock::new();
+        let (state_home, scan) = (TempHome::new(), TempHome::new());
+        write_sessions(&scan.0);
+        let roots = ScanRoots {
+            home: scan.0.clone(),
+            config_dir: scan.0.join("roaming"),
+            data_dir: scan.0.join("local"),
+            xdg_data_home: scan.0.join(".local").join("share"),
+        };
+        let mut config =
+            AgentConfig::with_scan_roots(state_home.0.clone(), roots.clone(), Default::default());
+        config.state_suffix = SUFFIX;
+        config.options = Options {
+            clock: Arc::clone(&clock) as Arc<dyn Clock>,
+            housekeeping_period: Duration::from_secs(60),
+        };
+        assert_eq!(config.scan_home.as_deref(), Some(scan.0.as_path()));
+        let agent = Agent::start(config).unwrap();
+
+        let shown = agent.scope_disclosure().clone();
+        let text = |path: &Path| path.to_str().unwrap().to_owned();
+        assert_eq!(shown.home, text(&roots.home));
+        assert_eq!(shown.config_dir, text(&roots.config_dir));
+        assert_eq!(shown.data_dir, text(&roots.data_dir));
+        assert_eq!(shown.xdg_data_home, Some(text(&roots.xdg_data_home)));
+        assert_eq!(shown.source_cache_dir, text(&state_home.source_cache()));
+        assert!(shown.extra_scan_paths.is_empty() && shown.excluded_scan_paths.is_empty());
+        assert!(shown.opencode_db_paths.is_empty());
+        let rehashed = owner_inputs_sha256_with_xdg_data_home(
+            Path::new(&shown.home),
+            Path::new(&shown.config_dir),
+            Path::new(&shown.data_dir),
+            shown.xdg_data_home.as_deref().map(Path::new),
+            Path::new(&shown.source_cache_dir),
+            &ScannerSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(rehashed, shown.owner_inputs_sha256);
+        assert_eq!(
+            shown.owner_inputs_sha256,
+            agent.source().owner_inputs_sha256()
+        );
+
+        let scope = state_home.root().join(SCOPE_FILE);
+        let wrong = if shown.owner_inputs_sha256 == "00".repeat(32) {
+            "11".repeat(32)
+        } else {
+            "00".repeat(32)
+        };
+        let before = generation(&agent);
+        for digest in [
+            wrong.as_str(),
+            "",
+            &shown.owner_inputs_sha256.to_uppercase(),
+        ] {
+            assert_eq!(
+                agent.approve_scope_for(digest),
+                Err(StorageError::Refused(SecurityError::Invalid)),
+                "{digest:?}"
+            );
+        }
+        assert!(
+            !scope.exists(),
+            "a refused approve_scope_for wrote the record"
+        );
+        assert_eq!(generation(&agent), before);
+        assert!(!agent.scope_approved());
+
+        agent.approve_scope_for(&shown.owner_inputs_sha256).unwrap();
+        assert!(agent.scope_approved());
+        assert_eq!(generation(&agent), before + 1);
+        let record = fs::read(&scope).unwrap();
+        assert_eq!(
+            agent.approve_scope_for(&wrong),
+            Err(StorageError::Refused(SecurityError::Invalid))
+        );
+        assert_eq!(fs::read(&scope).unwrap(), record);
+        let Records::Graph(graph) = direct(&agent, Endpoint::Graph) else {
+            panic!()
+        };
+        assert!(
+            graph
+                .iter()
+                .any(|r| r.model.as_deref() == Some("claude-3-5-sonnet") && r.input_tokens == 300),
+            "{graph:?}"
+        );
+    }
+}
+
+/// W3b: the Windows scan-root defaults (`agent::default_scan_roots`).
+#[cfg(windows)]
+mod windows_roots {
+    use std::{
+        path::{Component, Path, Prefix},
+        process::Command,
+    };
+
+    use syrtis_agent::{agent::default_scan_roots, secure_fs::trusted_home};
+
+    /// Absolute, a drive or UNC prefix, no `\\?\`, no `.` or `..`.
+    fn plain_absolute(path: &Path) -> bool {
+        let mut components = path.components();
+        let prefix = matches!(
+            components.next(),
+            Some(Component::Prefix(prefix))
+                if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::UNC(..))
+        );
+        prefix
+            && path.is_absolute()
+            && !path.to_string_lossy().starts_with(r"\\?\")
+            && components.all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+    }
+
+    /// Four absolute, non-verbatim paths; the XDG data root is
+    /// `home\.local\share` of the same home; LocalAppData equals the state
+    /// base (`trusted_home`, same known folder, other flags); RoamingAppData
+    /// is another folder. The values are printed on failure.
+    #[test]
+    fn the_default_scan_roots_are_four_plain_absolute_known_folders() {
+        let roots = default_scan_roots().unwrap_or_else(|error| panic!("{error:?}"));
+        for path in [
+            &roots.home,
+            &roots.config_dir,
+            &roots.data_dir,
+            &roots.xdg_data_home,
+        ] {
+            assert!(plain_absolute(path), "{path:?} in {roots:?}");
+        }
+        assert_eq!(
+            roots.xdg_data_home,
+            roots.home.join(".local").join("share"),
+            "{roots:?}"
+        );
+        assert!(roots.xdg_data_home.starts_with(&roots.home), "{roots:?}");
+        assert_eq!(roots.data_dir, trusted_home().unwrap(), "{roots:?}");
+        assert_ne!(roots.config_dir, roots.data_dir, "{roots:?}");
+        assert!(roots.home.is_dir() && roots.data_dir.is_dir(), "{roots:?}");
+    }
+
+    /// No environment variable moves a default: a child of this binary
+    /// with `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `HOME`, `HOMEDRIVE`,
+    /// `HOMEPATH`, `TMP`, `TEMP`, every `XDG_*` root and
+    /// `TOKSCALE_CONFIG_DIR` pointed elsewhere answers what this process
+    /// answers.
+    #[test]
+    fn environment_variables_do_not_move_the_default_scan_roots() {
+        let mine = format!("{:?}", default_scan_roots().unwrap());
+        let elsewhere = std::env::temp_dir().join("syrtis-w3b-elsewhere");
+        let decoy = elsewhere.to_str().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "windows_roots::child_process_entry",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("SYRTIS_ROOTS_CHILD", "1")
+            .envs(
+                [
+                    "USERPROFILE",
+                    "APPDATA",
+                    "LOCALAPPDATA",
+                    "HOME",
+                    "HOMEPATH",
+                    "TMP",
+                    "TEMP",
+                    "XDG_DATA_HOME",
+                    "XDG_CONFIG_HOME",
+                    "XDG_CACHE_HOME",
+                    "XDG_STATE_HOME",
+                    "XDG_RUNTIME_DIR",
+                    "TOKSCALE_CONFIG_DIR",
+                ]
+                .map(|key| (key, decoy)),
+            )
+            .env("HOMEDRIVE", "Q:")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        let marker = "ROOTS:";
+        let start = stdout
+            .find(marker)
+            .unwrap_or_else(|| panic!("{stdout}\n{stderr}"))
+            + marker.len();
+        let theirs = stdout[start..].lines().next().unwrap_or("");
+        assert_eq!(theirs, mine);
+    }
+
+    /// The child side. A no-op in a normal run.
+    #[test]
+    fn child_process_entry() {
+        if std::env::var_os("SYRTIS_ROOTS_CHILD").is_none() {
+            return;
+        }
+        println!("ROOTS:{:?}", default_scan_roots().unwrap());
     }
 }

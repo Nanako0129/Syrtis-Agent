@@ -10,23 +10,25 @@
 //! in `src/report_peer.rs` (`receiver_tests`), on all three platforms; the
 //! measured memory bound is `tests/runtime_report_memory_v1.rs`.
 //!
-//! Every test here needs a secure root, so they run on macOS and Linux
-//! only: Windows fails closed (`tests/runtime_storage_v1.rs`). The
+//! Every test here needs a secure root; they run on macOS, Linux and
+//! Windows (`W3b`). The
 //! per-grant limit, the compute slot and the code numbering have unit
 //! tests in `src/report_peer.rs` that run on all three platforms; so does
 //! nothing else, because the report path reads the store. Acceptance (6),
 //! which needs a test-only seam inside `authorize_then`, is a unit test
 //! there too. Every listener binds 127.0.0.1 only.
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+mod support;
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod disk {
     use std::{
         net::TcpListener,
-        os::unix::fs::PermissionsExt,
         path::PathBuf,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicI64, AtomicUsize, Ordering},
+            atomic::{AtomicI64, Ordering},
             mpsc,
         },
         thread,
@@ -129,15 +131,7 @@ mod disk {
 
     impl TempHome {
         fn new() -> Self {
-            static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "syrtis-agent-report-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir(&path).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-            Self(path)
+            Self(super::support::new_home("report"))
         }
     }
 

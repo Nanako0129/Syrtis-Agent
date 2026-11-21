@@ -454,6 +454,12 @@ fn write_handshake(
     write_all(stream, &bytes, deadline)
 }
 
+/// The longest single `recv` on Windows (`read_exact`): how late a stalled
+/// read notices `Listener::stop`. Below the 1 s stop bound, with room for
+/// the accept poll and the joins.
+#[cfg(windows)]
+const WINDOWS_READ_SLICE: Duration = Duration::from_millis(250);
+
 /// Each system call gets the time left until `deadline`, so a peer that
 /// trickles bytes cannot extend it.
 fn read_exact(
@@ -463,8 +469,24 @@ fn read_exact(
 ) -> Result<(), NoiseError> {
     let mut filled = 0;
     while filled < buffer.len() {
+        let timeout = deadline.remaining()?;
+        // Windows, measured: with 8 handshakes stalled in this read,
+        // `Listener::stop` (a `shutdown` from another thread) took 9.8 s,
+        // the 10 s deadline (windows-latest run 44887602263); with each
+        // call there capped at `WINDOWS_READ_SLICE` it returns within the
+        // 1 s bound (run 44889107385). Our reading of the two runs, not a
+        // measured fact: the shutdown does not wake a `recv` already
+        // blocked, and the next call fails. Retrying after a timed-out call
+        // and then receiving data is what `tests::accept_reads_a_non_blocking_stream_in_blocking_mode`
+        // and `tests::connect_reads_its_stream_in_blocking_mode` exercise
+        // (data after 300 ms, slices of 250 ms), passing on Windows; that
+        // a timed-out `recv` never consumes data is not claimed from
+        // Windows. Writes are not sliced: a timed-out send may already
+        // have sent part of its bytes.
+        #[cfg(windows)]
+        let timeout = timeout.min(WINDOWS_READ_SLICE);
         stream
-            .set_read_timeout(Some(deadline.remaining()?))
+            .set_read_timeout(Some(timeout))
             .map_err(|_| NoiseError::Io)?;
         #[cfg(test)]
         tests::READ_CALLS.with(|calls| calls.set(calls.get() + 1));

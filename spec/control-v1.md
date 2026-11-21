@@ -138,7 +138,7 @@ The token, the offer secret and the Pair URL never appear in a `Debug` output or
 | `SA-2C2b` | `sharing_set_runs_the_runtime_gate_and_maps_its_errors`; dispatch of 10 and 11 to their hooks: `each_command_succeeds_and_each_validator_refusal_is_invalid`; `scopeApprove` and `scopeApproved`: `tests/agent_v1.rs` `live::scope_approve_over_control_needs_the_running_digest_and_ends_earlier_grants`, `live::status_scope_approved_matches_what_report_serves` |
 | `SA-2B2c2` | The expiry filter of `status` and `pendingList`: `tests/runtime_lifecycle_v1.rs` `status_and_pending_list_leave_out_what_has_expired`; the hooks: that file and `spec/runtime-v1.md` |
 
-`W2` (in-process entry; `tests/runtime_control_local_v1.rs` unless noted; macOS and Linux until `W3` extends them to Windows, whose storage still fails closed):
+`W2` (in-process entry; `tests/runtime_control_local_v1.rs` unless noted; since `W3b` they run on macOS, Linux and Windows, except the last row, which is macOS/Linux by what it tests. Windows has no control socket, so there the side-by-side test compares two in-process calls and rests on the fixed codes and data it asserts, and the `sharingSet` control of the refusal test uses `Runtime::enable_sharing`):
 
 | Item | Test |
 |---|---|
