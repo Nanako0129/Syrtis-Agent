@@ -268,6 +268,24 @@
 # wording, and the "In-process control" section. No wire, command ID,
 # result code, MAC or state byte changed; src/control.rs and src/runtime.rs
 # are not digest-pinned.
+#
+# W1 (SA-2B1b, Windows secure storage) changed spec/state-store-v1.md on
+# purpose: it adds the "Windows" section (LocalAppData known-folder base,
+# handle-relative NtCreateFile descent with FILE_OPEN_REPARSE_POINT, the
+# explicit owner-only protected descriptor, the base/intermediate and
+# root/file DACL rules, persistent-ACL and network-volume checks, the
+# FileRenameInformationEx POSIX replace with no directory sync, handle
+# deletes, LockFileEx, the LOCALAPPDATA and USERPROFILE results, the
+# Windows non-claims, and the uncovered stub for other targets); the Root
+# table's Windows row and the environment sentence are scoped per platform;
+# and the dependency paragraph names windows-sys =0.61.2 (already in the
+# baseline, replacing the contract's 0.59.x) and the tuple allowlist.
+# tests/dependency_provenance_v1.rs changed on purpose: the Windows target
+# table is allowed, a package outside the baseline is accepted only by its
+# full (name, version, source, checksum) tuple and the allowlist must equal
+# what the lock adds (empty), with controls for a changed checksum, a
+# changed version and a path package. The lock baseline fixture is
+# unchanged: the lock gained no package.
 4eb5d2ca0aa2906676095dd4d2450d142f15fd6e8cdfbff774ee9d7cbf2e9373  spec/cache-store-v1.md
 055a5c81aade6aec75c8f43bccb8128ab22ca1691b15b690ca833d0005176a2f  spec/install-v1.md
 14448b1b0ca3be54b08c8c13f0e267eaa12058bcd571d678a481e574d2d7859a  spec/cli-v1.md
@@ -278,7 +296,7 @@ c6cfaf6793ab2d9319c461ac538c8d9e95428fdf2eebe54f630e6337673b3580  spec/pairing-v
 7cc4eb2a75af280535da80a2955e14af83e95b1842ad4339b9b51536c2d797ee  spec/peer-store-v1.md
 f2c1c9300b27ab7607fad510baf5380b6d4e050e483a422a3046d19b76be8de6  spec/report-cache-v1.md
 d42f2711c5e7f8d820af9e95691ce0ab926564af95f7e442997dad3d879290cc  spec/security-v1.md
-851b2c3306943ab32f1a6184bd6a593364e3ddf17d00ffde500222c2413d5267  spec/state-store-v1.md
+1305c76ef1673ed007d2b15a6a7fe142d557b50f83a35ad511f911d2bfad35be  spec/state-store-v1.md
 3e97171eda23b646b27ed21a26dffe9cb3a285636a558fc96e9b202076b3eb53  spec/v1.md
 4b28b7ce8b1d5192e8ee25aae4f8df4911ab3b7833df1d3324bff47aeaeb1c38  spec/source-v1.md
 5cf48f921f1a881a9d3da5a9e9a2cf46398797aead91311fee667cff1d110547  spec/agent-v1.md
@@ -286,7 +304,7 @@ ff21cbcfdd6aedfb68ac1b3cfda056663203f2c7f08fd05a856dc5dbe5e4c25a  src/cache.rs
 8b0add8d4fde2253edebdddd448d381559d63ff630f0e9d2f9faad8d9625567f  src/canonical.rs
 7f3d545bf38d846fd2cad5ebfc77d1ff865d42fad68001dd3e7af2282a1e96ef  src/report.rs
 c255e3a9c3c282d604324163bae814180983d1c36d28979cb33f1f97963c479c  src/security.rs
-c8b01baf8a687f066d8d361963b262d903e7776949ccf971130200759c86a167  tests/dependency_provenance_v1.rs
+ec4e8e38afd05bc70d9215fc37c9c21c232ceaa23701e5ccfd68707bcf40202a  tests/dependency_provenance_v1.rs
 c9d617dc9bf0f082b1ded0f9713b4b25019d53c27da3222cf10313b9d26d948b  tests/fixtures/v1/cache/body.sha256
 fb83883b05cfae1d1c43e99ef176d0c030f730821e4b948a0af44db00948e056  tests/fixtures/v1/cache/filename.txt
 b66991a435b5e89814a1486b3a354119b240adf8fa17d09e28a578f5039c5733  tests/fixtures/v1/cache/key.json

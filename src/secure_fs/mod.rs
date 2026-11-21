@@ -1,9 +1,11 @@
 //! Owner-only secure root for the agent's durable state.
 //!
 //! macOS and Linux open every object descriptor-relative and no-follow below a
-//! trusted home (`unix.rs`). Every other platform, Windows included until
-//! `SA-2B1b`, fails closed (`windows.rs`): no root can be opened, so no state
-//! can be read, written or served. See `spec/state-store-v1.md`.
+//! trusted home (`unix.rs`). Windows opens every object handle-relative with
+//! `NtCreateFile` and `FILE_OPEN_REPARSE_POINT` below the LocalAppData known
+//! folder, under protected owner-only DACLs (`windows.rs`). Every other
+//! platform fails closed (`unsupported.rs`): no root can be opened, so no
+//! state can be read, written or served. See `spec/state-store-v1.md`.
 
 use crate::security::SecurityError;
 
@@ -12,10 +14,15 @@ mod unix;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use unix::*;
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "windows")]
 mod windows;
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "windows")]
 pub use windows::*;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+mod unsupported;
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub use unsupported::*;
 
 /// Stable storage errors. They carry no path, OS error text or file content.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,7 +46,7 @@ pub enum StorageError {
 
 /// Points in the commit sequence. Every commit system call runs through
 /// `shim`, which in test builds lets a hook record, fail, pause or abort it.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Step {
     /// Opening one component below the trusted home; test-only hook point
@@ -51,6 +58,8 @@ pub(crate) enum Step {
     /// checks, whether it was created in this call or found, so a root left
     /// unsynced by an earlier crash is made durable before any commit goes
     /// into it. That sync runs before the `owner.lock` checks and the lock.
+    /// macOS and Linux only: Windows has no directory sync.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     SyncParent(usize),
     CreateTemp,
     /// First half of the bytes.
@@ -62,9 +71,13 @@ pub(crate) enum Step {
     /// exclusive guard. Not a system call; a pause point only.
     Staged,
     Rename,
+    /// macOS and Linux: the directory sync after a rename or unlink. Windows:
+    /// `FlushFileBuffers` on the still-open renamed handle after a rename,
+    /// and nothing after a delete (Windows has no directory sync).
     SyncDir,
-    /// `unlinkat` of one agent file by `SecureRoot::remove_file`; the
-    /// directory sync after it is `SyncDir`.
+    /// `unlinkat` (Windows: a POSIX-semantics delete through a handle opened
+    /// with `FILE_OPEN_REPARSE_POINT`) of one agent file by
+    /// `SecureRoot::remove_file`; the step after it is `SyncDir`.
     Unlink,
 }
 
@@ -76,12 +89,12 @@ pub(crate) const CACHE_PREFIXES: [&str; 2] = ["pcache-", "rcache-"];
 /// Directory entries (`.` and `..` not counted) `SecureRoot::list` and
 /// `SecureRoot::remove_stale_temps` read before they give up with
 /// `UnsafeState`.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub(crate) const LIST_ENTRIES_MAX: usize = 4_096;
 
 /// `Ok` only for a name in [`CACHE_PREFIXES`]; anything else, the empty
 /// string included, is `Refused(Invalid)`.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub(crate) fn cache_prefix(prefix: &str) -> Result<(), StorageError> {
     if CACHE_PREFIXES.contains(&prefix) {
         Ok(())
@@ -90,7 +103,7 @@ pub(crate) fn cache_prefix(prefix: &str) -> Result<(), StorageError> {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub(crate) fn shim<T>(
     #[cfg_attr(not(test), allow(unused_variables))] step: Step,
     op: impl FnOnce() -> std::io::Result<T>,
@@ -103,7 +116,10 @@ pub(crate) fn shim<T>(
 /// Test-only seams. Nothing here exists in a non-test build, so no public
 /// API can reach a bypass. Every seam is thread-local, so parallel tests do
 /// not see each other's settings, and [`seams::Reset`] clears them all.
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    test,
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 pub(crate) mod seams {
     use std::{
         cell::{Cell, RefCell},
@@ -115,12 +131,14 @@ pub(crate) mod seams {
     // Guards that a negative control may bypass.
     pub(crate) const NOFOLLOW: u32 = 1 << 0;
     pub(crate) const OWNER: u32 = 1 << 1;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) const MODE: u32 = 1 << 2;
     pub(crate) const INTERMEDIATE: u32 = 1 << 3;
     pub(crate) const NLINK: u32 = 1 << 4;
     pub(crate) const LOCAL_FS: u32 = 1 << 5;
     pub(crate) const BYTE_CAP: u32 = 1 << 6;
     /// Skips the exact-mode `fchmod` on objects the agent creates.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) const SKIP_FCHMOD: u32 = 1 << 7;
     /// Skips clearing the extended ACL on objects the agent creates (macOS).
     #[cfg(target_os = "macos")]
@@ -133,9 +151,25 @@ pub(crate) mod seams {
     #[cfg(target_os = "macos")]
     pub(crate) const INTERMEDIATE_ACL: u32 = 1 << 10;
     /// Skips the "not group- or other-writable" check on the home.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) const HOME_MODE: u32 = 1 << 11;
     /// Skips the parent sync of an agent root that already existed.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) const SKIP_PARENT_SYNC: u32 = 1 << 12;
+    /// Skips the protected, current-user-only DACL check on the agent root,
+    /// a private subdirectory and an agent file (Windows).
+    #[cfg(target_os = "windows")]
+    pub(crate) const DACL: u32 = 1 << 13;
+    /// Creates objects without the explicit owner-only security descriptor,
+    /// so they inherit their parent's ACEs (Windows).
+    #[cfg(target_os = "windows")]
+    pub(crate) const EXPLICIT_SD: u32 = 1 << 14;
+    /// Skips the "a DACL is present and not NULL" check (Windows).
+    #[cfg(target_os = "windows")]
+    pub(crate) const DACL_PRESENT: u32 = 1 << 15;
+    /// Skips the `FILE_PERSISTENT_ACLS` volume check (Windows).
+    #[cfg(target_os = "windows")]
+    pub(crate) const PERSISTENT_ACLS: u32 = 1 << 16;
 
     // Objects whose owner classification a test may force to "foreign".
     pub(crate) const HOME: u32 = 1 << 0;
@@ -149,6 +183,8 @@ pub(crate) mod seams {
         static BYPASS: Cell<u32> = const { Cell::new(0) };
         static FOREIGN: Cell<u32> = const { Cell::new(0) };
         static NONLOCAL: Cell<bool> = const { Cell::new(false) };
+        #[cfg(target_os = "windows")]
+        static NO_PERSISTENT_ACLS: Cell<bool> = const { Cell::new(false) };
         static LOCK_NAME: Cell<Option<&'static CStr>> = const { Cell::new(None) };
         static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
         #[cfg(target_os = "macos")]
@@ -237,6 +273,15 @@ pub(crate) mod seams {
     pub(crate) fn forced_nonlocal() -> bool {
         NONLOCAL.with(Cell::get)
     }
+    /// Makes every volume read as lacking `FILE_PERSISTENT_ACLS` (Windows).
+    #[cfg(target_os = "windows")]
+    pub(crate) fn force_no_persistent_acls(value: bool) {
+        NO_PERSISTENT_ACLS.with(|cell| cell.set(value));
+    }
+    #[cfg(target_os = "windows")]
+    pub(crate) fn forced_no_persistent_acls() -> bool {
+        NO_PERSISTENT_ACLS.with(Cell::get)
+    }
     /// Locks this file instead of the dedicated lock file.
     pub(crate) fn lock_name_override(name: Option<&'static CStr>) {
         LOCK_NAME.with(|cell| cell.set(name));
@@ -261,6 +306,8 @@ pub(crate) mod seams {
             bypass(0);
             force_foreign(0);
             force_nonlocal(false);
+            #[cfg(target_os = "windows")]
+            force_no_persistent_acls(false);
             lock_name_override(None);
             set_hook(None);
             #[cfg(target_os = "macos")]
@@ -277,10 +324,14 @@ pub(crate) mod seams {
 
 /// Temporary "home" directories for tests. Only directories this helper
 /// created are removed.
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    test,
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 pub(crate) mod test_support {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use std::os::unix::fs::PermissionsExt;
     use std::{
-        os::unix::fs::PermissionsExt,
         path::PathBuf,
         sync::atomic::{AtomicUsize, Ordering},
     };
@@ -302,6 +353,9 @@ pub(crate) mod test_support {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             std::fs::create_dir(&path).unwrap();
+            // Windows: the new directory inherits the temp directory's ACEs
+            // and is checked as the base (`windows.rs`).
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
             Self { path }
         }

@@ -12,9 +12,12 @@ This document fixes how the agent's durable state is stored: where, in what byte
 |---|---|---|
 | macOS | `getpwuid_r(geteuid())` `pw_dir` (directory service) | `Library/Application Support/com.nyanako.syrtis.agent` |
 | Linux | `getpwuid_r(geteuid())` `pw_dir` | `.local/state/syrtis-agent` |
-| Windows and every other platform | none | none: fails closed with `unsafeState` until `SA-2B1b` |
+| Windows | Current-token LocalAppData known folder (`SHGetKnownFolderPath(FOLDERID_LocalAppData)` with the process token) | `Nyanako\Syrtis Agent` |
+| Every other platform | none | none: fails closed with `unsafeState` (below) |
 
-`HOME`, `XDG_*`, `LOCALAPPDATA` and every other environment variable are ignored. A home that is not absolute (`/`, not `//`) fails closed.
+macOS and Linux: `HOME`, `XDG_*` and every other environment variable are ignored, and a home that is not absolute (`/`, not `//`) fails closed. Windows: see "Windows" below; `LOCALAPPDATA` is ignored, but no claim is made for every environment variable.
+
+The paragraphs and the object table below, up to "Files in the root", describe macOS and Linux. Windows has its own section.
 
 The home is opened by path and checked on the descriptor. Every component below it is opened with `openat(parent, name, O_DIRECTORY | O_NOFOLLOW)`; a missing component is created with `mkdirat(…, 0700)`, reopened the same way, set to exactly `0700` with `fchmod` on the new descriptor (the `mkdirat` mode is filtered by the process umask), has its extended ACL cleared on macOS, and then its parent directory is synced (`F_FULLFSYNC` on macOS, `fsync` on Linux) so the new entry is durable. Nothing is ever reopened by pathname after a check.
 
@@ -59,7 +62,7 @@ Any failure of a rule above leaves listener, control endpoint and report serving
 
 | Name | Purpose |
 |---|---|
-| `owner.lock` | Owner lock. Stable; never replaced; `flock(LOCK_EX \| LOCK_NB)`. |
+| `owner.lock` | Owner lock. Stable; never replaced; `flock(LOCK_EX \| LOCK_NB)` (Windows: `LockFileEx`, see "Windows"). |
 | `state.json` | The durable state. |
 | `.state.json.tmp` | Commit temp file. Present only during a commit or after a crash. |
 | `pcache-<64 hex>`, `rcache-<64 hex>` and their `.…tmp` | Producer and receiver cache entries (`spec/cache-store-v1.md`). |
@@ -76,6 +79,73 @@ Four more root operations serve the cache store (`spec/cache-store-v1.md`). Each
 | `list(prefix)` | `prefix` must be `pcache-` or `rcache-`; anything else, the empty string included, is `refused(invalid)`. Reads the root's entries through a fresh descriptor (`openat(root, ".")` and `fdopendir`), so two listings never share a directory offset. Every entry whose name starts with `prefix` is checked with `fstatat(…, AT_SYMLINK_NOFOLLOW)`: a regular file, owner the effective UID, mode exactly `0600`, link count 1, and a valid agent-file name. One entry failing any of them makes the whole call `unsafeState`; nothing is opened, followed or removed. Entries without the prefix are not checked, only counted: more than 4,096 entries (not counting `.` and `..`) is `unsafeState`. Temp files start with `.`, so they never carry the prefix. Returns names and sizes, sorted by name. No ACL check here: the read that follows (`read_file_sized`) checks it on macOS |
 | `remove_file(name)` | `unlinkat(root, name, 0)`, which removes a link and never follows it, then a directory sync. An absent file is success. Either step failing is `unknown`. Both run through the commit shim (`Unlink`, then `SyncDir`), so tests can fail each |
 | `remove_stale_temps(prefix)` | `prefix` as for `list`. Removes every entry named `.<prefix>….tmp` with `unlinkat` (never follows); `ENOENT` is ignored and any other failure is `unsafeState`. Only crash leftovers of that role's writes match |
+
+## Windows
+
+Implementation: `src/secure_fs/windows.rs` (`windows-sys` 0.61.2, below). Every rule here is enforced on an open handle; no Windows code path opens anything below the base by name, and none uses path-based `CreateFileW`, `MoveFileExW` or `ReplaceFileW`.
+
+### Base and descent
+
+| Step | Rule |
+|---|---|
+| Base | `trusted_home()` is the LocalAppData known folder of the process token. `open_under(home, suffix)` accepts only an absolute drive path (`X:\…` or `\\?\X:\…`); UNC, `\\?\UNC\…`, device, relative and drive-relative paths, `..`, and components holding `/`, `:` or NUL fail closed before anything is opened. The base is opened by its NT path (`\??\X:\…`) with `NtCreateFile` and **follows** reparse points (a user who moved AppData with a junction keeps working), the same as the Unix home opened by path. Path components above the base are trusted as a path, as on Unix |
+| Below the base | Every component is opened with `NtCreateFile` relative to its parent's handle (`OBJECT_ATTRIBUTES.RootDirectory`), one constant name per call, `OBJ_CASE_INSENSITIVE`, never `OBJ_INHERIT`, with `FILE_OPEN_REPARSE_POINT`, so a junction or symlink is opened itself; its handle must then not carry `FILE_ATTRIBUTE_REPARSE_POINT`. Directories are opened with `FILE_SHARE_READ \| FILE_SHARE_WRITE \| FILE_SHARE_DELETE` (the I/O manager opens the parent during a rename below it; inferred). A missing component is created by the same call (`FILE_OPEN_IF`) with the explicit descriptor below |
+| Suffix components | Not empty, `.` or `..`; no `\`, `/`, `:` or NUL |
+| Agent file names | The rule above (`[a-z0-9._-]`, not starting with `.`) |
+
+### Owner and DACL
+
+Every object the agent creates (each directory of the suffix, a private subdirectory, `owner.lock`, every temp file) gets an explicit security descriptor in the creating `NtCreateFile` call (`OBJECT_ATTRIBUTES.SecurityDescriptor`): owner = the current user's SID (from `TokenUser`), a DACL with `SE_DACL_PROTECTED` and one allow ACE, `FILE_ALL_ACCESS` for the current user (on directories with `OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE`, so a file a path-based consumer creates inside a private subdirectory inherits owner-only access). Nothing is changed after creation; an object that already exists is checked as found and, if it fails, left in place for manual repair.
+
+| Object | Required on the handle (`NtQuerySecurityObject`, `FileBasicInformation`, `FileStandardInformation`) |
+|---|---|
+| Every object | A DACL is present and not NULL (`SE_DACL_PRESENT`; a NULL DACL grants everyone everything). Every ACE is `ACCESS_ALLOWED_ACE_TYPE` or `ACCESS_DENIED_ACE_TYPE`; a callback, object, audit or unknown ACE type fails closed |
+| Base, intermediate (`Nyanako`) | Directory. Owner is the current user, SYSTEM (`S-1-5-18`) or Administrators (`S-1-5-32-544`). No allow ACE that is not `INHERIT_ONLY_ACE` grants any of `FILE_ADD_FILE`, `FILE_ADD_SUBDIRECTORY`, `FILE_DELETE_CHILD`, `DELETE`, `WRITE_DAC`, `WRITE_OWNER`, `GENERIC_WRITE`, `GENERIC_ALL` to any other SID (inherit-only ACEs do not count: the agent's children carry explicit descriptors). Deny ACEs are allowed |
+| Agent root, private subdirectory | Directory, not a reparse point. Owner is the current user. `SE_DACL_PROTECTED` is set and every ACE names the current user |
+| Agent file (`state.json`, `owner.lock`, cache entries) | Not a directory and not a reparse point. Owner, protection and ACEs as for the root. `NumberOfLinks == 1` |
+
+The base and the agent root must also be on a volume whose `FileFsAttributeInformation` has `FILE_PERSISTENT_ACLS` (a file system that keeps no security descriptors fails closed), and that `FileFsDeviceInformation` does not classify as network: `Characteristics & (FILE_REMOTE_DEVICE | FILE_REMOTE_DEVICE_VSMB)` or `DeviceType == FILE_DEVICE_NETWORK_FILE_SYSTEM` fails closed.
+
+The CI runner is elevated, so the default owner of objects it creates is Administrators; the explicit descriptor is what makes the agent's own objects owned by the user.
+
+### Commit, delete and lock
+
+```text
+NtCreateFile(root, ".<name>.tmp", GENERIC_WRITE|DELETE, share 0, FILE_CREATE,
+             FILE_NON_DIRECTORY_FILE|FILE_SYNCHRONOUS_IO_NONALERT|FILE_OPEN_REPARSE_POINT,
+             explicit descriptor)
+write (all bytes)
+FlushFileBuffers(temp handle)
+                   -- store takes its exclusive guard --
+NtSetInformationFile(temp handle, FileRenameInformationEx,
+                     REPLACE_IF_EXISTS|POSIX_SEMANTICS, RootDirectory = root, "<name>")
+FlushFileBuffers(the same, now renamed, handle)    -- shim step SyncDir
+                   -- in-memory state replaced, guard released --
+```
+
+- The rename runs on the temp file's own handle; nothing is reopened by name. `FILE_CREATE` fails if any entry of the temp name exists, a reparse point included.
+- **There is no directory sync on Windows.** The flush after the rename runs through the same shim step as the Unix directory sync (`SyncDir`), and its failure makes the store sticky unknown like any commit failure. Whether the rename itself survives power loss is the file system's (not observable in CI, as on Unix).
+- Deletes (`remove_file`, `remove_stale_temp`, `remove_stale_temps`, and every entry of `clear_private_subdir`) open the entry with `FILE_OPEN_REPARSE_POINT` relative to its parent's handle and delete through that handle (`FileDispositionInformationEx`, `DELETE | POSIX_SEMANTICS | IGNORE_READONLY_ATTRIBUTE`): a reparse point is removed itself, never followed. `remove_file` runs the delete as shim step `Unlink`; its `SyncDir` step does nothing on Windows. `clear_private_subdir` classifies each entry on its own handle: a reparse point (junction, symlink or other) is deleted and never entered, a directory is emptied (at most 32 levels) and deleted, anything else is deleted.
+- `list` and the cache primitives keep the rules of "Cache primitives" above, with the Windows agent-file checks in place of mode and owner; `list` opens each prefixed entry for attributes and security only (no data access). Every listing reads the directory through a fresh handle (`NtCreateFile` with an empty name relative to the directory), so two listings never share an enumeration position.
+- Lock: `owner.lock` is opened `GENERIC_READ | GENERIC_WRITE` with `FILE_SHARE_READ | FILE_SHARE_WRITE` (no delete sharing), so a second opener reaches `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY)` on byte 0; `ERROR_LOCK_VIOLATION` (the Win32 form of `STATUS_LOCK_NOT_GRANTED`) and `STATUS_SHARING_VIOLATION` are `busy`, any other failure `unsafeState`. Dropping the root calls `UnlockFileEx` and then closes the handle; process exit releases it too.
+- Every handle that becomes a `std::fs::File` is opened with `SYNCHRONIZE` and `FILE_SYNCHRONOUS_IO_NONALERT`.
+- `open_read_only` applies the same checks and creates and locks nothing. Its reads open with `FILE_SHARE_DELETE`, so the resident's POSIX rename can replace the file while it is read; a link count of 0 or 1 is accepted there, 2 or more refused.
+
+### Environment
+
+`LOCALAPPDATA` is ignored: a child process with `LOCALAPPDATA` set elsewhere resolves the same root (`localappdata_does_not_change_the_root`, `tests/runtime_storage_windows_v1.rs`). The known folder is asked with the process token; `userprofile_does_not_change_the_root` asserts that a child with `USERPROFILE` set elsewhere also resolves the same root. That assertion is evidence only once windows-latest CI has run it; if it fails there, this sentence changes, not the code. Other environment variables are not measured, so on Windows no claim is made that every environment variable is ignored: a process that can set this agent's environment runs as the same user, which is a same-user non-claim.
+
+### Windows non-claims
+
+- A holder of `SeBackupPrivilege` or `SeRestorePrivilege` who is not an administrator is treated as an administrator: those privileges bypass DACLs.
+- A low-integrity process of the same user is a same-user non-claim; mandatory integrity labels are not checked or set.
+- An antivirus or indexer that holds a handle on `state.json` (or another target) without `FILE_SHARE_DELETE` makes the POSIX replace fail; the store becomes sticky unknown. This affects availability only and fails closed.
+- Durability across power loss, as on Unix, is not observable in CI; there is no directory sync.
+- **Not observable in CI:** an object owned by another account, a network volume and a volume without persistent ACLs cannot be made on a CI runner. Those three classifications go through test-only seams that force the result; the tests prove that the guard refuses the forced result, not that Windows classifies a real such object the same way. A NULL DACL, a junction, a hard link, a file symlink, an extra ACE and a re-enabled inheritance are real fixtures (`NtCreateFile` with a NULL-DACL descriptor in the test, `mklink /J`, `std::fs::hard_link`, `symlink_file`, `icacls`).
+
+### Other platforms
+
+Every target other than macOS, Linux and Windows compiles `src/secure_fs/unsupported.rs`: `SecureRoot` and `ReadOnlyRoot` wrap an uninhabited type, so every open returns `unsafeState` and no state can be read, written or served. No CI job builds such a target; it fails closed because its types are empty, not because a test shows it.
 
 ## Encoding
 
@@ -193,7 +263,7 @@ Accepted trade-off (F-07): a checkpoint taken while the OS clock is temporarily 
 
 ## Dependency provenance
 
-`tests/dependency_provenance_v1.rs` checks `Cargo.lock` against the frozen baseline and `Cargo.toml` against an allowlist of tables and keys, with every version an exact three-part pin (`=` and three numeric parts). The one exception is `tokscale-core`, a git dependency pinned by a full 40-hex `rev` that the lock must repeat (`spec/source-v1.md`). Cargo source replacement (`.cargo/config.toml`) is outside both checks. The test checks only the package (manifest) directory, `CARGO_MANIFEST_DIR`, which is the repository root today: it asserts that this directory has no `.cargo` entry. That is a tripwire against adding one there by accident, not a defence against a malicious source replacement. On Windows no test reaches the branch of the check (`no_cargo_config_in`) for a `.cargo` lookup that fails with an error other than `NotFound`: its only control, a directory without search permission, is Unix-only. The check's not-a-directory error is reached on every OS. Cargo takes configuration from many other places; per the Cargo book's configuration-discovery documentation (not measured here), examples include a `.cargo/config.toml` in the working directory and each of its parents (so cargo run from inside `tests/` would read a `tests/.cargo/`, which this test does not check), `$CARGO_HOME/config.toml`, `--config` on the command line, and `CARGO_*` environment variables.
+`tests/dependency_provenance_v1.rs` checks `Cargo.lock` against the frozen baseline and `Cargo.toml` against an allowlist of tables and keys, with every version an exact three-part pin (`=` and three numeric parts). A lock package outside the baseline is accepted only by its full (name, version, source, checksum) tuple on an allowlist, never by name, never without a source, and the allowlist must equal what the lock adds. The Windows dependency is `windows-sys = "=0.61.2"` under `[target.'cfg(windows)'.dependencies]`: that version, and the `windows-link 0.2.1` it uses, were already in the baseline, so the lock gained no package and the allowlist is empty. It replaces the `0.59.x` that the SA-2B1b contract first named (chosen then to avoid `windows-link`): 0.61.2 needs Rust 1.71 (the toolchain is 1.85), has every `Wdk` and `Win32` item used, and adds nothing to the lock (W1 r1 (d)). The one exception is `tokscale-core`, a git dependency pinned by a full 40-hex `rev` that the lock must repeat (`spec/source-v1.md`). Cargo source replacement (`.cargo/config.toml`) is outside both checks. The test checks only the package (manifest) directory, `CARGO_MANIFEST_DIR`, which is the repository root today: it asserts that this directory has no `.cargo` entry. That is a tripwire against adding one there by accident, not a defence against a malicious source replacement. On Windows no test reaches the branch of the check (`no_cargo_config_in`) for a `.cargo` lookup that fails with an error other than `NotFound`: its only control, a directory without search permission, is Unix-only. The check's not-a-directory error is reached on every OS. Cargo takes configuration from many other places; per the Cargo book's configuration-discovery documentation (not measured here), examples include a `.cargo/config.toml` in the working directory and each of its parents (so cargo run from inside `tests/` would read a `tests/.cargo/`, which this test does not check), `$CARGO_HOME/config.toml`, `--config` on the command line, and `CARGO_*` environment variables.
 
 ## Residual risks
 

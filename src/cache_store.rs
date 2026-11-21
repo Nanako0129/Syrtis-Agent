@@ -445,7 +445,10 @@ fn load(
     }))
 }
 
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    test,
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 mod tests {
     use super::*;
     use crate::{
