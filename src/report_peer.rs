@@ -1877,8 +1877,17 @@ mod receiver_tests {
         ];
         for (label, script, expected) in cases {
             let before = receive_seams::decodes();
+            // The 16 MiB case sends its whole body through Noise over
+            // loopback before the receiver can refuse it; on a loaded CI
+            // runner that outran [`SHORT`] and the fetch ended `Timeout`
+            // (PR #39, windows-latest run 44907257062; the same commit
+            // passed when rerun). No outcome here depends on time, so
+            // every case gets [`FETCH_DEADLINE`], as
+            // `a_body_costing_more_than_the_whole_ledger_is_too_large` does.
             assert_eq!(
-                run(Endpoint::Graph, &ledger, script).err(),
+                run_within(Endpoint::Graph, &ledger, FETCH_DEADLINE, script)
+                    .0
+                    .err(),
                 Some(expected),
                 "{label}"
             );
