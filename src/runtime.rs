@@ -704,9 +704,9 @@ fn cache_key(record: &PeerRecord, query: &ReportQuery) -> CacheKey {
 }
 
 /// `max(osNow, lastAcceptedWall)` in ms; `None` when the clock or the
-/// state is unreadable, or while the clock is anomalous: a cache read at a
-/// wrong time would delete entries that are still valid, and a write would
-/// stamp them with it. Housekeeping skips such a round for the same reason.
+/// state is unreadable, or while the clock is anomalous (rolled back past
+/// the tolerance): the clock is not trusted then, so the cache is neither
+/// read nor written. Housekeeping skips such a round for the same reason.
 fn effective_now_ms(inner: &Inner) -> Option<i64> {
     let os_now = inner.clock.os_now_seconds().ok()?;
     let wall = inner

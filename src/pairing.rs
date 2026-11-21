@@ -1816,7 +1816,8 @@ mod tests {
 
         /// DR-3a (d): an approval refused for an existing reason revokes
         /// nothing: wrong generation, disclosure not exact, the pending
-        /// expired (700 s, past its 600 s offer), a clock anomaly. Control:
+        /// expired (700 s, past its 600 s offer), a clock anomaly (rolled
+        /// back 1,000 s, past the 300 s tolerance). Control:
         /// the same pending approved properly revokes the older grant.
         #[test]
         fn a_refused_approval_revokes_nothing() {
@@ -1829,7 +1830,7 @@ mod tests {
                 ("generation", 2, true, NOW),
                 ("disclosure", 1, false, NOW),
                 ("expired pending", 1, true, NOW + 700),
-                ("clock anomaly", 1, true, NOW + 200_000),
+                ("clock anomaly", 1, true, NOW - 1_000),
             ];
             for (label, generation, exact, os_now) in refusals {
                 assert_eq!(

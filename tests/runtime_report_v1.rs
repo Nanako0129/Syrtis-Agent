@@ -365,15 +365,11 @@ mod disk {
             )
         }
 
-        /// Moves the OS clock and the durable wall to `target` through
-        /// checkpoints of at most a day each, so no step is a clock anomaly.
+        /// Moves the OS clock and the durable wall to `target` with one
+        /// checkpoint.
         fn advance_wall_to(&self, target: i64) {
-            let mut wall = self.clock.os();
-            while wall < target {
-                wall = (wall + 86_400).min(target);
-                self.clock.set_os(wall);
-                self.store.checkpoint(wall).unwrap();
-            }
+            self.clock.set_os(target);
+            self.store.checkpoint(target).unwrap();
         }
 
         /// Waits until every connection has returned its reservation.

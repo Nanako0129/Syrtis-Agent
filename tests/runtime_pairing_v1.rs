@@ -2067,9 +2067,10 @@ mod disk {
                 })
             );
 
-            // Clock anomaly, checked after the binding: the bound static
-            // sees `busy`, any other static still `unauthorized`.
-            clock.skew(200_000);
+            // Clock anomaly (rolled back past the 300 s tolerance), checked
+            // after the binding: the bound static sees `busy`, any other
+            // static still `unauthorized`.
+            clock.skew(-1_000);
             assert_eq!(status(&awaiting).payload, error_payload(5));
             clock.tick();
             let other = raw(port, &mallory, &responder, pair_status_json(&awaiting));
@@ -2120,8 +2121,8 @@ mod disk {
                 .unwrap();
             assert_eq!(state_of(&status(c, &grants[2])), "expired");
 
-            // Clock anomaly: forward by more than a day.
-            clock.skew(200_000);
+            // Clock anomaly: back by more than 300 s.
+            clock.skew(-1_000);
             assert_eq!(status(b, &grants[1]).payload, error_payload(5));
             assert_eq!(state_of(&status(a, &grants[0])), "revoked");
             assert_eq!(state_of(&status(c, &grants[2])), "expired");
@@ -2269,7 +2270,7 @@ mod disk {
             assert_eq!(status(&awaiting).payload, error_payload(8));
             clock.wall_fails.store(false, Ordering::SeqCst);
 
-            clock.skew(200_000);
+            clock.skew(-1_000);
             assert_eq!(status(&rejected).payload, rejected_body);
             assert_eq!(state_of(&status(&approved)), "approved");
             assert_eq!(status(&awaiting).payload, error_payload(5));

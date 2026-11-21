@@ -79,7 +79,7 @@ The listener keeps running while sharing is off: Grant status must still answer 
 One thread. A round:
 
 0. If no listener runs, `stopping` is not set, and the stored `bindHost` is set (an earlier bind failed): one run of the `listenConfigure` hook's body. This step does not depend on the clock.
-1. Reads the OS clock and the state. An unreadable clock, a sticky-unknown store, or a clock anomaly by the frozen `clock_status` (more than 300 s behind or 86,400 s ahead of the wall) skips the round: nothing is written.
+1. Reads the OS clock and the state. An unreadable clock, a sticky-unknown store, or a clock anomaly by the frozen `clock_status` (more than 300 s behind the wall) skips the round: nothing is written. A reading ahead of the wall, however far (the app was not running or the machine slept), is not an anomaly: the round's checkpoint carries the wall to it.
 2. `StateStore::checkpoint(osNow)`: the frozen `compact_terminals`, which advances the durable wall. Then the receiver cache's `purge_expired(effectiveNowMs)`.
 3. For each `active` offer or grant and each `awaitingApproval` pending whose `expiresAt` ≤ effective now (ms), one transition with the frozen `expire_one(recordId, effectiveNowMs)`.
 
@@ -100,7 +100,7 @@ Nothing depends on the sweep for authority: claim, approval, Pair and Grant stat
 
 `Runtime::ever_answered(responderStatic) -> bool` (`DR-2b`): whether the receiver cache indexes any entry of that producer, for any query or grant (`CacheStore::has_peer`, no file read). `false` without a cache or when the cache is unknown. Entries leave with a revoke or expiry (step 4), `remove_peer`, expiry or eviction, and with them this answer. Entries written under report schema 1 are deleted by the first `CacheStore::open` after the move to schema 2 (`spec/report-cache-v1.md`), so it is `false` for every producer until its next successful pull.
 
-`Runtime::last_good(responderStatic, query) -> Result<Option<CachedBody>, StorageError>`: `None` without a cache, without a readable record, when that record is not `usable`, when the OS clock or the state cannot be read, or while the clock is anomalous (a read at a wrong time would delete entries that are still valid; `pull` does not write the cache then either); otherwise `CacheStore::get` under the key built from that same record, at the effective now in ms. A revoked or expired record, or one bound to an identity from before a reset, therefore reads nothing, whatever is still on disk. A record replaced by a new pairing (another `grantId`), or removed through `PeerStore::remove` alone, builds another key or none; the old entries are left to expiry and eviction. `Runtime::remove_peer` (below) deletes them at once.
+`Runtime::last_good(responderStatic, query) -> Result<Option<CachedBody>, StorageError>`: `None` without a cache, without a readable record, when that record is not `usable`, when the OS clock or the state cannot be read, or while the clock is anomalous (rolled back past the tolerance: the clock is not trusted then; `pull` does not write the cache either); otherwise `CacheStore::get` under the key built from that same record, at the effective now in ms. A revoked or expired record, or one bound to an identity from before a reset, therefore reads nothing, whatever is still on disk. A record replaced by a new pairing (another `grantId`), or removed through `PeerStore::remove` alone, builds another key or none; the old entries are left to expiry and eviction. `Runtime::remove_peer` (below) deletes them at once.
 
 `Runtime::remove_peer(responderStatic) -> Result<(), StorageError>` (`SA-3e`): first `PeerStore::remove(responderStatic)`, durable; its error is returned and the cache is not touched. Then `CacheStore::remove_peer(peerStatic)` (lowercase hex), every entry of that producer; no cache, or a removal that fails, does not change the result, for the reason in step 4: once the record is gone no usable record names those files, and expiry or eviction deletes them. An absent producer is `Ok`, and entries left under its key are still deleted. What is deleted is the entries that exist when the removal runs. A `pull` of the same producer running at the same time took its record snapshot before the removal (step 1) and writes only after a successful fetch, so it may still write one entry afterwards; no record can read that entry, and expiry deletes it. `pull` is unchanged.
 
@@ -116,7 +116,7 @@ Nothing depends on the sweep for authority: claim, approval, Pair and Grant stat
 | 6 | `after_disable_and_enable_and_after_a_reset_new_offers_pair` |
 | 6b | `src/runtime.rs` `stop_during_a_held_listen_configure_hook_leaves_no_port_open`; `concurrent_listen_configures_end_bound_to_the_stored_address` |
 | 7 | `housekeeping_expires_offers_pending_and_grants_and_advances_the_wall` |
-| 8 | `an_anomalous_round_is_skipped_and_the_next_sane_one_sweeps`, `a_sticky_store_neither_stops_nor_spins_housekeeping` |
+| 8 | `an_anomalous_round_is_skipped_and_the_next_sane_one_sweeps`, `a_clock_two_days_ahead_is_accepted_and_offers_still_work`, `a_sticky_store_neither_stops_nor_spins_housekeeping` |
 | 9 | `stop_takes_a_final_checkpoint` |
 | 10 | `without_a_bindable_host_the_runtime_runs_control_without_a_listener` |
 | control filter | `status_and_pending_list_leave_out_what_has_expired` |
