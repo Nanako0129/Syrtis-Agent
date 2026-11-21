@@ -251,12 +251,29 @@
 # ends that device's earlier grant. spec/security-v1.md: the Approve row
 # says it is the reference transition alone and that pairing::approve
 # composes Revoke with it; the frozen transition itself is unchanged.
+#
+# W2 changed spec/control-v1.md and spec/runtime-v1.md on purpose: the
+# in-process control entry Runtime::control. spec/control-v1.md gains the
+# "In-process entry" section (the platform-independent, crate-private
+# dispatcher shared with the socket server and never given to a Listener or
+# ReportSource; the eight commands, shutdown/sharingSet/scopeApprove
+# invalid; the frozen verify_control_command on a client-built envelope and
+# verify_control_response with RESPONSE_JSON_MAX; no MAC, peer check, slot
+# or deadline, and why; the stopped flag under a read-write lock and
+# ControlError::Stopped; the caller duties) and its W2 acceptance table, and
+# the platform paragraph now says Windows uses that entry. spec/runtime-v1.md
+# states the compile-time Windows no-server rule (macOS and Linux still fail
+# the start when the server does not start), Runtime::socket_path on macOS
+# and Linux only, assembly step 3's dispatcher, stop step 1a, the into_store
+# wording, and the "In-process control" section. No wire, command ID,
+# result code, MAC or state byte changed; src/control.rs and src/runtime.rs
+# are not digest-pinned.
 4eb5d2ca0aa2906676095dd4d2450d142f15fd6e8cdfbff774ee9d7cbf2e9373  spec/cache-store-v1.md
 055a5c81aade6aec75c8f43bccb8128ab22ca1691b15b690ca833d0005176a2f  spec/install-v1.md
 14448b1b0ca3be54b08c8c13f0e267eaa12058bcd571d678a481e574d2d7859a  spec/cli-v1.md
-5e067392c4493745c43ea18da06dca5bbba1ff8a48bf5ddfddcae16036a9cdc8  spec/control-v1.md
+f14f436dccb81dfec157fa0aba8e141427bed6f9788834a91e76008705c387d1  spec/control-v1.md
 c6cfaf6793ab2d9319c461ac538c8d9e95428fdf2eebe54f630e6337673b3580  spec/pairing-v1.md
-5510c323d931128e6034b46ce261d0deed26a34fb150b867c9eb7aa527becf6c  spec/runtime-v1.md
+5b44f472d89efa4f4e381ea8eabf1cd533e6b7e9d448a02a8ce1499b11a109ee  spec/runtime-v1.md
 26b94d43b40c537b49747a23befb5e53187dbba07cb0aae399350e7f3dd42527  spec/report-peer-v1.md
 7cc4eb2a75af280535da80a2955e14af83e95b1842ad4339b9b51536c2d797ee  spec/peer-store-v1.md
 f2c1c9300b27ab7607fad510baf5380b6d4e050e483a422a3046d19b76be8de6  spec/report-cache-v1.md

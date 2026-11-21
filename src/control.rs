@@ -5,23 +5,33 @@
 //! `src/security.rs`; command and response shapes are the frozen envelopes
 //! of `spec/v1.md`, checked by `verify_control_command` and
 //! `verify_control_response`. Every state change goes through
-//! [`StateStore`] or [`crate::pairing::approve`]. macOS and Linux only;
-//! every other platform fails closed with [`ControlError::Unsupported`],
-//! like `secure_fs`. Writes no log.
+//! [`StateStore`] or [`crate::pairing::approve`]. The socket server and
+//! client are macOS and Linux only; every other platform fails closed with
+//! [`ControlError::Unsupported`], like `secure_fs`. The command dispatcher
+//! (`Shared`, `execute` and the handlers) is platform-independent and
+//! crate-private: besides the socket server, its one other caller is
+//! `Runtime::control`, the in-process entry (`W2`). Writes no log.
 
 use std::{
     fmt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, PoisonError, RwLock, RwLockReadGuard},
     time::Duration,
 };
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
-    pairing::Clock,
+    canonical::CanonicalJsonV1,
+    listener::bind_address,
+    pairing::{self, Clock},
     secure_fs::StorageError,
-    state_store::{Secret32, StateStore},
+    security::{
+        CONTROL_VERSION, GrantState, Offer, OfferState, PEER_PROTOCOL_VERSION, PairOffer, Pending,
+        PendingState, ReferenceState, SecurityError, clock_status, decode_fixed_hex, hex_encode,
+        offer_secret_hash, pair_url, verify_control_command, verify_control_response,
+    },
+    state_store::{Secret32, StateStore, StoredState, random},
 };
 
 /// The socket's name inside the secure root.
@@ -89,6 +99,9 @@ pub enum ControlError {
     ServerProof,
     /// The response failed its MAC, bound or the frozen validator.
     Response,
+    /// In-process only (`Runtime::control`): the runtime was stopped. The
+    /// command did not run. Never a wire code.
+    Stopped,
 }
 
 /// One command: its ID and its body, sent as given. The server checks the
@@ -300,7 +313,14 @@ impl Server {
         clock: Arc<dyn Clock>,
         hooks: Hooks,
     ) -> Result<Self, ControlError> {
-        imp::Server::start(store, clock, hooks).map(Self)
+        imp::Server::start(Arc::new(Shared::new(store, clock, hooks))).map(Self)
+    }
+
+    /// Serves `shared`, the dispatcher `Runtime` also runs in-process
+    /// commands on. Not on Windows, where the runtime starts no server.
+    #[cfg(not(windows))]
+    pub(crate) fn start_shared(shared: Arc<Shared>) -> Result<Self, ControlError> {
+        imp::Server::start(shared).map(Self)
     }
 
     pub fn socket_path(&self) -> &Path {
@@ -319,6 +339,439 @@ impl Server {
     }
 }
 
+/// The command dispatcher: the store, the clock and the hooks every command
+/// runs with, and the stopped flag. Crate-private, never `pub`: the socket
+/// server holds one, and a `Runtime` holds the same one for
+/// `Runtime::control`. Invariant (`spec/control-v1.md`, "In-process
+/// entry"): no `Shared`, and nothing that reaches one, is ever handed to a
+/// `Listener` or a `ReportSource`, so no peer path can run a command.
+pub(crate) struct Shared {
+    store: Arc<StateStore>,
+    clock: Arc<dyn Clock>,
+    on_shutdown: ShutdownHook,
+    on_listen_configured: ListenHook,
+    scan: ScanHook,
+    scope: ScopeHook,
+    sharing: Option<SharingHook>,
+    scope_approve: Option<ScopeApproveHook>,
+    /// `true` once [`Shared::stop`] ran. Every [`execute`], on both paths,
+    /// runs under a read guard of it; `stop` takes the write guard, so it
+    /// waits for every command in flight.
+    stopped: RwLock<bool>,
+}
+
+impl Shared {
+    pub(crate) fn new(store: Arc<StateStore>, clock: Arc<dyn Clock>, hooks: Hooks) -> Self {
+        let Hooks {
+            on_shutdown,
+            on_listen_configured,
+            scan,
+            scope,
+            sharing,
+            scope_approve,
+        } = hooks;
+        Self {
+            store,
+            clock,
+            on_shutdown,
+            on_listen_configured,
+            scan,
+            scope,
+            sharing,
+            scope_approve,
+            stopped: RwLock::new(false),
+        }
+    }
+
+    /// The read guard [`execute`] needs. A hook runs under it, so a hook
+    /// that called `Runtime::control` or `Runtime::stop` could deadlock:
+    /// hooks must do neither.
+    fn running(&self) -> RwLockReadGuard<'_, bool> {
+        self.stopped.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Waits for every command in flight (both paths), then makes every
+    /// later in-process command [`ControlError::Stopped`]. The socket path
+    /// does not read the flag: its server is stopped and joined next.
+    pub(crate) fn stop(&self) {
+        *self.stopped.write().unwrap_or_else(PoisonError::into_inner) = true;
+    }
+}
+
+/// The eight commands the in-process entry runs. `shutdown`, `sharingSet`
+/// and `scopeApprove` are `invalid` there: the owning process has the
+/// direct `Runtime` methods.
+const IN_PROCESS: [u16; 8] = [
+    STATUS,
+    OFFER_CREATE,
+    OFFER_CANCEL,
+    PENDING_LIST,
+    APPROVE,
+    REJECT,
+    REVOKE,
+    LISTEN_CONFIGURE,
+];
+
+/// The in-process entry behind `Runtime::control`. The command envelope is
+/// built as [`Client::call`] builds it and goes through the same
+/// [`answer`] (the frozen `verify_control_command`, then [`execute`]) as
+/// the socket path; the response envelope is built as the server builds it
+/// and checked as the client checks it (`RESPONSE_JSON_MAX`, the frozen
+/// `verify_control_response`). No MAC, framing, peer-UID check, slot or
+/// deadline: the caller is the process that owns the runtime.
+pub(crate) fn run_in_process(shared: &Shared, command: &Command) -> Result<Response, ControlError> {
+    let running = shared.running();
+    if *running {
+        return Err(ControlError::Stopped);
+    }
+    let request_id: [u8; 16] = random().map_err(|_| ControlError::Unavailable)?;
+    let json = command_json(command, &request_id)?;
+    let (code, data) = if IN_PROCESS.contains(&command.id) {
+        answer(shared, &running, &json, &request_id, command.id)
+    } else {
+        (INVALID, Value::Null)
+    };
+    drop(running);
+    let response = response_json(code, data, &request_id).ok_or(ControlError::Response)?;
+    if response.len() > RESPONSE_JSON_MAX {
+        return Err(ControlError::Response);
+    }
+    verify_control_response(&response, &request_id, command.id, code)
+        .map_err(|_| ControlError::Response)?;
+    let data = CanonicalJsonV1::decode_value(&response)
+        .ok()
+        .and_then(|mut value| value.get_mut("data").map(Value::take))
+        .ok_or(ControlError::Response)?;
+    Ok(Response { code, data })
+}
+
+/// The CanonicalJsonV1 command envelope, at most [`COMMAND_JSON_MAX`]
+/// bytes, as the client sends it.
+fn command_json(command: &Command, request_id: &[u8; 16]) -> Result<Vec<u8>, ControlError> {
+    let json = CanonicalJsonV1::encode(&json!({
+        "body": command.body,
+        "commandId": command.id,
+        "controlVersion": CONTROL_VERSION,
+        "requestId": hex_encode(request_id),
+    }))
+    .map_err(|_| ControlError::Command)?;
+    if json.len() > COMMAND_JSON_MAX {
+        return Err(ControlError::Command);
+    }
+    Ok(json)
+}
+
+/// The CanonicalJsonV1 response envelope, as the server sends it.
+fn response_json(code: u16, data: Value, request_id: &[u8; 16]) -> Option<Vec<u8>> {
+    CanonicalJsonV1::encode(&json!({
+        "code": code,
+        "controlVersion": CONTROL_VERSION,
+        "data": data,
+        "requestId": hex_encode(request_id),
+    }))
+    .ok()
+}
+
+/// One command envelope, on either path: the frozen
+/// `verify_control_command` (a refusal is `invalid`), then [`execute`] on
+/// its body. Error data is always `null`.
+fn answer(
+    shared: &Shared,
+    running: &RwLockReadGuard<'_, bool>,
+    json: &[u8],
+    request_id: &[u8; 16],
+    command_id: u16,
+) -> (u16, Value) {
+    match verify_control_command(json, request_id, command_id) {
+        Ok(()) => {
+            let body = CanonicalJsonV1::decode_value(json)
+                .ok()
+                .and_then(|mut value| value.get_mut("body").map(Value::take))
+                .unwrap_or(Value::Null);
+            match execute(shared, running, command_id, &body) {
+                Ok(data) => (OK, data),
+                Err(code) => (code, Value::Null),
+            }
+        }
+        Err(_) => (INVALID, Value::Null),
+    }
+}
+
+/// Runs one validated command. `Err` is the result code; error data is
+/// always `null`. `_running` is the read guard of the stopped flag, held by
+/// the caller for this whole run on both paths.
+fn execute(
+    shared: &Shared,
+    _running: &RwLockReadGuard<'_, bool>,
+    command_id: u16,
+    body: &Value,
+) -> Result<Value, u16> {
+    let store = &*shared.store;
+    let clock = &*shared.clock;
+    match command_id {
+        STATUS => {
+            let state = store.state().map_err(code_of)?;
+            let now_ms = record_ms(&state.reference, clock).map_err(|_| INTERNAL)?;
+            Ok(status(
+                &state,
+                now_ms,
+                (shared.scan)(),
+                (shared.scope)(store),
+            ))
+        }
+        OFFER_CREATE => offer_create(shared, body),
+        OFFER_CANCEL => {
+            let offer_id = id(body, "offerId")?;
+            store
+                .transition(|state| state.cancel_offer(offer_id, record_ms(state, clock)?))
+                .map_err(code_of)?;
+            Ok(Value::Null)
+        }
+        PENDING_LIST => {
+            let state = store.state().map_err(code_of)?;
+            let now_ms = record_ms(&state.reference, clock).map_err(|_| INTERNAL)?;
+            Ok(pending_list(&state, now_ms))
+        }
+        APPROVE => {
+            let (pending_id, generation) = (id(body, "pendingId")?, generation(body)?);
+            let os_now = clock.os_now_seconds().map_err(code_of)?;
+            // The server cannot see what the owner was shown; showing
+            // the disclosure and getting consent is the caller's duty.
+            pairing::approve(store, pending_id, generation, true, os_now).map_err(code_of)?;
+            Ok(Value::Null)
+        }
+        REJECT => {
+            let (pending_id, generation) = (id(body, "pendingId")?, generation(body)?);
+            store
+                .transition(|state| {
+                    state.reject_pending(pending_id, generation, record_ms(state, clock)?)
+                })
+                .map_err(code_of)?;
+            Ok(Value::Null)
+        }
+        REVOKE => {
+            let grant_id = id(body, "grantId")?;
+            store
+                .transition(|state| state.revoke_commit(grant_id, record_ms(state, clock)?))
+                .map_err(code_of)?;
+            Ok(Value::Null)
+        }
+        LISTEN_CONFIGURE => {
+            let host = body
+                .get("bindHost")
+                .and_then(Value::as_str)
+                .ok_or(INVALID)?;
+            let port = body
+                .get("bindPort")
+                .and_then(Value::as_u64)
+                .and_then(|port| u16::try_from(port).ok())
+                .ok_or(INVALID)?;
+            // The listener's own rule, not a copy: the frozen validator
+            // and the store accept hostnames the listener never binds.
+            bind_address(host, port).map_err(|_| INVALID)?;
+            let label = store.state().map_err(code_of)?.config.node_label;
+            store
+                .set_listen_config(Some(host.to_owned()), port, label)
+                .map_err(code_of)?;
+            // Before the reply: once the client sees `ok`, the listener
+            // already serves the new address (or is stopped).
+            (shared.on_listen_configured)();
+            Ok(Value::Null)
+        }
+        SHUTDOWN => Ok(Value::Null),
+        // The effect is the hook's, never a transition here: the
+        // runtime's enable gate and F-7 disable, the agent's scope
+        // approval. Without a hook: `internal`, nothing written.
+        SHARING_SET => {
+            let hook = shared.sharing.as_ref().ok_or(INTERNAL)?;
+            let enabled = body
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .ok_or(INVALID)?;
+            hook(enabled).map_err(code_of)?;
+            Ok(Value::Null)
+        }
+        SCOPE_APPROVE => {
+            let hook = shared.scope_approve.as_ref().ok_or(INTERNAL)?;
+            let digest = body
+                .get("ownerInputsSha256")
+                .and_then(Value::as_str)
+                .ok_or(INVALID)?;
+            hook(store, digest).map_err(code_of)?;
+            Ok(Value::Null)
+        }
+        _ => Err(INVALID),
+    }
+}
+
+fn offer_create(shared: &Shared, body: &Value) -> Result<Value, u16> {
+    let ttl_ms = body
+        .get("ttlSeconds")
+        .and_then(Value::as_u64)
+        .and_then(|ttl| i64::try_from(ttl).ok())
+        .and_then(|ttl| ttl.checked_mul(1_000))
+        .ok_or(INVALID)?;
+    let state = shared.store.state().map_err(code_of)?;
+    let (host, port) = (state.config.bind_host.clone(), state.config.bind_port);
+    let host = host.ok_or(INVALID)?;
+    bind_address(&host, port).map_err(|_| INVALID)?;
+    // The identity as of now: a reset after this turns sharing off, so
+    // the frozen `create_offer` below refuses an offer bound to it.
+    let responder = state.identity_public().map_err(code_of)?;
+    drop(state);
+    let offer_id: [u8; 16] = random().map_err(code_of)?;
+    let secret = Secret32::new(random().map_err(code_of)?);
+    let os_now = shared.clock.os_now_seconds().map_err(code_of)?;
+    let mut expires_at = 0;
+    shared
+        .store
+        .transition(|state| {
+            let now_ms = clock_status(os_now, state.last_accepted_wall_unix_seconds())
+                .effective_now
+                .checked_mul(1_000)
+                .ok_or(SecurityError::Bounds)?;
+            expires_at = now_ms.checked_add(ttl_ms).ok_or(SecurityError::Bounds)?;
+            state.create_offer(
+                Offer {
+                    offer_id,
+                    secret_hash: offer_secret_hash(&offer_id, secret.expose(), &responder),
+                    created_at_ms: now_ms,
+                    expires_at_ms: expires_at,
+                    state: OfferState::Active,
+                },
+                os_now,
+            )
+        })
+        .map_err(code_of)?;
+    // The frozen `PairOffer` derives a `Debug` that prints the secret:
+    // it lives only as this temporary.
+    let url = pair_url(&PairOffer {
+        expires_at,
+        host,
+        offer_id: hex_encode(&offer_id),
+        port,
+        responder_static: hex_encode(&responder),
+        secret: hex_encode(secret.expose()),
+        version: PEER_PROTOCOL_VERSION,
+    })
+    .map_err(|_| INTERNAL)?;
+    Ok(json!({
+        "expiresAt": expires_at,
+        "offerId": hex_encode(&offer_id),
+        "pairUrl": url,
+    }))
+}
+
+/// `now_ms` is [`record_ms`]: offers and pending records past their
+/// `expiresAt` by then are left out even before the housekeeping sweep
+/// stores them as expired. Grants are counted as stored.
+fn status(state: &StoredState, now_ms: i64, scan: ScanStatus, scope_approved: bool) -> Value {
+    let reference = &state.reference;
+    let mut families = scan.families;
+    families.sort_unstable();
+    families.dedup();
+    families.truncate(128);
+    json!({
+        "activeGrantCount": reference
+            .grants
+            .iter()
+            .filter(|grant| grant.state == GrantState::Active)
+            .count(),
+        "activeOfferCount": reference
+            .offers
+            .iter()
+            .filter(|offer| offer.state == OfferState::Active && now_ms < offer.expires_at_ms)
+            .count(),
+        "bindHost": state.config.bind_host,
+        "bindPort": state.config.bind_port,
+        "lastScanAt": scan.last_scan_at,
+        "nodeLabel": state.config.node_label,
+        "pendingCount": reference
+            .pending
+            .iter()
+            .filter(|pending| awaiting(pending, now_ms))
+            .count(),
+        "scanStatus": match scan.state {
+            ScanState::Never => "never",
+            ScanState::Ok => "ok",
+            ScanState::Error => "error",
+        },
+        "scopeApproved": scope_approved,
+        "sharingEnabled": reference.sharing_enabled,
+        "sourceFamilies": families,
+    })
+}
+
+/// Awaiting approval and not past `expiresAt` at `now_ms`.
+fn awaiting(pending: &Pending, now_ms: i64) -> bool {
+    pending.state == PendingState::AwaitingApproval && now_ms < pending.expires_at_ms
+}
+
+fn pending_list(state: &StoredState, now_ms: i64) -> Value {
+    let mut listed: Vec<_> = state
+        .reference
+        .pending
+        .iter()
+        .filter(|pending| awaiting(pending, now_ms))
+        .collect();
+    listed.sort_by_key(|pending| pending.pending_id);
+    listed
+        .into_iter()
+        .map(|pending| {
+            json!({
+                "expiresAt": pending.expires_at_ms,
+                "pendingId": hex_encode(&pending.pending_id),
+                "sasCode": pending.sas_code,
+            })
+        })
+        .collect()
+}
+
+/// A terminal record's timestamp: the effective now, or the durable
+/// wall while the OS clock is unavailable or anomalous. Never refuses
+/// for the clock, so a revoke never waits on it.
+fn record_ms(state: &ReferenceState, clock: &dyn Clock) -> Result<i64, SecurityError> {
+    let wall = state.last_accepted_wall_unix_seconds();
+    let now = clock.os_now_seconds().map_or(wall, |os_now| {
+        let status = clock_status(os_now, wall);
+        if status.anomaly {
+            wall
+        } else {
+            status.effective_now
+        }
+    });
+    now.checked_mul(1_000).ok_or(SecurityError::Bounds)
+}
+
+fn id(body: &Value, key: &str) -> Result<[u8; 16], u16> {
+    body.get(key)
+        .and_then(Value::as_str)
+        .and_then(|value| decode_fixed_hex(value).ok())
+        .ok_or(INVALID)
+}
+
+fn generation(body: &Value) -> Result<u64, u16> {
+    body.get("sasGeneration")
+        .and_then(Value::as_u64)
+        .ok_or(INVALID)
+}
+
+/// Local control may say `unsafeState`; the peer wire folds it into
+/// `internal`.
+fn code_of(error: StorageError) -> u16 {
+    match error {
+        StorageError::Refused(SecurityError::Unauthorized) => UNAUTHORIZED,
+        StorageError::Refused(SecurityError::Expired) => EXPIRED,
+        StorageError::Refused(_) => INVALID,
+        StorageError::Busy => BUSY,
+        StorageError::UnsafeState => UNSAFE_STATE,
+        StorageError::Unknown
+        | StorageError::Incompatible
+        | StorageError::Corrupt
+        | StorageError::Unavailable => INTERNAL,
+    }
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod imp {
     use std::convert::Infallible;
@@ -328,11 +781,9 @@ mod imp {
     pub(super) struct Server(Infallible);
 
     impl Server {
-        pub(super) fn start(
-            _: Arc<StateStore>,
-            _: Arc<dyn Clock>,
-            _: Hooks,
-        ) -> Result<Self, ControlError> {
+        pub(super) fn start(shared: Arc<Shared>) -> Result<Self, ControlError> {
+            // Fails closed; only the socket server runs the shutdown hook.
+            let _ = &shared.on_shutdown;
             Err(ControlError::Unsupported)
         }
 
@@ -371,29 +822,16 @@ mod imp {
             },
         },
         sync::{
-            Mutex, MutexGuard, PoisonError,
+            Mutex, MutexGuard,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         thread::{self, JoinHandle},
         time::Instant,
     };
 
-    use serde_json::json;
-
     use super::*;
-    use crate::{
-        canonical::CanonicalJsonV1,
-        listener::bind_address,
-        pairing,
-        secure_fs::StorageError,
-        security::{
-            CONTROL_VERSION, GrantState, Offer, OfferState, PEER_PROTOCOL_VERSION, PairOffer,
-            Pending, PendingState, ReferenceState, SecurityError, clock_status,
-            control_command_mac, control_key, control_response_mac, control_server_mac,
-            decode_fixed_hex, hex_encode, offer_secret_hash, pair_url, verify_control_command,
-            verify_control_response, verify_mac,
-        },
-        state_store::{StoredState, random},
+    use crate::security::{
+        control_command_mac, control_key, control_response_mac, control_server_mac, verify_mac,
     };
 
     // ponytail: polling accept like the peer listener; poll(2) if idle
@@ -405,16 +843,10 @@ mod imp {
     const RESPONSE_HEADER_LEN: usize = 2 + 4;
     const MAC_LEN: usize = 32;
 
-    /// What every connection thread shares.
-    struct Shared {
-        store: Arc<StateStore>,
-        clock: Arc<dyn Clock>,
-        on_shutdown: ShutdownHook,
-        on_listen_configured: ListenHook,
-        scan: ScanHook,
-        scope: ScopeHook,
-        sharing: Option<SharingHook>,
-        scope_approve: Option<ScopeApproveHook>,
+    /// What every connection thread shares: the dispatcher, plus what only
+    /// the socket has.
+    struct Serving {
+        shared: Arc<Shared>,
         /// The pre-auth memory ledger, in bytes.
         memory: AtomicUsize,
         /// A `try_clone` of each connection, so `stop` can shut it down;
@@ -426,36 +858,25 @@ mod imp {
         peer_uid: Option<libc::uid_t>,
     }
 
+    impl std::ops::Deref for Serving {
+        type Target = Shared;
+
+        fn deref(&self) -> &Shared {
+            &self.shared
+        }
+    }
+
     pub(super) struct Server {
         path: PathBuf,
-        shared: Arc<Shared>,
+        shared: Arc<Serving>,
         stop: Arc<AtomicBool>,
         accept: Option<JoinHandle<()>>,
     }
 
     impl Server {
-        pub(super) fn start(
-            store: Arc<StateStore>,
-            clock: Arc<dyn Clock>,
-            hooks: Hooks,
-        ) -> Result<Self, ControlError> {
-            let Hooks {
-                on_shutdown,
-                on_listen_configured,
-                scan,
-                scope,
-                sharing,
-                scope_approve,
-            } = hooks;
-            Self::spawn(Shared {
-                store,
-                clock,
-                on_shutdown,
-                on_listen_configured,
-                scan,
-                scope,
-                sharing,
-                scope_approve,
+        pub(super) fn start(shared: Arc<Shared>) -> Result<Self, ControlError> {
+            Self::spawn(Serving {
+                shared,
                 memory: AtomicUsize::new(0),
                 live: Mutex::new(HashMap::new()),
                 #[cfg(test)]
@@ -463,7 +884,7 @@ mod imp {
             })
         }
 
-        fn spawn(shared: Shared) -> Result<Self, ControlError> {
+        fn spawn(shared: Serving) -> Result<Self, ControlError> {
             let path = shared.store.root().path().join(SOCKET_NAME);
             SocketAddr::from_pathname(&path).map_err(|_| ControlError::PathTooLong)?;
             clear_residue(&path)?;
@@ -534,7 +955,7 @@ mod imp {
         unsafe { libc::geteuid() }
     }
 
-    fn accept_loop(listener: UnixListener, shared: &Arc<Shared>, stop: &AtomicBool) {
+    fn accept_loop(listener: UnixListener, shared: &Arc<Serving>, stop: &AtomicBool) {
         let mut workers: Vec<JoinHandle<()>> = Vec::new();
         let mut next_id: u64 = 0;
         while !stop.load(Ordering::SeqCst) {
@@ -566,7 +987,7 @@ mod imp {
     }
 
     fn peer_uid(
-        #[cfg_attr(not(test), allow(unused_variables))] shared: &Shared,
+        #[cfg_attr(not(test), allow(unused_variables))] shared: &Serving,
         stream: &UnixStream,
     ) -> Option<libc::uid_t> {
         #[cfg(test)]
@@ -603,7 +1024,7 @@ mod imp {
     /// Takes a slot and spawns the worker, or closes the stream unread when
     /// all [`PRE_AUTH_CONNECTIONS`] slots are taken.
     fn admit(
-        shared: &Arc<Shared>,
+        shared: &Arc<Serving>,
         id: u64,
         stream: UnixStream,
         accepted: Instant,
@@ -631,7 +1052,7 @@ mod imp {
     }
 
     /// Frees the slot when the worker ends, panic included.
-    struct Slot<'a>(&'a Shared, u64);
+    struct Slot<'a>(&'a Serving, u64);
 
     impl Drop for Slot<'_> {
         fn drop(&mut self) {
@@ -672,7 +1093,7 @@ mod imp {
     /// One connection. `None` closes it without a response: a wrong
     /// version, a deadline, EOF, an oversize length, a failed MAC, or an
     /// unreadable state.
-    fn serve(shared: &Shared, stream: &mut UnixStream, accepted: Instant) -> Option<()> {
+    fn serve(shared: &Serving, stream: &mut UnixStream, accepted: Instant) -> Option<()> {
         // Deadline I/O is non-blocking plus poll(2) (`read_by`).
         stream.set_nonblocking(true).ok()?;
         let mut hello = [0; HELLO_LEN];
@@ -729,26 +1150,11 @@ mod imp {
             return None;
         }
 
-        let (code, data) = match verify_control_command(json, &request_id, command_id) {
-            Ok(()) => {
-                let body = CanonicalJsonV1::decode_value(json)
-                    .ok()
-                    .and_then(|mut value| value.get_mut("body").map(Value::take))
-                    .unwrap_or(Value::Null);
-                match execute(shared, command_id, &body) {
-                    Ok(data) => (OK, data),
-                    Err(code) => (code, Value::Null),
-                }
-            }
-            Err(_) => (INVALID, Value::Null),
+        let (code, data) = {
+            let running = shared.running();
+            answer(shared, &running, json, &request_id, command_id)
         };
-        let response = CanonicalJsonV1::encode(&json!({
-            "code": code,
-            "controlVersion": CONTROL_VERSION,
-            "data": data,
-            "requestId": hex_encode(&request_id),
-        }))
-        .ok()?;
+        let response = response_json(code, data, &request_id)?;
         let mac = control_response_mac(
             &key,
             CONTROL_VERSION,
@@ -769,275 +1175,6 @@ mod imp {
             (shared.on_shutdown)();
         }
         written.ok()
-    }
-
-    /// Runs one validated command. `Err` is the result code; error data is
-    /// always `null`.
-    fn execute(shared: &Shared, command_id: u16, body: &Value) -> Result<Value, u16> {
-        let store = &*shared.store;
-        let clock = &*shared.clock;
-        match command_id {
-            STATUS => {
-                let state = store.state().map_err(code_of)?;
-                let now_ms = record_ms(&state.reference, clock).map_err(|_| INTERNAL)?;
-                Ok(status(
-                    &state,
-                    now_ms,
-                    (shared.scan)(),
-                    (shared.scope)(store),
-                ))
-            }
-            OFFER_CREATE => offer_create(shared, body),
-            OFFER_CANCEL => {
-                let offer_id = id(body, "offerId")?;
-                store
-                    .transition(|state| state.cancel_offer(offer_id, record_ms(state, clock)?))
-                    .map_err(code_of)?;
-                Ok(Value::Null)
-            }
-            PENDING_LIST => {
-                let state = store.state().map_err(code_of)?;
-                let now_ms = record_ms(&state.reference, clock).map_err(|_| INTERNAL)?;
-                Ok(pending_list(&state, now_ms))
-            }
-            APPROVE => {
-                let (pending_id, generation) = (id(body, "pendingId")?, generation(body)?);
-                let os_now = clock.os_now_seconds().map_err(code_of)?;
-                // The server cannot see what the owner was shown; showing
-                // the disclosure and getting consent is the caller's duty.
-                pairing::approve(store, pending_id, generation, true, os_now).map_err(code_of)?;
-                Ok(Value::Null)
-            }
-            REJECT => {
-                let (pending_id, generation) = (id(body, "pendingId")?, generation(body)?);
-                store
-                    .transition(|state| {
-                        state.reject_pending(pending_id, generation, record_ms(state, clock)?)
-                    })
-                    .map_err(code_of)?;
-                Ok(Value::Null)
-            }
-            REVOKE => {
-                let grant_id = id(body, "grantId")?;
-                store
-                    .transition(|state| state.revoke_commit(grant_id, record_ms(state, clock)?))
-                    .map_err(code_of)?;
-                Ok(Value::Null)
-            }
-            LISTEN_CONFIGURE => {
-                let host = body
-                    .get("bindHost")
-                    .and_then(Value::as_str)
-                    .ok_or(INVALID)?;
-                let port = body
-                    .get("bindPort")
-                    .and_then(Value::as_u64)
-                    .and_then(|port| u16::try_from(port).ok())
-                    .ok_or(INVALID)?;
-                // The listener's own rule, not a copy: the frozen validator
-                // and the store accept hostnames the listener never binds.
-                bind_address(host, port).map_err(|_| INVALID)?;
-                let label = store.state().map_err(code_of)?.config.node_label;
-                store
-                    .set_listen_config(Some(host.to_owned()), port, label)
-                    .map_err(code_of)?;
-                // Before the reply: once the client sees `ok`, the listener
-                // already serves the new address (or is stopped).
-                (shared.on_listen_configured)();
-                Ok(Value::Null)
-            }
-            SHUTDOWN => Ok(Value::Null),
-            // The effect is the hook's, never a transition here: the
-            // runtime's enable gate and F-7 disable, the agent's scope
-            // approval. Without a hook: `internal`, nothing written.
-            SHARING_SET => {
-                let hook = shared.sharing.as_ref().ok_or(INTERNAL)?;
-                let enabled = body
-                    .get("enabled")
-                    .and_then(Value::as_bool)
-                    .ok_or(INVALID)?;
-                hook(enabled).map_err(code_of)?;
-                Ok(Value::Null)
-            }
-            SCOPE_APPROVE => {
-                let hook = shared.scope_approve.as_ref().ok_or(INTERNAL)?;
-                let digest = body
-                    .get("ownerInputsSha256")
-                    .and_then(Value::as_str)
-                    .ok_or(INVALID)?;
-                hook(store, digest).map_err(code_of)?;
-                Ok(Value::Null)
-            }
-            _ => Err(INVALID),
-        }
-    }
-
-    fn offer_create(shared: &Shared, body: &Value) -> Result<Value, u16> {
-        let ttl_ms = body
-            .get("ttlSeconds")
-            .and_then(Value::as_u64)
-            .and_then(|ttl| i64::try_from(ttl).ok())
-            .and_then(|ttl| ttl.checked_mul(1_000))
-            .ok_or(INVALID)?;
-        let state = shared.store.state().map_err(code_of)?;
-        let (host, port) = (state.config.bind_host.clone(), state.config.bind_port);
-        let host = host.ok_or(INVALID)?;
-        bind_address(&host, port).map_err(|_| INVALID)?;
-        // The identity as of now: a reset after this turns sharing off, so
-        // the frozen `create_offer` below refuses an offer bound to it.
-        let responder = state.identity_public().map_err(code_of)?;
-        drop(state);
-        let offer_id: [u8; 16] = random().map_err(code_of)?;
-        let secret = Secret32::new(random().map_err(code_of)?);
-        let os_now = shared.clock.os_now_seconds().map_err(code_of)?;
-        let mut expires_at = 0;
-        shared
-            .store
-            .transition(|state| {
-                let now_ms = clock_status(os_now, state.last_accepted_wall_unix_seconds())
-                    .effective_now
-                    .checked_mul(1_000)
-                    .ok_or(SecurityError::Bounds)?;
-                expires_at = now_ms.checked_add(ttl_ms).ok_or(SecurityError::Bounds)?;
-                state.create_offer(
-                    Offer {
-                        offer_id,
-                        secret_hash: offer_secret_hash(&offer_id, secret.expose(), &responder),
-                        created_at_ms: now_ms,
-                        expires_at_ms: expires_at,
-                        state: OfferState::Active,
-                    },
-                    os_now,
-                )
-            })
-            .map_err(code_of)?;
-        // The frozen `PairOffer` derives a `Debug` that prints the secret:
-        // it lives only as this temporary.
-        let url = pair_url(&PairOffer {
-            expires_at,
-            host,
-            offer_id: hex_encode(&offer_id),
-            port,
-            responder_static: hex_encode(&responder),
-            secret: hex_encode(secret.expose()),
-            version: PEER_PROTOCOL_VERSION,
-        })
-        .map_err(|_| INTERNAL)?;
-        Ok(json!({
-            "expiresAt": expires_at,
-            "offerId": hex_encode(&offer_id),
-            "pairUrl": url,
-        }))
-    }
-
-    /// `now_ms` is [`record_ms`]: offers and pending records past their
-    /// `expiresAt` by then are left out even before the housekeeping sweep
-    /// stores them as expired. Grants are counted as stored.
-    fn status(state: &StoredState, now_ms: i64, scan: ScanStatus, scope_approved: bool) -> Value {
-        let reference = &state.reference;
-        let mut families = scan.families;
-        families.sort_unstable();
-        families.dedup();
-        families.truncate(128);
-        json!({
-            "activeGrantCount": reference
-                .grants
-                .iter()
-                .filter(|grant| grant.state == GrantState::Active)
-                .count(),
-            "activeOfferCount": reference
-                .offers
-                .iter()
-                .filter(|offer| offer.state == OfferState::Active && now_ms < offer.expires_at_ms)
-                .count(),
-            "bindHost": state.config.bind_host,
-            "bindPort": state.config.bind_port,
-            "lastScanAt": scan.last_scan_at,
-            "nodeLabel": state.config.node_label,
-            "pendingCount": reference
-                .pending
-                .iter()
-                .filter(|pending| awaiting(pending, now_ms))
-                .count(),
-            "scanStatus": match scan.state {
-                ScanState::Never => "never",
-                ScanState::Ok => "ok",
-                ScanState::Error => "error",
-            },
-            "scopeApproved": scope_approved,
-            "sharingEnabled": reference.sharing_enabled,
-            "sourceFamilies": families,
-        })
-    }
-
-    /// Awaiting approval and not past `expiresAt` at `now_ms`.
-    fn awaiting(pending: &Pending, now_ms: i64) -> bool {
-        pending.state == PendingState::AwaitingApproval && now_ms < pending.expires_at_ms
-    }
-
-    fn pending_list(state: &StoredState, now_ms: i64) -> Value {
-        let mut listed: Vec<_> = state
-            .reference
-            .pending
-            .iter()
-            .filter(|pending| awaiting(pending, now_ms))
-            .collect();
-        listed.sort_by_key(|pending| pending.pending_id);
-        listed
-            .into_iter()
-            .map(|pending| {
-                json!({
-                    "expiresAt": pending.expires_at_ms,
-                    "pendingId": hex_encode(&pending.pending_id),
-                    "sasCode": pending.sas_code,
-                })
-            })
-            .collect()
-    }
-
-    /// A terminal record's timestamp: the effective now, or the durable
-    /// wall while the OS clock is unavailable or anomalous. Never refuses
-    /// for the clock, so a revoke never waits on it.
-    fn record_ms(state: &ReferenceState, clock: &dyn Clock) -> Result<i64, SecurityError> {
-        let wall = state.last_accepted_wall_unix_seconds();
-        let now = clock.os_now_seconds().map_or(wall, |os_now| {
-            let status = clock_status(os_now, wall);
-            if status.anomaly {
-                wall
-            } else {
-                status.effective_now
-            }
-        });
-        now.checked_mul(1_000).ok_or(SecurityError::Bounds)
-    }
-
-    fn id(body: &Value, key: &str) -> Result<[u8; 16], u16> {
-        body.get(key)
-            .and_then(Value::as_str)
-            .and_then(|value| decode_fixed_hex(value).ok())
-            .ok_or(INVALID)
-    }
-
-    fn generation(body: &Value) -> Result<u64, u16> {
-        body.get("sasGeneration")
-            .and_then(Value::as_u64)
-            .ok_or(INVALID)
-    }
-
-    /// Local control may say `unsafeState`; the peer wire folds it into
-    /// `internal`.
-    fn code_of(error: StorageError) -> u16 {
-        match error {
-            StorageError::Refused(SecurityError::Unauthorized) => UNAUTHORIZED,
-            StorageError::Refused(SecurityError::Expired) => EXPIRED,
-            StorageError::Refused(_) => INVALID,
-            StorageError::Busy => BUSY,
-            StorageError::UnsafeState => UNSAFE_STATE,
-            StorageError::Unknown
-            | StorageError::Incompatible
-            | StorageError::Corrupt
-            | StorageError::Unavailable => INTERNAL,
-        }
     }
 
     pub(super) fn call(client: &Client, command: &Command) -> Result<Response, ControlError> {
@@ -1061,16 +1198,7 @@ mod imp {
         }
 
         let request_id: [u8; 16] = random().map_err(|_| ControlError::Unavailable)?;
-        let json = CanonicalJsonV1::encode(&json!({
-            "body": command.body,
-            "commandId": command.id,
-            "controlVersion": CONTROL_VERSION,
-            "requestId": hex_encode(&request_id),
-        }))
-        .map_err(|_| ControlError::Command)?;
-        if json.len() > COMMAND_JSON_MAX {
-            return Err(ControlError::Command);
-        }
+        let json = command_json(command, &request_id)?;
         let mac = control_command_mac(
             &key,
             CONTROL_VERSION,
@@ -1246,15 +1374,19 @@ mod imp {
             let root = SecureRoot::open_under(&home.0, &["r"]).unwrap();
             let store = Arc::new(StateStore::open(root, 1_700_000_000).unwrap());
             let foreign = euid().wrapping_add(1);
-            let mut server = Server::spawn(Shared {
-                store,
-                clock: Arc::new(SystemClock),
-                on_shutdown: Arc::new(|| {}),
-                on_listen_configured: Arc::new(|| {}),
-                scan: Arc::new(ScanStatus::default),
-                scope: Arc::new(|_| false),
-                sharing: None,
-                scope_approve: None,
+            let mut server = Server::spawn(Serving {
+                shared: Arc::new(Shared::new(
+                    store,
+                    Arc::new(SystemClock),
+                    Hooks {
+                        on_shutdown: Arc::new(|| {}),
+                        on_listen_configured: Arc::new(|| {}),
+                        scan: Arc::new(ScanStatus::default),
+                        scope: Arc::new(|_| false),
+                        sharing: None,
+                        scope_approve: None,
+                    },
+                )),
                 memory: AtomicUsize::new(0),
                 live: Mutex::new(HashMap::new()),
                 peer_uid: Some(foreign),

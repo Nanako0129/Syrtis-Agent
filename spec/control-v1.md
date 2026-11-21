@@ -4,7 +4,7 @@
 
 This document fixes the local control wire: how a program of the same user (the CLI or the App) reaches the agent over a Unix domain socket, how both sides prove they hold the control token, and what each of the eleven control commands does. Implementation: `src/control.rs`. The command and response envelopes, the result codes and the success data shapes are frozen in `spec/v1.md` ("Control bodies and results"); the MAC constructions and their domain tags are frozen in `spec/security-v1.md` and `src/security.rs` (`control_key`, `control_server_mac`, `control_command_mac`, `control_response_mac`, `verify_control_command`, `verify_control_response`, `verify_mac`). This wire adds no cryptography: its byte framing only carries the inputs of those functions.
 
-macOS and Linux only. Every other platform, Windows included, fails closed: the server does not start and the client does not connect (`Unsupported`). The Windows named pipe is deferred with Windows storage (before `SA-4`).
+The socket server and client are macOS and Linux only. Every other platform, Windows included, fails closed: the server does not start and the client does not connect (`Unsupported`). A Windows named pipe is not in this version. On Windows the embedding App runs commands through the in-process entry `Runtime::control` instead (`W2`, "In-process entry" below); the command dispatcher behind both is platform-independent.
 
 The `Runtime` that assembles store, listener and control (`SA-2B2c2`, `spec/runtime-v1.md`) owns what this wire leaves to its hooks: the real effect of `shutdown`, restarting the peer listener after `listenConfigure`, the sharing enable and disable entry points with the F-7 disable composition (command 10 `sharingSet` reaches them through a hook, `SA-2C2b`), scope approval (command 11 `scopeApprove`, through the agent's hook), and the SEC-SPLIT-02 checkpoint and `expire_one` schedule.
 
@@ -52,6 +52,22 @@ One command per connection. All integers are big-endian.
 **Deadlines.** Absolute, on the monotonic clock; partial bytes never extend them. Accept → complete hello: 2 s. Server proof written → complete command: 2 s. Response write: 2 s. A timeout, EOF or MAC failure returns the slot and the memory. The client has one 10 s deadline for the whole call. Both sides wait with non-blocking sockets and `poll(2)`, not socket timeouts (macOS refuses `setsockopt` with `EINVAL` once the peer has closed, even while its last bytes are unread).
 
 **Replay.** A recorded hello, command or response cannot be replayed: each MAC binds the fresh `serverNonce` (and the client's `clientNonce`).
+
+## In-process entry (`W2`)
+
+`Runtime::control(&self, command: &Command) -> Result<Response, ControlError>` (`spec/runtime-v1.md`) is the one public in-process entry; there is no `control::Local` and no other public way to reach the dispatcher. It exists so the Windows App, which has no control endpoint in this version, can run the commands the macOS App sends over its own socket. It is available on every platform the runtime starts on.
+
+**Same dispatcher.** The dispatcher (`Shared`: the store, the clock, the hooks and a stopped flag) and `execute` with its handlers are platform-independent and crate-private (`pub(crate)`, never `pub`). The runtime builds one `Shared`, the control server serves it, and `Runtime::control` runs on the same one: the same handlers, the same `listenConfigure`, scan and scope hooks, the same store error mapping, the same result codes and success data. **Invariant:** no `Shared`, and nothing that reaches one, is ever given to a `Listener` or a `ReportSource`; the runtime keeps it in a field of `Runtime` itself, not in the state its hooks and listener share, so no peer path can run a control command.
+
+**Command set.** Exactly the eight commands `status`, `offerCreate`, `offerCancel`, `pendingList`, `approve`, `reject`, `revoke`, `listenConfigure`. Any other ID, including `shutdown` (9), `sharingSet` (10) and `scopeApprove` (11), is answered 1 `invalid` with `null` data and nothing runs: the owning process has the direct methods (`Runtime::stop`, `Runtime::enable_sharing` / `disable_sharing`, the agent's scope approval).
+
+**What it keeps.** The command envelope is built as the client builds it (CanonicalJsonV1 `{body, commandId, controlVersion, requestId}`, a fresh CSPRNG `requestId`, at most 4,096 bytes; over that, or a body that does not encode, is `ControlError::Command` and nothing runs) and goes through the same code as step 5 of the socket: the frozen `verify_control_command(commandJson, requestId, commandId)` (a refusal is `invalid`, so every validator bound applies, such as `ttlSeconds` 1..=900 and the `bindPort` range), then `execute` on its body. The response envelope is built as the server builds it and checked as the client checks it (step 7): at most 65,536 bytes and the frozen `verify_control_response`; a failure is `ControlError::Response` (the command may have run).
+
+**What it skips, and why.** No MAC, no framing, no peer-UID check, no slot or pre-auth ledger, no deadline: the caller is the process that owns the `Runtime`, which already holds the store and the token. The control token is still generated and stored on every platform (it is part of the state schema), but on Windows nothing reads it.
+
+**Stop.** The dispatcher's stopped flag sits under a read-write lock. `execute` runs under a read guard on both paths: the socket path takes it around step 5, the in-process entry for its whole call. `Runtime::stop`, after asking for shutdown, takes the write guard, so it waits for every command in flight on either path, then sets the flag. From then on `Runtime::control` returns `ControlError::Stopped`, a Rust-level error and never a wire code, and runs nothing. The socket path does not read the flag; its server is stopped and joined in the next step, as before.
+
+**Caller duties.** The in-process call has no deadline: a store commit, the `listenConfigure` listener restart and the scan and scope hooks can block, so it must not be called on a UI thread (the socket path's client gives up after 10 s). Before `approve`, showing the owner the SAS and getting their confirmation that it matches is the caller's obligation, as on the socket. A hook runs under the read guard, so a hook must never call `Runtime::control` or `Runtime::stop`.
 
 ## Commands
 
@@ -121,3 +137,14 @@ The token, the offer secret and the Pair URL never appear in a `Debug` output or
 | `SA-0G` | `without_hooks_sharing_set_and_scope_approve_are_internal_and_change_nothing`, `status_reports_scope_approved_from_its_provider` |
 | `SA-2C2b` | `sharing_set_runs_the_runtime_gate_and_maps_its_errors`; dispatch of 10 and 11 to their hooks: `each_command_succeeds_and_each_validator_refusal_is_invalid`; `scopeApprove` and `scopeApproved`: `tests/agent_v1.rs` `live::scope_approve_over_control_needs_the_running_digest_and_ends_earlier_grants`, `live::status_scope_approved_matches_what_report_serves` |
 | `SA-2B2c2` | The expiry filter of `status` and `pendingList`: `tests/runtime_lifecycle_v1.rs` `status_and_pending_list_leave_out_what_has_expired`; the hooks: that file and `spec/runtime-v1.md` |
+
+`W2` (in-process entry; `tests/runtime_control_local_v1.rs` unless noted; macOS and Linux until `W3` extends them to Windows, whose storage still fails closed):
+
+| Item | Test |
+|---|---|
+| The eight commands answer as over the socket | `each_of_the_eight_commands_answers_in_process_as_over_the_socket` |
+| The frozen validator runs (`ttlSeconds` 901, an extra key, the size bound) | `the_frozen_validator_refuses_in_process_and_nothing_is_stored` (with the validator call removed from the in-process path, it fails: executor report) |
+| `shutdown`, `sharingSet`, `scopeApprove` refused | `shutdown_sharing_set_and_scope_approve_are_invalid_in_process` |
+| `Stopped` after `stop` | `a_call_after_stop_is_stopped` |
+| `stop` waits for an in-process hook | `src/runtime.rs` `stop_during_a_held_in_process_listen_configure_leaves_no_port_open` |
+| No server is only a Windows build: elsewhere a bad socket path fails the start | `a_non_socket_at_the_control_path_fails_the_start_and_binds_no_port` |
