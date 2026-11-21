@@ -15,7 +15,7 @@ unicode-normalization = { version = "=0.1.25", default-features = false, feature
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "=0.2.189", default-features = false }
-tokscale-core = { git = "https://github.com/Nanako0129/tokscale-core", rev = "51047602c7052f4c7a2ec0fc96967958e79aa829" }
+tokscale-core = { git = "https://github.com/Nanako0129/tokscale-core", rev = "2378f31a258b4875349a2d857338e3ed63fa60d8" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", default-features = false, features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_SystemServices", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_Shell"] }

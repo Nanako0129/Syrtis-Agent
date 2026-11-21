@@ -899,6 +899,49 @@ mod live {
         );
     }
 
+    /// W3a: a separate XDG data root is an owner input. A scope approved
+    /// without one is not approved for the same agent restarted with one;
+    /// `approve_scope` then makes one `source_change_commit`, and the
+    /// running source reports the root it hashed.
+    #[test]
+    fn a_separate_xdg_data_home_needs_its_own_approval() {
+        let clock = TestClock::new();
+        let home = TempHome::new();
+        let agent = start(&home, &clock, ScannerSettings::default());
+        agent.approve_scope().unwrap();
+        assert!(agent.scope_approved());
+        let digest = agent.source().owner_inputs_sha256().to_owned();
+        drop(agent);
+
+        let xdg = home.0.join("xdg");
+        let mut config = config(&home.0, &clock, ScannerSettings::default());
+        config.xdg_data_home = Some(xdg.clone());
+        let agent = (0..200)
+            .find_map(|_| match Agent::start(config.clone()) {
+                Err(AgentError::Storage(StorageError::Busy))
+                | Err(AgentError::Runtime(RuntimeError::Store(StorageError::Busy))) => {
+                    thread::sleep(Duration::from_millis(10));
+                    None
+                }
+                other => Some(other.unwrap()),
+            })
+            .expect("the agent did not start");
+        assert_eq!(agent.source().xdg_data_home(), Some(xdg.as_path()));
+        assert_ne!(agent.source().owner_inputs_sha256(), digest);
+        assert!(!agent.scope_approved());
+        assert!(!status_scope(&agent));
+        let before = generation(&agent);
+        assert!(
+            agent
+                .source()
+                .report(&request(Endpoint::Graph, before), None, far())
+                .is_err()
+        );
+        agent.approve_scope().unwrap();
+        assert_eq!(generation(&agent), before + 1);
+        assert!(agent.scope_approved());
+    }
+
     /// Acceptance (4): `reset` keeps the record but unapproves it; the next
     /// `approve_scope` approves again without moving the generation past
     /// the value `reset` set, and a new pairing reads.

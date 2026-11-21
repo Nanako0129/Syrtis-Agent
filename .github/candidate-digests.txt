@@ -286,9 +286,30 @@
 # what the lock adds (empty), with controls for a changed checksum, a
 # changed version and a path package. The lock baseline fixture is
 # unchanged: the lock gained no package.
+#
+# W3a (2026-11-21): engine pin moved to tokscale-core 2378f31a (the merge of
+# its PR 91: RemoteSourceContextV1::new_with_xdg_data_home and
+# preview_fingerprint_with_xdg_data_home, a separate XDG data root for a
+# remote scan). Changed on purpose: the 40-hex pin and the provenance
+# sentence in spec/source-v1.md, and the lock baseline fixture (the
+# tokscale-core source line only; the lock gained no package). Both D1
+# fixtures, tests/fixtures/v1/source/default-roots.json and
+# tests/fixtures/v1/source/environment-keys.json, were derived again at
+# 2378f31a: engineSha, and every cited src/source_context.rs line (the only
+# engine src/ file the delta touches; 189->237, 194->242, 198->246,
+# 519->579, 1133->1197); default-roots.json also says that the dataDir base
+# (the XDG data root) is the separate XDG data root when one is given, and
+# that the approved roots of admits_scan_root include it. The per-pin
+# SEC-R4 requirement of spec/source-v1.md is met by tokscale-core PR 91: its
+# three-platform CI, its fresh-context verifier and the security review of
+# that change. spec/source-v1.md, spec/agent-v1.md and spec/cli-v1.md now
+# describe the optional XDG data root: EngineSource::new_with_xdg_data_home,
+# AgentConfig::xdg_data_home (None from AgentConfig::new), xdgDataHome in
+# the owner-inputs digest only when set (so every existing digest is
+# unchanged), and the disclosure line shown only when it is set.
 4eb5d2ca0aa2906676095dd4d2450d142f15fd6e8cdfbff774ee9d7cbf2e9373  spec/cache-store-v1.md
 055a5c81aade6aec75c8f43bccb8128ab22ca1691b15b690ca833d0005176a2f  spec/install-v1.md
-14448b1b0ca3be54b08c8c13f0e267eaa12058bcd571d678a481e574d2d7859a  spec/cli-v1.md
+15d25e02b0c12487fca662e0cae5bd0c5be64d2c9c9d5cdc0f868e86cbd88f0b  spec/cli-v1.md
 f14f436dccb81dfec157fa0aba8e141427bed6f9788834a91e76008705c387d1  spec/control-v1.md
 c6cfaf6793ab2d9319c461ac538c8d9e95428fdf2eebe54f630e6337673b3580  spec/pairing-v1.md
 5b44f472d89efa4f4e381ea8eabf1cd533e6b7e9d448a02a8ce1499b11a109ee  spec/runtime-v1.md
@@ -298,8 +319,8 @@ f2c1c9300b27ab7607fad510baf5380b6d4e050e483a422a3046d19b76be8de6  spec/report-ca
 d42f2711c5e7f8d820af9e95691ce0ab926564af95f7e442997dad3d879290cc  spec/security-v1.md
 1305c76ef1673ed007d2b15a6a7fe142d557b50f83a35ad511f911d2bfad35be  spec/state-store-v1.md
 3e97171eda23b646b27ed21a26dffe9cb3a285636a558fc96e9b202076b3eb53  spec/v1.md
-4b28b7ce8b1d5192e8ee25aae4f8df4911ab3b7833df1d3324bff47aeaeb1c38  spec/source-v1.md
-5cf48f921f1a881a9d3da5a9e9a2cf46398797aead91311fee667cff1d110547  spec/agent-v1.md
+c0fc80a530fedc517818f90beafd74e865ff477a36ae9cf906cf2120db11d9dd  spec/source-v1.md
+1260a005ce9a25885555e4b78caa20e1f588fe84500d4bd3a419bd191b2535b1  spec/agent-v1.md
 ff21cbcfdd6aedfb68ac1b3cfda056663203f2c7f08fd05a856dc5dbe5e4c25a  src/cache.rs
 8b0add8d4fde2253edebdddd448d381559d63ff630f0e9d2f9faad8d9625567f  src/canonical.rs
 7f3d545bf38d846fd2cad5ebfc77d1ff865d42fad68001dd3e7af2282a1e96ef  src/report.rs
@@ -313,7 +334,7 @@ ae49173b3522596aacf7c767ad3ef7959d2333167f18293fd404aadfc3467981  tests/fixtures
 fbafa7ed3a76229676c94fb2709ee1e68ff17f9b139a1cc0ac3944af987fe725  tests/fixtures/v1/report/graph.json
 d323ed6e422d0b2f2d9a53980630c960c7379beeb67ab130b858945b167d3678  tests/fixtures/v1/report/hourly.json
 1b19e6980a40a4c4baf68edec8a219810fbebd33514e4799c18a6e8100e50aed  tests/fixtures/v1/report/models.json
-e339b9a73b92d9ca2288a8ab03de8d7742db31cff81ed64731f694c5e16738bc  tests/fixtures/v1/runtime/storage/cargo-lock-baseline.json
+da72dff43ec39dbe3d2375a5d63b8694b63dcb152632c152a0aca282c54b9e4a  tests/fixtures/v1/runtime/storage/cargo-lock-baseline.json
 f8326f22b3df9d37df1ec1eea8dd6b4a160de6022b3a226a35bb618c4345f4e0  tests/fixtures/v1/runtime/storage/state-golden.json
 2c954878055be61bca2aa8ab1800ae44970499df97f36b800c851f90e84b14a7  tests/fixtures/v1/security/consent.json
 a58bdd593173195fa9042f6c0e4065a11d553fcc88d4ae79bfc1a5e31f16692e  tests/fixtures/v1/security/control_mac.hex
@@ -327,7 +348,7 @@ cd289e2421e745c59b5798ffc29fcecb02836444f77e816794d62e6f4a2a688e  tests/fixtures
 94653acee749d3612203b35dc400df8d7c4a93272af47f2cdeb10d2f6e14cb00  tests/fixtures/v1/security/state_transitions.json
 cbd942c4fd168b5d78fbfc469acd06cb62f77c026fcbc256285c6c7d9680fdd1  tests/fixtures/v1/security/uninstall.json
 212a6d74e16ee8b4a5f92414d0894fb9334eb40041ed9cc0b78c5962391cbf77  tests/fixtures/v1/source/codex-duration-timing.jsonl
-3442574c566e7a932f6aa28c42f2159b04fa1bbb28e84658634b62c15047fd26  tests/fixtures/v1/source/default-roots.json
-e8e7dc707bb657c1e55bb24d12f5dc9ec1963c3bfae68e694b5c4b3ddb8d092d  tests/fixtures/v1/source/environment-keys.json
+e05fad1c06021f7b34d9174e022d06593e91cead3eb9b98ceefd0c3f0edf8333  tests/fixtures/v1/source/default-roots.json
+77c3b38f98c5a11422b4f7af76a80952b7fc79d56a82d39c2c65848f44bd1d38  tests/fixtures/v1/source/environment-keys.json
 a584f0562d3fbe16d266bc4877754f6a2ba0f945089a6c63065efd3fa945d2be  tests/report_cache_v1.rs
 03725933a8fb9f03cc888d583c146f9341645a7a8a4b1dca672f86d812afbc00  tests/security_contract_v1.rs

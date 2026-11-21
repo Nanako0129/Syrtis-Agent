@@ -163,7 +163,10 @@ mod engine {
             AGGREGATION_REVISION, PEER_PROTOCOL_VERSION, REPORT_SCHEMA_VERSION, SecurityError,
             TZDB_REVISION,
         },
-        source::{EngineSource, PRICING_DIR, SCOPE_FILE, SOURCE_CACHE_DIR, owner_inputs_sha256},
+        source::{
+            EngineSource, PRICING_DIR, SCOPE_FILE, SOURCE_CACHE_DIR, owner_inputs_sha256,
+            owner_inputs_sha256_with_xdg_data_home,
+        },
         state_store::StateStore,
     };
     use tokscale_core::{
@@ -689,6 +692,132 @@ mod engine {
         }
         let distinct: BTreeSet<&String> = changed.iter().chain([&golden]).collect();
         assert_eq!(distinct.len(), changed.len() + 1, "{changed:?}");
+    }
+
+    /// W3a golden: a separate XDG data root is an owner input. One fixed
+    /// input set with `Some(x)` is pinned as a literal; it differs from the
+    /// `None` golden above (which is the five-argument function's value),
+    /// a different `x` moves it again, and `x` equal to the data dir is
+    /// still a different scope from `None`.
+    #[test]
+    fn a_separate_xdg_data_home_is_in_the_owner_inputs_digest() {
+        let path = |p: &str| PathBuf::from(p);
+        let settings = ScannerSettings::default();
+        let digest = |xdg: Option<&str>| {
+            owner_inputs_sha256_with_xdg_data_home(
+                &path("/h"),
+                &path("/h/.config"),
+                &path("/h/.local/share"),
+                xdg.map(Path::new),
+                &path("/h/agent/source-cache"),
+                &settings,
+            )
+            .unwrap()
+        };
+        let none = digest(None);
+        assert_eq!(
+            none,
+            owner_inputs_sha256(
+                &path("/h"),
+                &path("/h/.config"),
+                &path("/h/.local/share"),
+                &path("/h/agent/source-cache"),
+                &settings,
+            )
+            .unwrap()
+        );
+        let golden = digest(Some("/h/xdg"));
+        assert_eq!(
+            golden,
+            "7f9da522af7f3b4a0d206f0381fe612aef5760d738ae293b8d976adcd81d82ad"
+        );
+        let distinct: BTreeSet<String> = [
+            none,
+            golden,
+            digest(Some("/h/xdg-2")),
+            digest(Some("/h/.local/share")),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(distinct.len(), 4, "{distinct:?}");
+    }
+
+    /// W3a: a relative or empty XDG data root is refused, like any other
+    /// relative root.
+    #[test]
+    fn a_relative_or_empty_xdg_data_home_is_refused() {
+        let home = TempDir::new("xdg-bad");
+        let store = open_store(&home.path);
+        for xdg in [PathBuf::from("relative/share"), PathBuf::new()] {
+            let built = EngineSource::new_with_xdg_data_home(
+                store.root(),
+                home.path.clone(),
+                config_dir(&home.path),
+                data_dir(&home.path),
+                Some(xdg.clone()),
+                ScannerSettings::default(),
+            );
+            assert_eq!(
+                built.err(),
+                Some(StorageError::Refused(SecurityError::Invalid)),
+                "{xdg:?}"
+            );
+        }
+    }
+
+    /// W3a: the scan passes the hashed XDG data root to the engine. An
+    /// OpenCode message below `x` (outside the home and the data dir) is
+    /// reported with `Some(x)` and not with `None`; switching from a scope
+    /// approved under `None` to `Some(x)` denies until it is approved
+    /// after a `source_change_commit`. The pattern of the engine's
+    /// `source_fold_reports_opencode_under_a_separate_xdg_data_home`.
+    #[test]
+    fn a_separate_xdg_data_home_is_scanned_and_needs_its_own_approval() {
+        let home = TempDir::new("xdg-home");
+        let x = TempDir::new("xdg-x");
+        write(
+            &x.path.join("opencode/storage/message/ses_x/msg_x.json"),
+            r#"{"id":"msg_x","sessionID":"ses_x","role":"assistant","modelID":"m-open","providerID":"anthropic","tokens":{"input":410,"output":41,"reasoning":0,"cache":{"read":4,"write":1}},"time":{"created":2209032000000.0}}"#,
+        );
+        let store = open_store(&home.path);
+        let opencode = |source: &EngineSource, generation: u64| -> Option<u64> {
+            let graph: Vec<GraphRecord> = records(
+                &report(source, Endpoint::Graph, generation),
+                Endpoint::Graph,
+                generation,
+            );
+            graph
+                .iter()
+                .find(|row| row.client == "opencode")
+                .map(|row| row.input_tokens)
+        };
+
+        let without = source(&store, &home.path, ScannerSettings::default());
+        assert_eq!(without.xdg_data_home(), None);
+        without.approve(&store).unwrap();
+        let first = generation(&store);
+        assert_eq!(opencode(&without, first), None);
+
+        let with = EngineSource::new_with_xdg_data_home(
+            store.root(),
+            home.path.clone(),
+            config_dir(&home.path),
+            data_dir(&home.path),
+            Some(x.path.clone()),
+            ScannerSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(with.xdg_data_home(), Some(x.path.as_path()));
+        assert_ne!(with.owner_inputs_sha256(), without.owner_inputs_sha256());
+        assert!(denied(&with, first));
+        store
+            .transition(|state| state.source_change_commit())
+            .unwrap();
+        with.approve(&store).unwrap();
+        let now = generation(&store);
+        assert_eq!(now, first + 1);
+        assert_eq!(opencode(&with, now), Some(410));
+        assert!(denied(&without, now));
     }
 
     /// Acceptance (2): approving changed inputs without the generation

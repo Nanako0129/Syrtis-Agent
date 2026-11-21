@@ -10,11 +10,11 @@ macOS and Linux. `Agent::start` returns `Unsupported` on every target without th
 
 ## Start
 
-`Agent::start(AgentConfig { trusted_home, config_dir, data_dir, settings, state_suffix, options })`:
+`Agent::start(AgentConfig { trusted_home, config_dir, data_dir, xdg_data_home, settings, state_suffix, options })`:
 
-1. `SecureRoot::open_under(trusted_home, state_suffix)`. `AgentConfig::new` sets `state_suffix` to the frozen platform suffix (`secure_fs::STATE_SUFFIX`) and `options` to `Options::default()`; a product passes `secure_fs::trusted_home()` as `trusted_home`. A test passes a temp home and a suffix without spaces.
+1. `SecureRoot::open_under(trusted_home, state_suffix)`. `AgentConfig::new` (signature unchanged) sets `xdg_data_home` to `None`, `state_suffix` to the frozen platform suffix (`secure_fs::STATE_SUFFIX`) and `options` to `Options::default()`; a product passes `secure_fs::trusted_home()` as `trusted_home`. A test passes a temp home and a suffix without spaces.
 2. The agent keeps `trusted_home`; `uninstall` uses it (below), so the install objects and the secure root are always below the same home.
-3. `Runtime::start_with_scope`, whose `make_source` builds the one `EngineSource` of this root from the state store's own root, with `home = trusted_home`, `config_dir`, `data_dir` and `settings`. Control `status` reads that source's scan record (`spec/source-v1.md`, "Scan record") and `scopeApproved` (below); control `scopeApprove` runs the scope approval (below). The control server starts before the source exists: until it does, `scopeApproved` is false and `scopeApprove` is `internal`.
+3. `Runtime::start_with_scope`, whose `make_source` builds the one `EngineSource` of this root from the state store's own root, with `home = trusted_home`, `config_dir`, `data_dir`, `xdg_data_home` and `settings` (`EngineSource::new_with_xdg_data_home`). `xdg_data_home` is an optional separate XDG data root (`spec/source-v1.md`, "Separate XDG data root"): an owner input in the scope digest, so a caller that sets it must show it in its scope disclosure (it reads it back as `Agent::source().xdg_data_home()`, or computes the digest with `source::owner_inputs_sha256_with_xdg_data_home`). `None` scans and hashes as before it existed, so an approved scope stays approved. Control `status` reads that source's scan record (`spec/source-v1.md`, "Scan record") and `scopeApproved` (below); control `scopeApprove` runs the scope approval (below). The control server starts before the source exists: until it does, `scopeApproved` is false and `scopeApprove` is `internal`.
 
 The inputs are fixed for the agent's life. To change a scan setting the caller stops the agent and starts a new one with the new settings; the approved scope then no longer matches (below).
 
@@ -116,6 +116,7 @@ Not classified with certainty:
 | (8c) source cache not clearable | `live::a_source_cache_that_cannot_be_cleared_only_marks_manual_repair` |
 | `SA-2C2b` (3) `scopeApprove`: digest check, full approval | `live::scope_approve_over_control_needs_the_running_digest_and_ends_earlier_grants` |
 | `SA-2C2b` (4) `scopeApproved` agrees with `report` | `live::status_scope_approved_matches_what_report_serves` |
+| W3a: a scope approved without a separate XDG data root is not approved with one; `approve_scope` commits once | `live::a_separate_xdg_data_home_needs_its_own_approval` |
 
 ## Non-claims
 

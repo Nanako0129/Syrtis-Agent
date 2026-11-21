@@ -165,7 +165,7 @@ mod imp {
         runtime::RuntimeError,
         secure_fs::{STATE_SUFFIX, SecureRoot, StorageError, trusted_home},
         security::{GrantState, clock_status, decode_fixed_hex, hex_encode},
-        source::{SOURCE_CACHE_DIR, owner_inputs_sha256},
+        source::{SOURCE_CACHE_DIR, owner_inputs_sha256_with_xdg_data_home},
         state_store::{STATE_FILE, STATE_FILE_MAX_BYTES, Secret32, StateStore, decode_state},
     };
 
@@ -299,25 +299,39 @@ mod imp {
         /// The owner inputs the resident computes from the same home.
         fn disclosure(&self) -> Option<(Vec<(&'static str, String)>, String)> {
             let (config_dir, data_dir) = default_dirs(&self.home);
+            // The resident's `AgentConfig::new` sets no separate XDG data
+            // root; one that is set is an owner input and is shown.
+            let xdg_data_home: Option<PathBuf> = None;
             let cache = self.root_path().join(SOURCE_CACHE_DIR);
             let settings = ScannerSettings::default();
-            let digest =
-                owner_inputs_sha256(&self.home, &config_dir, &data_dir, &cache, &settings)?;
+            let digest = owner_inputs_sha256_with_xdg_data_home(
+                &self.home,
+                &config_dir,
+                &data_dir,
+                xdg_data_home.as_deref(),
+                &cache,
+                &settings,
+            )?;
             let clients: Vec<&str> = tokscale_core::ClientId::ALL
                 .iter()
                 .map(|client| client.as_str())
                 .collect();
-            let lines = vec![
+            let mut lines = vec![
                 ("Home", self.home.display().to_string()),
                 ("Config directory", config_dir.display().to_string()),
                 ("Data directory", data_dir.display().to_string()),
+            ];
+            if let Some(xdg) = &xdg_data_home {
+                lines.push(("XDG data directory", xdg.display().to_string()));
+            }
+            lines.extend([
                 ("Engine source cache", cache.display().to_string()),
                 (
                     "Extra scan paths",
                     "none (the standalone agent scans default roots only)".into(),
                 ),
                 ("Clients the engine reads", clients.join(", ")),
-            ];
+            ]);
             Some((lines, digest))
         }
     }
