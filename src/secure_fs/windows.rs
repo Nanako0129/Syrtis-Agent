@@ -269,7 +269,7 @@ impl SecureRoot {
         let file = shim(Step::CreateTemp, || {
             let open = Open {
                 // DELETE: the rename runs on this handle.
-                access: GENERIC_WRITE | DELETE,
+                access: GENERIC_WRITE | DELETE | SYNCHRONIZE,
                 share: 0,
                 disposition: FILE_CREATE,
                 options: FILE_OPTIONS | FILE_OPEN_REPARSE_POINT,
@@ -710,6 +710,14 @@ struct Open {
 /// path when `parent` is `None`. `OBJ_CASE_INSENSITIVE` as Win32 opens do;
 /// never `OBJ_INHERIT`. `descriptor` applies only if the call creates the
 /// object.
+///
+/// With `FILE_SYNCHRONOUS_IO_NONALERT` the I/O manager requires `SYNCHRONIZE`
+/// in the raw `DesiredAccess`, checked before generic rights are mapped
+/// (`GENERIC_READ` maps to a set that includes it, but too late), and
+/// answers `STATUS_INVALID_PARAMETER` otherwise. CI round 1 measured that
+/// failure for `owner.lock` (`GENERIC_READ | GENERIC_WRITE`). Every call
+/// site lists `SYNCHRONIZE` itself; this adds it again so no site can
+/// forget it.
 fn nt_create(
     parent: Option<&File>,
     name: &[u16],
@@ -736,6 +744,11 @@ fn nt_create(
         SecurityDescriptor: descriptor.map_or(ptr::null(), Descriptor::as_ptr),
         SecurityQualityOfService: ptr::null(),
     };
+    let access = if open.options & FILE_SYNCHRONOUS_IO_NONALERT != 0 {
+        open.access | SYNCHRONIZE
+    } else {
+        open.access
+    };
     let mut handle: HANDLE = ptr::null_mut();
     let mut status_block = IO_STATUS_BLOCK::default();
     // SAFETY: every pointer refers to a live local: `object_name` borrows
@@ -746,7 +759,7 @@ fn nt_create(
     let status = unsafe {
         NtCreateFile(
             &mut handle,
-            open.access,
+            access,
             &attributes,
             &mut status_block,
             ptr::null(),
@@ -759,6 +772,23 @@ fn nt_create(
         )
     };
     if status < 0 {
+        // Test builds print every parameter, so one CI log line names the
+        // call. "Not found" is an expected answer at several sites.
+        #[cfg(test)]
+        if status != STATUS_OBJECT_NAME_NOT_FOUND {
+            eprintln!(
+                "secure_fs::windows: NtCreateFile {:#010x}: name {:?} relative {} \
+                 access {access:#010x} share {:#x} disposition {} options {:#010x} \
+                 descriptor {}",
+                status as u32,
+                String::from_utf16_lossy(name),
+                parent.is_some(),
+                open.share,
+                open.disposition,
+                open.options,
+                descriptor.is_some(),
+            );
+        }
         return Err(status);
     }
     // SAFETY: on success the call returned a new handle that nothing else
@@ -1272,7 +1302,7 @@ fn query_information(handle: &File, buffer: &mut [u64], class: i32) -> Result<()
 fn open_agent_file(dir: &File, name: &str) -> Result<Option<File>, StorageError> {
     let name = file_name(name)?;
     let open = Open {
-        access: GENERIC_READ,
+        access: GENERIC_READ | SYNCHRONIZE,
         share: SHARE_ALL,
         disposition: FILE_OPEN,
         options: FILE_OPTIONS | nofollow(),
@@ -1295,7 +1325,7 @@ fn acquire_lock(dir: &File, user: &Sid) -> Result<Lock, StorageError> {
     // Shared for read and write, so a second opener reaches `LockFileEx`
     // (and gets `Busy` there) instead of a sharing violation.
     let open = Open {
-        access: GENERIC_READ | GENERIC_WRITE,
+        access: GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
         share: FILE_SHARE_READ | FILE_SHARE_WRITE,
         disposition: FILE_OPEN_IF,
         options: FILE_OPTIONS | nofollow(),
@@ -1372,6 +1402,16 @@ fn rename_over(file: &File, dir: &File, target: &[u16]) -> Result<(), NTSTATUS> 
             FileRenameInformationEx,
         )
     };
+    #[cfg(test)]
+    if status < 0 {
+        eprintln!(
+            "secure_fs::windows: NtSetInformationFile(FileRenameInformationEx) {:#010x}: \
+             target {:?} length {total} flags {:#x}",
+            status as u32,
+            String::from_utf16_lossy(target),
+            FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS,
+        );
+    }
     if status < 0 { Err(status) } else { Ok(()) }
 }
 
@@ -1408,6 +1448,14 @@ fn dispose(handle: &File) -> Result<(), NTSTATUS> {
             FileDispositionInformationEx,
         )
     };
+    #[cfg(test)]
+    if status < 0 {
+        eprintln!(
+            "secure_fs::windows: NtSetInformationFile(FileDispositionInformationEx) {:#010x}: \
+             flags {:#x}",
+            status as u32, info.Flags,
+        );
+    }
     if status < 0 { Err(status) } else { Ok(()) }
 }
 
