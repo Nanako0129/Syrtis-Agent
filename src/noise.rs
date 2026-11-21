@@ -470,13 +470,19 @@ fn read_exact(
     let mut filled = 0;
     while filled < buffer.len() {
         let timeout = deadline.remaining()?;
-        // Windows does not wake a `recv` that is already blocked when
-        // `Listener::stop` shuts the socket down from another thread
-        // (windows-latest run 44887602263: `stop` waited out the 10 s
-        // handshake). Each call there waits at most `WINDOWS_READ_SLICE`,
-        // so the next call sees the shutdown and fails. A timed-out `recv`
-        // returns no data, so the retry loses nothing. Writes are not
-        // sliced: a timed-out send may already have sent part of its bytes.
+        // Windows, measured: with 8 handshakes stalled in this read,
+        // `Listener::stop` (a `shutdown` from another thread) took 9.8 s,
+        // the 10 s deadline (windows-latest run 44887602263); with each
+        // call there capped at `WINDOWS_READ_SLICE` it returns within the
+        // 1 s bound (run 44889107385). Our reading of the two runs, not a
+        // measured fact: the shutdown does not wake a `recv` already
+        // blocked, and the next call fails. Retrying after a timed-out call
+        // and then receiving data is what `tests::accept_reads_a_non_blocking_stream_in_blocking_mode`
+        // and `tests::connect_reads_its_stream_in_blocking_mode` exercise
+        // (data after 300 ms, slices of 250 ms), passing on Windows; that
+        // a timed-out `recv` never consumes data is not claimed from
+        // Windows. Writes are not sliced: a timed-out send may already
+        // have sent part of its bytes.
         #[cfg(windows)]
         let timeout = timeout.min(WINDOWS_READ_SLICE);
         stream

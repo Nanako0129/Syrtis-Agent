@@ -1202,6 +1202,14 @@ mod engine {
         }
     }
 
+    /// Whether a test that must not be skipped on CI runs here: true
+    /// whenever `GITHUB_ACTIONS` is set (any value), as in
+    /// `tests/dependency_provenance_v1.rs`.
+    #[cfg(windows)]
+    fn skip_must_fail_here() -> bool {
+        std::env::var_os("GITHUB_ACTIONS").is_some()
+    }
+
     /// Files and directories a test planted outside its temp directories;
     /// dropping it removes exactly those, files first, then each directory
     /// it created (deepest first, only when empty), also when the test
@@ -1276,9 +1284,28 @@ mod engine {
     /// same files below the scanned roots are reported. Only the planted
     /// files and the directories created for them are removed, also when
     /// an assertion fails.
+    ///
+    /// Rule: it writes below the real AppData only under `GITHUB_ACTIONS`
+    /// (`skip_must_fail_here`, the pattern of
+    /// `tests/dependency_provenance_v1.rs`). Elsewhere, on a developer's
+    /// machine that may run Syrtis, it prints `SKIPPED` and returns: a
+    /// local scan there could count the decoy, and a killed run would leave
+    /// it. On CI it always runs. The decoy stays where the engine's lanes
+    /// would read it if a scan took a real folder as a root: below each of
+    /// the two folders, `tokscale\antigravity-cache\sessions` (the config
+    /// lane) and `opencode\storage\message` (the data lane). A decoy
+    /// anywhere else would be missed by a scan that did read those folders,
+    /// and the test would prove nothing.
     #[cfg(windows)]
     #[test]
     fn a_decoy_below_the_real_appdata_known_folders_is_never_scanned() {
+        if !skip_must_fail_here() {
+            eprintln!(
+                "SKIPPED off CI: a_decoy_below_the_real_appdata_known_folders_is_never_scanned \
+                 would write below the real AppData (runs under GITHUB_ACTIONS)"
+            );
+            return;
+        }
         let roots = syrtis_agent::agent::default_scan_roots().unwrap();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
