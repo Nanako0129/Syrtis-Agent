@@ -12,7 +12,7 @@ serde_json = { version = "=1.0.151", default-features = false, features = ["std"
 hmac = { version = "=0.12.1", default-features = false }
 sha2 = { version = "=0.10.9", default-features = false }
 unicode-normalization = { version = "=0.1.25", default-features = false, features = ["std"] }
-tokscale-core = { git = "https://github.com/Nanako0129/tokscale-core", rev = "2378f31a258b4875349a2d857338e3ed63fa60d8" }
+tokscale-core = { git = "https://github.com/Nanako0129/tokscale-core", rev = "d7a147512c3e404fa45f7e6783932fe42759e01c" }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "=0.2.189", default-features = false }

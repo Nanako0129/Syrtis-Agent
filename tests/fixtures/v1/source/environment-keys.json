@@ -1,5 +1,5 @@
 {
-  "engineSha": "2378f31a258b4875349a2d857338e3ed63fa60d8",
+  "engineSha": "d7a147512c3e404fa45f7e6783932fe42759e01c",
   "keys": [
     {
       "key": "HOME",
@@ -19,7 +19,7 @@
     },
     {
       "key": "XDG_RUNTIME_DIR",
-      "source": "src/message_cache.rs:105"
+      "source": "src/message_cache.rs:124"
     },
     {
       "key": "XDG_STATE_HOME",
@@ -111,15 +111,15 @@
     },
     {
       "key": "USER",
-      "source": "src/message_cache.rs:120"
+      "source": "src/message_cache.rs:139"
     },
     {
       "key": "USERNAME",
-      "source": "src/message_cache.rs:119"
+      "source": "src/message_cache.rs:138"
     },
     {
       "key": "TMPDIR",
-      "source": "std::env::temp_dir, src/message_cache.rs:114"
+      "source": "std::env::temp_dir, src/message_cache.rs:133"
     }
   ],
   "note": "Every environment key the engine names at the pinned SHA, plus XDG_STATE_HOME (the frozen ignoredEnvironment fixture) and TMPDIR (std::env::temp_dir). DIRECT_SOURCE_ENV_KEYS is src/scanner.rs:18-26; the client env roots come from CLIENTS. XDG_STATE_HOME is not named by the engine (source null)."

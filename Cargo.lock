@@ -1781,7 +1781,7 @@ dependencies = [
 [[package]]
 name = "tokscale-core"
 version = "3.0.0"
-source = "git+https://github.com/Nanako0129/tokscale-core?rev=2378f31a258b4875349a2d857338e3ed63fa60d8#2378f31a258b4875349a2d857338e3ed63fa60d8"
+source = "git+https://github.com/Nanako0129/tokscale-core?rev=d7a147512c3e404fa45f7e6783932fe42759e01c#d7a147512c3e404fa45f7e6783932fe42759e01c"
 dependencies = [
  "bincode",
  "chrono",
