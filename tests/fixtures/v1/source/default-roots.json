@@ -2,7 +2,7 @@
   "bases": {
     "codexRoot": "home/.codex (CODEX_HOME fallback)",
     "configDir": "the owner's config dir",
-    "dataDir": "the owner's data dir (XDG_DATA_HOME substitute)",
+    "dataDir": "the XDG data root: the owner's data dir, or the separate XDG data root when the agent is given one (XDG_DATA_HOME substitute, src/source_context.rs:476,526); XdgData clients resolve below it (src/source_context.rs:840)",
     "grokRoot": "home/.grok (GROK_HOME fallback)",
     "hermesRoot": "home/.hermes (HERMES_HOME fallback)",
     "home": "the owner's home"
@@ -353,8 +353,8 @@
       "var": null
     }
   ],
-  "derivedFrom": "tokscale-core CLIENTS (src/clients.rs) and the hard-coded extra roots of scan_all_clients_resolved_inner (src/scanner.rs:1401-1794) and its helpers; remote contexts resolve env-var roots to home/<fallbackRelative> (src/source_context.rs:1133)",
-  "engineSha": "51047602c7052f4c7a2ec0fc96967958e79aa829",
+  "derivedFrom": "tokscale-core CLIENTS (src/clients.rs) and the hard-coded extra roots of scan_all_clients_resolved_inner (src/scanner.rs:1401-1794) and its helpers; remote contexts resolve env-var roots to home/<fallbackRelative> (src/source_context.rs:1197); a remote scan admits roots below home, config dir, data dir, the XDG data root, the source cache and the settings paths (admits_scan_root, src/source_context.rs:757-786)",
+  "engineSha": "2378f31a258b4875349a2d857338e3ed63fa60d8",
   "extraRoots": [
     {
       "base": "home",
@@ -405,7 +405,7 @@
     {
       "base": "home",
       "client": "claude",
-      "note": "variant configDir is file content; admitted only below an approved root (admits_scan_root)",
+      "note": "variant configDir is file content; admitted only below an approved root, the XDG data root included (admits_scan_root)",
       "relative": ".cc-mirror",
       "source": "src/cc_mirror.rs:23"
     },
@@ -432,7 +432,7 @@
       "base": "home",
       "client": "codex",
       "relative": ".codex/archived_sessions",
-      "source": "src/source_context.rs:519"
+      "source": "src/source_context.rs:579"
     },
     {
       "base": "home",
@@ -558,7 +558,7 @@
     {
       "base": "dataDir",
       "client": "crush",
-      "note": "entry data_dir is file content; admitted only below an approved root, src/scanner.rs:1696",
+      "note": "entry data_dir is file content; admitted only below an approved root, the XDG data root included, src/scanner.rs:1696",
       "relative": "crush/projects.json",
       "source": "src/scanner.rs:1692"
     },

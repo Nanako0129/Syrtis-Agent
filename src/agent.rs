@@ -44,6 +44,13 @@ pub struct AgentConfig {
     /// support" directories; use `cli::default_dirs`.
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
+    /// A separate XDG data root (`EngineSource::new_with_xdg_data_home`):
+    /// the engine resolves `XDG_DATA_HOME` to it instead of `data_dir`.
+    /// An owner input, part of the scope digest
+    /// (`source::owner_inputs_sha256_with_xdg_data_home`), so a disclosure
+    /// must show it when set. `None` (the default) is the scan and digest
+    /// from before this field.
+    pub xdg_data_home: Option<PathBuf>,
     pub settings: ScannerSettings,
     /// The secure root below `trusted_home`: the frozen platform suffix
     /// (`secure_fs::STATE_SUFFIX`) unless a test chooses another.
@@ -63,6 +70,7 @@ impl AgentConfig {
             trusted_home,
             config_dir,
             data_dir,
+            xdg_data_home: None,
             settings,
             state_suffix: DEFAULT_SUFFIX,
             options: Options::default(),
@@ -186,6 +194,7 @@ mod imp {
                 trusted_home,
                 config_dir,
                 data_dir,
+                xdg_data_home,
                 settings,
                 state_suffix,
                 options,
@@ -222,11 +231,12 @@ mod imp {
             let runtime = Runtime::start_with_scope(
                 root,
                 move |root| {
-                    let source = Arc::new(EngineSource::new(
+                    let source = Arc::new(EngineSource::new_with_xdg_data_home(
                         root,
                         trusted_home,
                         config_dir,
                         data_dir,
+                        xdg_data_home,
                         settings,
                     )?);
                     let _ = fill.set(Arc::clone(&source));

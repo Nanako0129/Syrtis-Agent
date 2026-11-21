@@ -72,7 +72,9 @@ pub struct ScopeRecord {
 /// engine's fingerprint (it hashes the engine's client table and resolver
 /// version) nor the engine's serde form of `ScannerSettings` (a new engine
 /// field would serialize as a default) is used, so an engine pin alone
-/// never changes the digest (D1).
+/// never changes the digest (D1). `xdgDataHome` is left out when there is
+/// no separate XDG data root, so those bytes are the ones from before it
+/// existed.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OwnerInputs {
@@ -83,15 +85,39 @@ struct OwnerInputs {
     home: String,
     opencode_db_paths: Vec<String>,
     source_cache_dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    xdg_data_home: Option<String>,
 }
 
 /// `ownerInputsSha256` for these inputs: SHA-256 of the CanonicalJsonV1
 /// encoding of [`OwnerInputs`], lowercase hex. `None` when a path is not
-/// UTF-8 or a string is not NFC.
+/// UTF-8 or a string is not NFC. No separate XDG data root: the digest of
+/// [`owner_inputs_sha256_with_xdg_data_home`] with `None`.
 pub fn owner_inputs_sha256(
     home: &Path,
     config_dir: &Path,
     data_dir: &Path,
+    source_cache_dir: &Path,
+    settings: &ScannerSettings,
+) -> Option<String> {
+    owner_inputs_sha256_with_xdg_data_home(
+        home,
+        config_dir,
+        data_dir,
+        None,
+        source_cache_dir,
+        settings,
+    )
+}
+
+/// [`owner_inputs_sha256`] with a separate XDG data root (the engine's
+/// `*_with_xdg_data_home`). `Some(x)` is hashed as `xdgDataHome` even when
+/// `x` equals `data_dir`; `None` leaves the field out.
+pub fn owner_inputs_sha256_with_xdg_data_home(
+    home: &Path,
+    config_dir: &Path,
+    data_dir: &Path,
+    xdg_data_home: Option<&Path>,
     source_cache_dir: &Path,
     settings: &ScannerSettings,
 ) -> Option<String> {
@@ -129,6 +155,10 @@ pub fn owner_inputs_sha256(
         home: text(home)?,
         opencode_db_paths: list(opencode_db_paths)?,
         source_cache_dir: text(source_cache_dir)?,
+        xdg_data_home: match xdg_data_home {
+            Some(path) => Some(text(path)?),
+            None => None,
+        },
     };
     let bytes = CanonicalJsonV1::encode(&inputs).ok()?;
     Some(hex_encode(&Sha256::digest(&bytes)))
@@ -140,6 +170,10 @@ pub struct EngineSource {
     home: PathBuf,
     config_dir: PathBuf,
     data_dir: PathBuf,
+    /// Hashed into `owner_inputs_sha256` and passed to every engine call;
+    /// set only by the constructor, so no scan uses a value the digest
+    /// does not cover.
+    xdg_data_home: Option<PathBuf>,
     source_cache_dir: PathBuf,
     pricing_dir: PathBuf,
     settings: ScannerSettings,
@@ -162,12 +196,30 @@ impl EngineSource {
     /// `data_dir` are the owner's absolute roots; custom roots are the
     /// absolute paths in `settings` (`extraScanPaths`, `opencodeDbPaths`).
     /// Anything the engine or the canonical encoder refuses (a relative
-    /// path, a non-UTF-8 or non-NFC path) is `Refused(Invalid)`.
+    /// path, a non-UTF-8 or non-NFC path) is `Refused(Invalid)`. No
+    /// separate XDG data root: [`Self::new_with_xdg_data_home`] with `None`.
     pub fn new(
         root: Arc<SecureRoot>,
         home: PathBuf,
         config_dir: PathBuf,
         data_dir: PathBuf,
+        settings: ScannerSettings,
+    ) -> Result<Self, StorageError> {
+        Self::new_with_xdg_data_home(root, home, config_dir, data_dir, None, settings)
+    }
+
+    /// [`Self::new`] with a separate XDG data root `xdg_data_home`: the
+    /// engine then resolves `XDG_DATA_HOME` (the XdgData clients and the
+    /// OpenCode, Synthetic and Crush databases) to it instead of
+    /// `data_dir`, and admits scan roots below it. It is an owner input:
+    /// part of `owner_inputs_sha256`. A relative or empty one is
+    /// `Refused(Invalid)` (the engine refuses it).
+    pub fn new_with_xdg_data_home(
+        root: Arc<SecureRoot>,
+        home: PathBuf,
+        config_dir: PathBuf,
+        data_dir: PathBuf,
+        xdg_data_home: Option<PathBuf>,
         settings: ScannerSettings,
     ) -> Result<Self, StorageError> {
         // A crash between `stage` and `publish` leaves the temp file, and
@@ -177,22 +229,30 @@ impl EngineSource {
         let source_cache_dir = root.private_subdir(SOURCE_CACHE_DIR)?;
         let pricing_dir = root.private_subdir(PRICING_DIR)?;
         let invalid = StorageError::Refused(SecurityError::Invalid);
-        RemoteSourceContextV1::preview_fingerprint(
+        RemoteSourceContextV1::preview_fingerprint_with_xdg_data_home(
             &home,
             &config_dir,
             &data_dir,
+            xdg_data_home.as_deref(),
             &source_cache_dir,
             &settings,
         )
         .map_err(|_| invalid)?;
-        let owner_inputs_sha256 =
-            owner_inputs_sha256(&home, &config_dir, &data_dir, &source_cache_dir, &settings)
-                .ok_or(invalid)?;
+        let owner_inputs_sha256 = owner_inputs_sha256_with_xdg_data_home(
+            &home,
+            &config_dir,
+            &data_dir,
+            xdg_data_home.as_deref(),
+            &source_cache_dir,
+            &settings,
+        )
+        .ok_or(invalid)?;
         Ok(Self {
             root,
             home,
             config_dir,
             data_dir,
+            xdg_data_home,
             source_cache_dir,
             pricing_dir,
             settings,
@@ -200,6 +260,12 @@ impl EngineSource {
             approving: Mutex::new(()),
             scan: Mutex::new(ScanStatus::default()),
         })
+    }
+
+    /// The separate XDG data root this source scans and hashed, for an
+    /// owner disclosure; `None` when there is none.
+    pub fn xdg_data_home(&self) -> Option<&Path> {
+        self.xdg_data_home.as_deref()
     }
 
     /// The source cache directory (below the secure root).
@@ -306,18 +372,20 @@ impl EngineSource {
         endpoint: Endpoint,
         node_label: Option<&str>,
     ) -> Result<(Vec<u8>, BTreeSet<String>), SourceError> {
-        let fingerprint = RemoteSourceContextV1::preview_fingerprint(
+        let fingerprint = RemoteSourceContextV1::preview_fingerprint_with_xdg_data_home(
             &self.home,
             &self.config_dir,
             &self.data_dir,
+            self.xdg_data_home.as_deref(),
             &self.source_cache_dir,
             &self.settings,
         )
         .map_err(|_| SourceError)?;
-        let context = RemoteSourceContextV1::new(
+        let context = RemoteSourceContextV1::new_with_xdg_data_home(
             &self.home,
             &self.config_dir,
             &self.data_dir,
+            self.xdg_data_home.as_deref(),
             &self.source_cache_dir,
             self.settings.clone(),
             RemoteSourceScopeTokenV1::new(fingerprint, request.source_scope_generation),

@@ -1,5 +1,5 @@
 {
-  "engineSha": "51047602c7052f4c7a2ec0fc96967958e79aa829",
+  "engineSha": "2378f31a258b4875349a2d857338e3ed63fa60d8",
   "keys": [
     {
       "key": "HOME",
@@ -31,15 +31,15 @@
     },
     {
       "key": "TOKSCALE_EXTRA_DIRS",
-      "source": "src/source_context.rs:194"
+      "source": "src/source_context.rs:242"
     },
     {
       "key": "TOKSCALE_HEADLESS_DIR",
-      "source": "src/source_context.rs:189"
+      "source": "src/source_context.rs:237"
     },
     {
       "key": "TOKSCALE_PRICING_CACHE_ONLY",
-      "source": "src/source_context.rs:198"
+      "source": "src/source_context.rs:246"
     },
     {
       "key": "COPILOT_OTEL_FILE_EXPORTER_PATH",
