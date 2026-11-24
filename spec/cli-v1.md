@@ -47,7 +47,7 @@ The standalone agent never fetches pricing and puts nothing in `Agent::pricing_d
 | `status` | `status` | `sharingEnabled`, `bindHost`, `bindPort`, `nodeLabel`, `activeGrantCount`, `activeOfferCount`, `pendingCount`, `scopeApproved`: a caller's baseline. |
 | `scope disclosure` | `status` (the resident must answer), then the menu's disclosure for this home; changes nothing | `lines` (`[{name, value}]`, what menu item 4 prints) and `ownerInputsSha256`. |
 | `scope approve --digest <64 hex>` | `scopeApprove`. A digest that is not the resident's is `invalid` (exit 5) and nothing is written. | `scopeApproved`. |
-| `sharing on` / `sharing off` | `sharingSet`. Off revokes every grant (`spec/runtime-v1.md`). | `sharingEnabled`. |
+| `sharing on` / `sharing off` | `sharingSet`. Off revokes every grant (`spec/runtime-v1.md`). When sharing is already on, `sharing on` is answered `invalid` and exits 5, with nothing changed; a caller that retries after an exit 6 reads `status` first and does not take that exit 5 as a refusal. | `sharingEnabled`. |
 | `listen --host <ip> --port <n>` | `listenConfigure`. The host is canonical IP text the listener would bind (not unspecified), the port 1024-65535. The stored node label is kept; control cannot set it. | `bindHost`, `bindPort`. |
 | `offer create --ttl <s>` | `offerCreate`; `s` is 1-120, canonical decimal. | `expiresAt`, `offerId`, `pairUrl`. |
 | `offer cancel --offer-id <32 hex>` | `offerCancel`. | `cancelled`. |
@@ -124,7 +124,7 @@ This is a read path without the owner lock (readiness security review). The resi
 | (8) `install` through `install::install`; refused for an unsafe destination | `ctl_v1::install_and_uninstall_use_the_frozen_install_path`, `ctl_v1::install_refuses_a_destination_others_can_write`, `ctl_v1::install_refuses_a_symlinked_destination_directory`, `ctl_v1::install_and_uninstall_refuse_while_the_resident_runs` |
 | (8) `uninstall`: exit 7 names what a purge left; a leftover cache is not reported `absent`; an unwritable stdout | `src/cli/ctl.rs` `an_uninstall_that_left_something_is_a_failure_naming_it`; `ctl_v1::uninstall_does_not_report_a_leftover_cache_as_absent`, `ctl_v1::uninstall_in_an_empty_home_creates_nothing`, `ctl_v1::an_unwritable_stdout_is_a_local_failure_with_its_stderr_line` |
 | (8) clean agent to a live offer with `ctl` alone | `ctl_v1::a_clean_agent_is_walked_to_an_offer_with_ctl_alone` |
-| (8) the Linux unit discards stdout and stderr | `install_v1::the_linux_unit_discards_stdout_and_stderr` |
+| (8) the Linux unit discards stdout and leaves stderr to the journal | `install_v1::the_linux_unit_discards_stdout_and_keeps_stderr` |
 | (7) line limit | `a_line_over_the_limit_is_refused_and_the_next_one_is_read`, `disk::the_menu_ignores_a_line_over_the_limit` |
 
 ## Non-claims
@@ -133,7 +133,7 @@ This is a read path without the owner lock (readiness security review). The resi
 - **Signals.** `run` installs no signal handler. A `SIGTERM` from launchd or systemd ends the process without `Runtime::stop`, so without the final housekeeping checkpoint; the owner lock is released by the kernel at exit. Not exercised.
 - **The release gate's position** is observed only by the CI step's exit status and message; with the gate removed, the step's extra argument stops the binary at the usage check (status 2), which is how the step turns red without opening a real home.
 - **Install from the menu** is not exercised by a test (it would copy the test binary); `install::install` itself is tested in `tests/install_v1.rs`.
-- **`ctl` on a systemd host.** `install` writes the unit and starts nothing; `systemctl --user` and a no-systemd fallback are the caller's step, not run by `ctl` or by a test. The unit's `StandardOutput=null` and `StandardError=null` are checked as text, not by running systemd.
+- **`ctl` on a systemd host.** `install` writes the unit and starts nothing; `systemctl --user` and a no-systemd fallback are the caller's step, not run by `ctl` or by a test. The unit's `StandardOutput=null` (and no `StandardError` line) is checked as text, not by running systemd.
 - **Windows**: compiling and the unsupported message are claimed for CI; not run on this machine.
 - **Same UID.** A process of the same UID can read the token from `state.json` as the menu does (`spec/state-store-v1.md`, `spec/control-v1.md`).
 - **`ctl listen` and a failed bind.** `listenConfigure` stores the address and replies; a bind that then fails in the resident does not change the exit status, which stays 0. The caller's proof is the handshake that follows (`status`, then a connection), not the exit status of `listen`.

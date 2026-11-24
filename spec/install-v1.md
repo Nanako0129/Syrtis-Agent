@@ -29,7 +29,7 @@ The same source installed twice gives the same bytes and modes. The binary path 
 
 ### Autostart templates
 
-`packaging/macos/com.nyanako.syrtis.agent.plist` and `packaging/linux/syrtis-agent.service`, compiled in with `include_str!`. The single `@BINARY@` is replaced by the binary path. The plist sets `Label`, `ProgramArguments = [binary, "run"]` and `RunAtLoad`; the unit sets `ExecStart=<binary> run`, `StandardOutput=null`, `StandardError=null` (nothing the resident prints reaches a journal or a session) and `WantedBy=default.target`.
+`packaging/macos/com.nyanako.syrtis.agent.plist` and `packaging/linux/syrtis-agent.service`, compiled in with `include_str!`. The single `@BINARY@` is replaced by the binary path. The plist sets `Label`, `ProgramArguments = [binary, "run"]` and `RunAtLoad`; the unit sets `ExecStart=<binary> run`, `StandardOutput=null` (what the resident prints on stdout reaches no journal or session; its stderr goes to the journal, which is where the two lines `run` prints on a failed start, already running and did not start, are read) and `WantedBy=default.target`.
 
 ## Uninstall
 
@@ -37,7 +37,7 @@ The same source installed twice gives the same bytes and modes. The binary path 
 
 1. `StateStore::uninstall(terminal_at_ms)`: sharing off, every active grant revoked, deny floor raised. On failure the call returns `Storage(_)` and removes nothing.
 2. Derive both paths from `trusted_home`. If that fails (a non-UTF-8 home, or one `install_objects` refuses), both objects are `ManualRepair` and the call goes on with step 5; it still returns the report. Otherwise walk each object's parent chain on its own (no creation). A missing directory on the way means the object cannot exist: `Absent`. A directory that fails its checks (or cannot be opened no-follow) means its presence cannot be established safely: that object is `ManualRepair` and left alone. One object's chain never affects the other object.
-3. Autostart object: removed (`unlinkat`, then a directory sync) only when `fstatat` shows a regular file owned by the effective UID with one link, and its bytes, read through an `O_NOFOLLOW | O_NONBLOCK` descriptor that passes the same checks, equal this version's rendered template (on Linux, or the rendered template of upstream 36ce382, which lacked `StandardOutput=null` and `StandardError=null`). Otherwise `ManualRepair`.
+3. Autostart object: removed (`unlinkat`, then a directory sync) only when `fstatat` shows a regular file owned by the effective UID with one link, and its bytes, read through an `O_NOFOLLOW | O_NONBLOCK` descriptor that passes the same checks, equal this version's rendered template (on Linux, or the rendered template of upstream 36ce382, which lacked `StandardOutput=null`). Otherwise `ManualRepair`.
 4. Binary: removed when it is a regular file owned by the effective UID with one link. Otherwise `ManualRepair`.
 5. Producer and receiver caches: `CacheStore::open` + `clear` on the store's root. Failure is `ManualRepair`.
 6. Only with `purge` and no `ManualRepair` anywhere: `SecureRoot::remove_file` of `peers.json`, then `state.json`. `owner.lock` is never removed: unlinking a held lock would let the next process lock a different inode.

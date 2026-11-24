@@ -66,8 +66,7 @@ pub const MACOS_PLIST_TEMPLATE: &str =
     include_str!("../packaging/macos/com.nyanako.syrtis.agent.plist");
 /// systemd user unit template; `@BINARY@` is the installed binary.
 pub const LINUX_UNIT_TEMPLATE: &str = include_str!("../packaging/linux/syrtis-agent.service");
-/// The unit template before `StandardOutput=null` and `StandardError=null`
-/// (upstream 36ce382). Uninstall still removes a unit written from it.
+/// The unit template before `StandardOutput=null` (upstream 36ce382). Uninstall still removes a unit written from it.
 pub const LINUX_UNIT_PREVIOUS_TEMPLATE: &str = "[Unit]\nDescription=Syrtis Agent\n\n[Service]\n\
 ExecStart=@BINARY@ run\n\n[Install]\nWantedBy=default.target\n";
 
