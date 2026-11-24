@@ -5,6 +5,8 @@ on:
     branches:
       - main
   pull_request:
+  # release.yml runs these same checks before it builds.
+  workflow_call:
 
 permissions:
   contents: read
