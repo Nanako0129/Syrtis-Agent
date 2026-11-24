@@ -2,7 +2,7 @@
 
 ## Purpose and boundary
 
-This document fixes the standalone binary `syrtis-agent` (`SA-2C2b`): `syrtis-agent run`, the resident entry point, and `syrtis-agent` with no argument, a plain numbered menu that manages the running resident over its control socket. Implementation: `src/main.rs` (three lines) and `src/cli.rs`; acceptance: `tests/cli_v1.rs`, plus the control and agent cases named below. The standalone agent is a producer only: no dashboard, no receiver, nothing to paste.
+This document fixes the standalone binary `syrtis-agent` (`SA-2C2b`): `syrtis-agent run`, the resident entry point, `syrtis-agent` with no argument, a plain numbered menu that manages the running resident over its control socket, and `syrtis-agent ctl <command>`, the same management as one non-interactive command per call (see "`ctl`" below). Implementation: `src/main.rs` (three lines), `src/cli.rs` and `src/cli/ctl.rs`; acceptance: `tests/cli_v1.rs` and `tests/ctl_v1.rs`, plus the control and agent cases named below. The standalone agent is a producer only: no dashboard, no receiver, nothing to paste.
 
 The binary adds no state, no wire format and no transition. Sharing, scope approval, offers, approvals and the listen address change only through the frozen control commands (`spec/control-v1.md`); their effects are the runtime's and the agent's (`spec/runtime-v1.md`, `spec/agent-v1.md`).
 
@@ -13,7 +13,7 @@ macOS and Linux. On every other platform the binary compiles; `run` and the menu
 `main` takes, in this order:
 
 1. **Release gate.** In a build without `debug_assertions`, if the environment variable `SYRTIS_AGENT_DEBUG_HOME` is set (any value), the binary prints `syrtis-agent: SYRTIS_AGENT_DEBUG_HOME is set, but this build does not accept it. Nothing was opened.` to stderr and exits 3, before reading its arguments or resolving any home.
-2. **Arguments.** None: the menu. Exactly `run`: the resident. Anything else: `usage: syrtis-agent [run]` on stderr, exit 2, nothing opened. No argument carries a value, so no secret, token or Pair URL can arrive by argv; no environment variable is read except the one above.
+2. **Arguments.** None: the menu. Exactly `run`: the resident. `ctl` and what follows: see "`ctl`". Anything else: `usage: syrtis-agent [run]` on stderr, exit 2, nothing opened. `run` and the menu take no value. `ctl` takes values, but only non-secret ones (a digest, a SAS, an ID, a port, a lifetime, an address) that its parser checks before anything is opened; no secret, token or Pair URL can arrive by argv. No environment variable is read except the one above.
 3. **Home.** `secure_fs::trusted_home()` (the directory-service home of the effective UID; `HOME` and `XDG_*` are ignored). In a debug build only, `SYRTIS_AGENT_DEBUG_HOME` replaces it. Both functions that read the variable for that purpose are compiled under an item-level `#[cfg(debug_assertions)]`; the release counterparts never read it. This is how `tests/cli_v1.rs` runs the binary on a temp home.
 
 The secure root is the frozen `secure_fs::STATE_SUFFIX` below that home. The engine's config and data directories are `.config` and `.local/share` below that home on macOS and Linux alike, never from the environment (`cli::default_dirs`, which depends on the home alone). The engine uses the data directory as the XDG data root and `<config directory>/tokscale` as its config root, so on macOS the standalone agent scans the places the engine's local report lane falls back to when no environment variable redirects it (for example OpenCode and Muse under `.local/share`, Antigravity under `.config/tokscale`). Until DR-1e both were `Library/Application Support` on macOS. The secure root stays where it is. These directories are owner inputs, so changing them is a consent change (`spec/source-v1.md`): a resident started over a scope approved with other directories runs, reports `Scan scope approved: no` and refuses every report until the owner approves the scope again.
@@ -23,6 +23,47 @@ The secure root is the frozen `secure_fs::STATE_SUFFIX` below that home. The eng
 `Agent::start` with that home, those directories, the frozen suffix and empty `ScannerSettings`: **the standalone agent scans default roots only.** It has no setting for extra scan paths, exclusions or database paths; adding one needs a new persisted file and a frozen-contract amendment. It then blocks in `Runtime::wait` until control `shutdown`, calls `Runtime::stop` and exits 0. Another process holding the owner lock (`Busy`): `syrtis-agent: another syrtis-agent is already running for this user.` on stderr, exit 1. Any other start failure prints the stable error class (for example `Storage(UnsafeState)`), no path, exit 1. It does not daemonize and writes no pid file: launchd or systemd manages it (`spec/install-v1.md`).
 
 The standalone agent never fetches pricing and puts nothing in `Agent::pricing_dir()`. With that directory empty its costs are what the engine computes without a pricing dataset (`spec/source-v1.md`, `spec/agent-v1.md`). The directory is shared with an app that used the same secure root and is not cleared when the app stops: pricing files the app left there keep pricing the standalone agent's reports at any age, since the engine uses a stale table rather than dropping it.
+
+## `ctl`
+
+`syrtis-agent ctl <command>` is the menu without prompts, for a caller that drives the agent over a pipe (the Syrtis app over `ssh`). It adds no control command, no state and no wire byte: every command that reaches the resident is one frozen control command sent through `control::Client`, with the token read exactly as the menu reads it (`open_read_only`, `state.json`, `controlToken` kept in memory). It reads no stdin and no environment variable besides the debug home of a debug build; the release gate and the home are those of "Arguments and the home" and run before `ctl` parses anything.
+
+**Output.** Success: exit 0, stderr empty, stdout exactly one line, `SYRTIS-CTL-V1 ` followed by one compact JSON object and a newline. Failure: a non-zero exit, stdout empty, stderr exactly one line `syrtis-agent ctl: <message>` holding a stable class, never a path, a token or a Pair URL (a message containing `syrtis://` is replaced). The Pair URL exists only in the stdout line of `offer create`.
+
+| Exit | Meaning |
+|---:|---|
+| 0 | Done. |
+| 2 | Usage: unknown command, a missing, repeated or extra flag, or a value that failed its check. Nothing was opened. |
+| 3 | Release gate (above). |
+| 4 | The resident is not running or did not answer (the command did not run). |
+| 5 | The resident answered with an error code (`invalid`, `unauthorized`, `expired`, `busy`, ...), named in the message. Nothing changed. |
+| 6 | The command went out in full and no valid reply came back: it may have taken effect; run `status`. |
+| 7 | Local failure: the state directory failed a safety check, `install` or `uninstall` failed or left something for a manual repair, or stdout could not be written (the stderr line then says the command may have taken effect). |
+| 8 | `pending approve`: not exactly one pending pairing carries the SAS. Nothing was sent but `pendingList`. |
+| 9 | `install` or `uninstall` while the resident runs. Nothing was changed. |
+
+| Command | Does | Success object |
+|---|---|---|
+| `status` | `status` | `sharingEnabled`, `bindHost`, `bindPort`, `nodeLabel`, `activeGrantCount`, `activeOfferCount`, `pendingCount`, `scopeApproved`: a caller's baseline. |
+| `scope disclosure` | `status` (the resident must answer), then the menu's disclosure for this home; changes nothing | `lines` (`[{name, value}]`, what menu item 4 prints) and `ownerInputsSha256`. |
+| `scope approve --digest <64 hex>` | `scopeApprove`. A digest that is not the resident's is `invalid` (exit 5) and nothing is written. | `scopeApproved`. |
+| `sharing on` / `sharing off` | `sharingSet`. Off revokes every grant (`spec/runtime-v1.md`). When sharing is already on, `sharing on` is answered `invalid` and exits 5, with nothing changed; a caller that retries after an exit 6 reads `status` first and does not take that exit 5 as a refusal. | `sharingEnabled`. |
+| `listen --host <ip> --port <n>` | `listenConfigure`. The host is canonical IP text the listener would bind (not unspecified), the port 1024-65535. The stored node label is kept; control cannot set it. | `bindHost`, `bindPort`. |
+| `offer create --ttl <s>` | `offerCreate`; `s` is 1-120, canonical decimal. | `expiresAt`, `offerId`, `pairUrl`. |
+| `offer cancel --offer-id <32 hex>` | `offerCancel`. | `cancelled`. |
+| `pending approve --expect-sas <XXXX-XXXX>` | See below. | `approved`, `pendingId`. |
+| `grant revoke --grant-id <32 hex>` | `revoke`. | `revoked`. |
+| `shutdown` | `shutdown`; the reply comes before the resident has stopped. | `stopping`. |
+| `install` | `install::install(home, current_exe)` as menu item 10: needs the resident stopped, holds the owner lock, starts and loads nothing. The checks of `spec/install-v1.md` (no-follow walk, owner, no group or other write, `O_EXCL` temp file) are the only ones; `ctl` adds none and skips none. | `installed`. |
+| `uninstall [--purge]` | `Agent::uninstall_stopped` as menu item 11, without its prompts; needs the resident stopped. Exit 7 names everything that is still there: an object left for a manual repair, `state` when `--purge` did not remove the identity and pairing state, and `sourceScope` when the state went and `source-scope.json` did not. With neither install object present and a state directory that is missing or holds only what a finished purge leaves (`owner.lock`, a stale `control.sock`, `pricing`, and `source-cache` as an empty 0700 directory without an extended ACL, which is what `clear_private_subdir` accepts; tested read-only), nothing is opened for writing: every object is `absent`, `purged` is `false`, and no file or directory is created. Any other entry there, such as a cache an earlier uninstall could not clear, runs the full uninstall. When that happens without a `state.json`, the state the store writes just to be opened is always removed again, with or without `--purge`, so an uninstall never leaves a new identity behind; `purged` still reports only a purge that was asked for. | `purged`, `autostart`, `binary`, `producerCache`, `receiverCache`, `sourceCache` (`removed`, `absent`). |
+
+Hex digits are lowercase, a SAS is `[0-9A-F]{4}-[0-9A-F]{4}` (the agent's own format), numbers are digits only with no sign or leading zero. A flag is `--name value` (no `--name=value`), each exactly once, in any order. After `shutdown`, `install` and `uninstall` answer 9 until the resident has exited; the caller retries.
+
+**`pending approve`.** The pending list is read once. Exactly one entry must carry the expected `sasCode`; only then is `approve{pendingId, sasGeneration: 1}` sent for that entry (v1 never re-issues a SAS, `spec/control-v1.md`). No entry, several entries or a malformed list send nothing further and exit 8 (or 7 for the malformed list). Entries past their expiry are not in the list (`spec/control-v1.md`, `pendingList`), so an expired pairing is "no entry"; one that expires between the list and `approve` is answered `expired` (exit 5). `ctl` never sends `reject`, never approves another entry, and never cancels an offer: the caller does that after a non-zero exit.
+
+**Not provided.** No `grants list`: the frozen control commands have no grant list, so a running resident can only count its grants (`status`), as the menu says; `grant revoke` takes the ID the caller already holds. No `--label` on `listen`: `listenConfigure` has no label field. Either needs a frozen-contract amendment.
+
+**Same UID.** `ctl` lets a process of the same UID approve a pairing with one command. The control socket already admits only the same UID, which is the accepted non-claim of `spec/control-v1.md`.
 
 ## The menu
 
@@ -76,6 +117,14 @@ This is a read path without the owner lock (readiness security review). The resi
 | (5c) stopped: control items write nothing | `disk::with_the_agent_stopped_control_items_write_nothing` |
 | (6) unknown arguments refused | `disk::unknown_arguments_are_refused_before_anything_is_opened` |
 | Review fixes | outcome unknown: `disk::a_command_sent_without_a_reply_is_reported_as_unknown` (client: `tests/runtime_control_v1.rs` `a_reply_missing_after_the_command_was_sent_is_no_reply`); renamed while open: `src/secure_fs/unix.rs` `a_read_only_read_accepts_a_file_replaced_after_its_open`; no state after purge: `disk::listing_grants_after_a_purge_creates_no_state`; lock free at the prompt: `disk::the_offline_revoke_prompt_does_not_hold_the_lock`; uninstall without a runtime: `disk::menu_uninstall_starts_no_runtime_and_binds_no_port`, `disk::menu_uninstall_works_with_an_unbindable_listen_address`; IPv6 in brackets: `disk::status_brackets_an_ipv6_listen_host`; no disclosure without a resident: `disk::with_the_agent_stopped_control_items_write_nothing` |
+| (8) `ctl` argument validation, exit codes, output contract | `ctl_v1::illegal_arguments_are_refused_before_anything_is_opened`, `ctl_v1::without_a_resident_control_commands_exit_4_and_write_nothing`; parser: `src/cli/ctl.rs` `parse_refuses_every_illegal_value`, `parse_accepts_each_command_in_its_one_form` |
+| (8) wrong digest refused | `ctl_v1::a_wrong_digest_is_refused_and_the_right_one_approves` |
+| (8) `pending approve`: mismatch, several, expired approve nothing and reject nothing | `ctl_v1::only_a_unique_sas_match_approves_and_no_other_pending_is_touched`, `ctl_v1::an_expired_pending_is_not_approved_and_nothing_else_is_touched`; with a recording control: `src/cli/ctl.rs` `a_code_mismatch_sends_no_approve_and_no_reject`, `several_pending_with_the_code_send_no_approve_and_no_reject`, `an_expired_pending_is_absent_from_the_list_and_nothing_is_sent`, `a_pending_that_expires_before_approve_is_refused_and_nothing_else_is_sent`, `one_matching_pending_is_approved_with_its_own_id_and_generation` |
+| (8) the Pair URL never on stderr | `ctl_v1::ctl` (checked on every call), `ctl_v1::the_pair_url_is_on_stdout_only_and_offers_and_grants_are_managed`; `src/cli/ctl.rs` `the_stderr_line_is_one_line_and_never_a_pair_url` |
+| (8) `install` through `install::install`; refused for an unsafe destination | `ctl_v1::install_and_uninstall_use_the_frozen_install_path`, `ctl_v1::install_refuses_a_destination_others_can_write`, `ctl_v1::install_refuses_a_symlinked_destination_directory`, `ctl_v1::install_and_uninstall_refuse_while_the_resident_runs` |
+| (8) `uninstall`: exit 7 names what a purge left; a leftover cache is not reported `absent`; an unwritable stdout | `src/cli/ctl.rs` `an_uninstall_that_left_something_is_a_failure_naming_it`; `ctl_v1::uninstall_does_not_report_a_leftover_cache_as_absent`, `ctl_v1::uninstall_does_not_report_a_cache_with_an_acl_as_absent` (macOS), `ctl_v1::uninstall_in_an_empty_home_creates_nothing`, `ctl_v1::an_unwritable_stdout_is_a_local_failure_with_its_stderr_line` |
+| (8) clean agent to a live offer with `ctl` alone | `ctl_v1::a_clean_agent_is_walked_to_an_offer_with_ctl_alone` |
+| (8) the Linux unit discards stdout and leaves stderr to the journal | `install_v1::the_linux_unit_discards_stdout_and_keeps_stderr` |
 | (7) line limit | `a_line_over_the_limit_is_refused_and_the_next_one_is_read`, `disk::the_menu_ignores_a_line_over_the_limit` |
 
 ## Non-claims
@@ -84,5 +133,9 @@ This is a read path without the owner lock (readiness security review). The resi
 - **Signals.** `run` installs no signal handler. A `SIGTERM` from launchd or systemd ends the process without `Runtime::stop`, so without the final housekeeping checkpoint; the owner lock is released by the kernel at exit. Not exercised.
 - **The release gate's position** is observed only by the CI step's exit status and message; with the gate removed, the step's extra argument stops the binary at the usage check (status 2), which is how the step turns red without opening a real home.
 - **Install from the menu** is not exercised by a test (it would copy the test binary); `install::install` itself is tested in `tests/install_v1.rs`.
+- **`ctl` on a systemd host.** `install` writes the unit and starts nothing; `systemctl --user` and a no-systemd fallback are the caller's step, not run by `ctl` or by a test. The unit's `StandardOutput=null` (and no `StandardError` line) is checked as text, not by running systemd.
 - **Windows**: compiling and the unsupported message are claimed for CI; not run on this machine.
 - **Same UID.** A process of the same UID can read the token from `state.json` as the menu does (`spec/state-store-v1.md`, `spec/control-v1.md`).
+- **`ctl listen` and a failed bind.** `listenConfigure` stores the address and replies; a bind that then fails in the resident does not change the exit status, which stays 0. The caller's proof is the handshake that follows (`status`, then a connection), not the exit status of `listen`.
+- **`--host` may be a non-loopback address.** `ctl listen --host` accepts any canonical IP the listener could bind that is not unspecified, a LAN or public address included. `ctl` adds no loopback restriction; limiting the host is the caller's decision.
+- **The `install` source is checked only for being a regular file.** `current_exe` is opened by path and must be a regular file; `ctl` does not verify its owner, signature or provenance, so the caller supplies a binary it already trusts.

@@ -181,7 +181,8 @@ fn golden(binary: &Path) -> String {
 #[cfg(target_os = "linux")]
 fn golden(binary: &Path) -> String {
     format!(
-        "[Unit]\nDescription=Syrtis Agent\n\n[Service]\nExecStart={} run\n\n\
+        "[Unit]\nDescription=Syrtis Agent\n\n[Service]\nExecStart={} run\n\
+StandardOutput=null\n\n\
 [Install]\nWantedBy=default.target\n",
         binary.display()
     )
@@ -754,4 +755,46 @@ fn a_relative_home_is_invalid() {
         install(Path::new("relative/home"), &home.source(b"agent")),
         Err(InstallError::Invalid)
     );
+}
+
+/// The Linux unit sends the resident's stdout to null and leaves stderr to
+/// the journal, where the two lines `run` prints on a failed start end up.
+/// Checked on every platform; the Linux-only `golden` above holds the same
+/// bytes.
+#[test]
+fn the_linux_unit_discards_stdout_and_keeps_stderr() {
+    assert_eq!(
+        syrtis_agent::install::LINUX_UNIT_TEMPLATE,
+        "[Unit]\nDescription=Syrtis Agent\n\n[Service]\nExecStart=@BINARY@ run\n\
+StandardOutput=null\n\n\
+[Install]\nWantedBy=default.target\n"
+    );
+}
+
+/// A unit written from upstream's previous template (36ce382, before
+/// `StandardOutput=null`) is still the agent's: uninstall removes it and a
+/// purge goes ahead.
+#[cfg(target_os = "linux")]
+#[test]
+fn uninstall_removes_a_unit_from_the_previous_template_and_purges() {
+    let home = TempHome::new();
+    install(&home.path, &home.source(b"agent")).unwrap();
+    let binary = home.objects().0;
+    let previous = format!(
+        "[Unit]\nDescription=Syrtis Agent\n\n[Service]\nExecStart={} run\n\n\
+[Install]\nWantedBy=default.target\n",
+        binary.display()
+    );
+    std::fs::write(home.autostart(), previous).unwrap();
+
+    let report = uninstall(home.store(), &home.path, true, NOW_MS).unwrap();
+
+    assert_eq!(
+        report,
+        UninstallReport {
+            purged: true,
+            ..CLEAN
+        }
+    );
+    assert!(!home.autostart().exists());
 }

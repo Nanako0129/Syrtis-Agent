@@ -10,6 +10,9 @@
 //! carries a secret. macOS and Linux; elsewhere both entry points print
 //! [`UNSUPPORTED`].
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod ctl;
+
 use std::{
     ffi::OsString,
     io::{self, BufRead},
@@ -52,6 +55,7 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     let resident = match args.as_slice() {
         [] => false,
         [run] if run == "run" => true,
+        [ctl, rest @ ..] if ctl == "ctl" => return imp::start_ctl(rest),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(EXIT_USAGE);
@@ -142,6 +146,11 @@ mod imp {
         eprintln!("{UNSUPPORTED}");
         ExitCode::FAILURE
     }
+
+    pub(super) fn start_ctl(_args: &[OsString]) -> ExitCode {
+        eprintln!("{UNSUPPORTED}");
+        ExitCode::FAILURE
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -190,6 +199,30 @@ mod imp {
             Ok(()) => ExitCode::SUCCESS,
             Err(_) => ExitCode::FAILURE,
         }
+    }
+
+    /// `syrtis-agent ctl ...` (`spec/cli-v1.md`, "ctl").
+    pub(super) fn start_ctl(args: &[OsString]) -> ExitCode {
+        let home = match home() {
+            Ok(home) => home,
+            Err(error) => {
+                eprintln!(
+                    "syrtis-agent ctl: the home directory could not be resolved ({error:?})."
+                );
+                return ExitCode::from(super::ctl::EXIT_LOCAL);
+            }
+        };
+        let menu = Menu {
+            home,
+            suffix: STATE_SUFFIX,
+            exe: std::env::current_exe().ok(),
+        };
+        ExitCode::from(super::ctl::run(
+            &menu,
+            args,
+            &mut io::stdout().lock(),
+            &mut io::stderr().lock(),
+        ))
     }
 
     #[cfg(debug_assertions)]
@@ -241,7 +274,7 @@ mod imp {
     }
 
     /// Why a control call did not get a reply.
-    enum Reach {
+    pub(super) enum Reach {
         /// No root, no state, or no answer on the socket.
         NotRunning,
         /// The root or `state.json` failed a check.
@@ -255,7 +288,7 @@ mod imp {
     }
 
     impl Menu {
-        fn root_path(&self) -> PathBuf {
+        pub(super) fn root_path(&self) -> PathBuf {
             self.suffix
                 .iter()
                 .fold(self.home.clone(), |path, part| path.join(part))
@@ -263,7 +296,7 @@ mod imp {
 
         /// The control token, read through `open_read_only` (never
         /// `open_under`: the resident holds the lock), and the socket.
-        fn client(&self) -> Result<Client, Reach> {
+        pub(super) fn client(&self) -> Result<Client, Reach> {
             let root = SecureRoot::open_read_only(&self.home, self.suffix)
                 .map_err(Reach::Unsafe)?
                 .ok_or(Reach::NotRunning)?;
@@ -281,7 +314,7 @@ mod imp {
             ))
         }
 
-        fn call(&self, id: u16, body: Value) -> Result<Response, Reach> {
+        pub(super) fn call(&self, id: u16, body: Value) -> Result<Response, Reach> {
             match self.client()?.call(&Command { id, body }) {
                 Ok(response) => Ok(response),
                 // Not connected, or cut before the whole command was out:
@@ -292,12 +325,12 @@ mod imp {
             }
         }
 
-        fn running(&self) -> bool {
+        pub(super) fn running(&self) -> bool {
             matches!(self.call(STATUS, json!({})), Ok(response) if response.code == OK)
         }
 
         /// The owner inputs the resident computes from the same home.
-        fn disclosure(&self) -> Option<(Vec<(&'static str, String)>, String)> {
+        pub(super) fn disclosure(&self) -> Option<(Vec<(&'static str, String)>, String)> {
             let (config_dir, data_dir) = default_dirs(&self.home);
             // The resident's `AgentConfig::new` sets no separate XDG data
             // root; one that is set is an owner input and is shown.
@@ -397,7 +430,7 @@ mod imp {
         }
     }
 
-    fn code_name(code: u16) -> &'static str {
+    pub(super) fn code_name(code: u16) -> &'static str {
         match code {
             OK => "ok",
             INVALID => "invalid",
