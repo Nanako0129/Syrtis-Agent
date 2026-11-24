@@ -3,6 +3,8 @@ Description=Syrtis Agent
 
 [Service]
 ExecStart=@BINARY@ run
+StandardOutput=null
+StandardError=null
 
 [Install]
 WantedBy=default.target

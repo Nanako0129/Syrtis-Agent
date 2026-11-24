@@ -66,6 +66,10 @@ pub const MACOS_PLIST_TEMPLATE: &str =
     include_str!("../packaging/macos/com.nyanako.syrtis.agent.plist");
 /// systemd user unit template; `@BINARY@` is the installed binary.
 pub const LINUX_UNIT_TEMPLATE: &str = include_str!("../packaging/linux/syrtis-agent.service");
+/// The unit template before `StandardOutput=null` and `StandardError=null`
+/// (upstream 36ce382). Uninstall still removes a unit written from it.
+pub const LINUX_UNIT_PREVIOUS_TEMPLATE: &str = "[Unit]\nDescription=Syrtis Agent\n\n[Service]\n\
+ExecStart=@BINARY@ run\n\n[Install]\nWantedBy=default.target\n";
 
 /// Copies `current_exe` to the frozen binary path and writes the autostart
 /// object, each by temp file and `rename`. Never loads or starts a service.
@@ -99,21 +103,79 @@ pub fn uninstall(
     }
 }
 
+/// Whether either install object has an entry of any kind (a link is not
+/// followed). Read-only; `true` when the paths cannot be derived or a
+/// stat fails other than "not found", so nothing is ever skipped on doubt.
+pub fn objects_present(trusted_home: &Path) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let Some(objects) = trusted_home
+            .to_str()
+            .and_then(|home| crate::security::install_objects(unix_platform(), home).ok())
+        else {
+            return true;
+        };
+        [&objects.binary, &objects.autostart_object]
+            .iter()
+            .any(|path| {
+                !matches!(
+                    std::fs::symlink_metadata(path.as_str()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                )
+            })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = trusted_home;
+        true
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn unix_platform() -> crate::security::Platform {
+    crate::security::Platform::MacOs
+}
+#[cfg(target_os = "linux")]
+fn unix_platform() -> crate::security::Platform {
+    crate::security::Platform::Linux
+}
+
 /// The autostart object's bytes for `binary`. A byte outside
 /// `[A-Za-z0-9/._-]` would need XML or systemd escaping (or quoting a
 /// space), so it is refused rather than escaped.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn autostart_contents(binary: &str) -> Result<String, InstallError> {
+    render(binary, current_template())
+}
+
+#[cfg(target_os = "macos")]
+fn current_template() -> &'static str {
+    MACOS_PLIST_TEMPLATE
+}
+#[cfg(target_os = "linux")]
+fn current_template() -> &'static str {
+    LINUX_UNIT_TEMPLATE
+}
+
+/// Every autostart object uninstall accepts as the agent's own: this
+/// version's bytes, and on Linux the previous template's.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn accepted_autostart_contents(binary: &str) -> Vec<String> {
+    #[allow(unused_mut)]
+    let mut accepted: Vec<String> = autostart_contents(binary).into_iter().collect();
+    #[cfg(target_os = "linux")]
+    accepted.extend(render(binary, LINUX_UNIT_PREVIOUS_TEMPLATE));
+    accepted
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn render(binary: &str, template: &str) -> Result<String, InstallError> {
     let plain = binary
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte));
     if !plain {
         return Err(InstallError::Invalid);
     }
-    #[cfg(target_os = "macos")]
-    let template = MACOS_PLIST_TEMPLATE;
-    #[cfg(target_os = "linux")]
-    let template = LINUX_UNIT_TEMPLATE;
     Ok(template.replacen("@BINARY@", binary, 1))
 }
 
@@ -131,7 +193,9 @@ mod unix {
         sync::Arc,
     };
 
-    use super::{InstallError, Outcome, UninstallReport, autostart_contents};
+    use super::{
+        InstallError, Outcome, UninstallReport, accepted_autostart_contents, autostart_contents,
+    };
     use crate::{
         cache::CacheRole,
         cache_store::CacheStore,
@@ -210,9 +274,9 @@ mod unix {
             .and_then(|home| Some((home, install_objects(PLATFORM, home).ok()?)));
         let (autostart, binary) = match paths {
             Some((home, objects)) => {
-                let expected = autostart_contents(&objects.binary).ok();
+                let expected = accepted_autostart_contents(&objects.binary);
                 let launcher = find(home, &objects.autostart_object).map(|found| match found {
-                    Found::Safe(target) if !matches(&target, expected.as_deref()) => Found::Foreign,
+                    Found::Safe(target) if !matches(&target, &expected) => Found::Foreign,
                     other => other,
                 });
                 (remove(launcher), remove(find(home, &objects.binary)))
@@ -263,11 +327,11 @@ mod unix {
         })
     }
 
-    /// Whether the object is byte-equal to `expected`, read through a
-    /// no-follow descriptor. `None` (no template could be rendered) never
-    /// matches.
-    fn matches(target: &Target, expected: Option<&str>) -> bool {
-        expected.is_some_and(|expected| {
+    /// Whether the object is byte-equal to one of `accepted`, read through
+    /// a no-follow descriptor. An empty list (no template could be
+    /// rendered) never matches.
+    fn matches(target: &Target, accepted: &[String]) -> bool {
+        accepted.iter().any(|expected| {
             read_exact_object(target, expected.len())
                 .ok()
                 .flatten()
