@@ -741,7 +741,34 @@ fn uninstall_does_not_report_a_leftover_cache_as_absent() {
     }
 }
 
-/// A result line that cannot be written is exit 7 with the one stderr
+/// macOS: an empty 0700 `source-cache` that carries an extended ACL is not
+/// what a purge leaves. `clear_private_subdir` refuses it, so the uninstall
+/// keeps answering exit 7 for it instead of `absent` on the retry.
+#[cfg(target_os = "macos")]
+#[test]
+fn uninstall_does_not_report_a_cache_with_an_acl_as_absent() {
+    let home = TempHome::new();
+    drop(start(&home));
+    assert_eq!(ctl(&home.0, &["uninstall", "--purge"]).json["purged"], true);
+    let cache = tree(&home.0)
+        .into_iter()
+        .map(|(path, _, _)| path)
+        .find(|path| path.ends_with("source-cache"))
+        .expect("the purge keeps the emptied source-cache");
+    let status = Process::new("/bin/chmod")
+        .args(["+a", "everyone allow read"])
+        .arg(&cache)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    for _ in 0..2 {
+        let refused = ctl(&home.0, &["uninstall", "--purge"]);
+        assert_eq!(refused.code, 7, "{}", refused.stderr);
+        assert!(refused.stderr.contains("sourceCache"), "{}", refused.stderr);
+    }
+}
+
 /// line, which does not claim that nothing happened.
 #[test]
 fn an_unwritable_stdout_is_a_local_failure_with_its_stderr_line() {

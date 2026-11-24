@@ -546,6 +546,7 @@ fn nothing_installed(menu: &Menu) -> bool {
                 let cache = root.join(SOURCE_CACHE_DIR);
                 std::fs::symlink_metadata(&cache)
                     .is_ok_and(|meta| meta.is_dir() && meta.mode() & 0o7777 == 0o700)
+                    && no_acl(&cache)
                     && listed(cache).is_some_and(|inside| inside.is_empty())
             })
     };
@@ -555,6 +556,17 @@ fn nothing_installed(menu: &Menu) -> bool {
         Err(_) => false,
     };
     empty_root && !install::objects_present(&menu.home)
+}
+
+/// macOS: the directory verifiably carries no extended ACL, the other
+/// thing `clear_private_subdir` refuses. Elsewhere there is none to carry.
+#[cfg(target_os = "macos")]
+fn no_acl(dir: &std::path::Path) -> bool {
+    std::fs::File::open(dir).is_ok_and(|dir| crate::secure_fs::acl::none(&dir))
+}
+#[cfg(not(target_os = "macos"))]
+fn no_acl(_dir: &std::path::Path) -> bool {
+    true
 }
 
 fn running() -> Fail {
