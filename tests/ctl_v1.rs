@@ -36,7 +36,7 @@ use syrtis_agent::{
     cli::{DEBUG_HOME_VAR, default_dirs},
     runtime::RuntimeError,
     secure_fs::StorageError,
-    security::{OfferClaim, PendingState, decode_fixed_hex, parse_pair_url},
+    security::{OfferClaim, PendingState, decode_fixed_hex, hex_encode, parse_pair_url},
 };
 
 const PREFIX: &str = "SYRTIS-CTL-V1 ";
@@ -428,9 +428,12 @@ fn an_expired_pending_is_not_approved_and_nothing_else_is_touched() {
     let home = TempHome::new();
     let agent = start(&home);
     make_ready(&home.0);
-    let expired = claim(&agent, &offer(&home.0, "1"), 0x01, "AAAA-1111");
+    // Two seconds, not one: an offer is stamped on a whole second, so a
+    // one-second offer can already be past its expiry when `claim` parses
+    // its URL a few milliseconds later.
+    let expired = claim(&agent, &offer(&home.0, "2"), 0x01, "AAAA-1111");
     let live = claim(&agent, &offer(&home.0, "120"), 0x02, "BBBB-2222");
-    thread::sleep(Duration::from_millis(2_300));
+    thread::sleep(Duration::from_millis(3_300));
 
     let result = ctl(
         &home.0,
@@ -485,7 +488,7 @@ fn the_pair_url_is_on_stdout_only_and_offers_and_grants_are_managed() {
         0
     );
     let grant = agent.runtime().store().state().unwrap().reference.grants[0].grant_id;
-    let grant_id: String = grant.iter().map(|byte| format!("{byte:02x}")).collect();
+    let grant_id = hex_encode(&grant);
     assert_eq!(ctl(&home.0, &["status"]).json["activeGrantCount"], 1);
     assert_eq!(
         ctl(&home.0, &["grant", "revoke", "--grant-id", &grant_id]).code,
@@ -693,6 +696,70 @@ fn uninstall_in_an_empty_home_creates_nothing() {
         }
         assert_eq!(fs::read_dir(&home.0).unwrap().count(), 0, "{args:?}");
     }
+}
+
+/// After a purge (which keeps `owner.lock`, the emptied `source-cache` and
+/// what no uninstall touches) a second uninstall has nothing to do and
+/// creates nothing. A cache that is still in the state directory (as after
+/// an uninstall that could not clear it) is not "nothing": the full
+/// uninstall runs and removes it instead of reporting it `absent`, with or
+/// without `--purge`, and the identity it has to create on the way never
+/// stays behind.
+#[test]
+fn uninstall_does_not_report_a_leftover_cache_as_absent() {
+    let home = TempHome::new();
+    drop(start(&home));
+    assert_eq!(ctl(&home.0, &["uninstall", "--purge"]).json["purged"], true);
+
+    let lock = tree(&home.0)
+        .into_iter()
+        .map(|(path, _, _)| path)
+        .find(|path| path.ends_with("owner.lock"))
+        .expect("the purge keeps owner.lock");
+    let root = lock.parent().unwrap();
+    let before = tree(&home.0);
+    assert!(!root.join("state.json").exists());
+    let again = ctl(&home.0, &["uninstall", "--purge"]);
+    assert_eq!(
+        (again.code, &again.json["sourceCache"]),
+        (0, &"absent".into())
+    );
+    assert_eq!(tree(&home.0), before, "nothing was created");
+
+    // The purge emptied `source-cache` and kept the directory.
+    let cache = root.join("source-cache");
+    for (args, purged) in [
+        (&["uninstall"][..], false),
+        (&["uninstall", "--purge"][..], true),
+    ] {
+        fs::write(cache.join("left"), b"x").unwrap();
+        let cleared = ctl(&home.0, args);
+        assert_eq!(cleared.code, 0, "{args:?}: {}", cleared.stderr);
+        assert_eq!(cleared.json["sourceCache"], "removed", "{args:?}");
+        assert_eq!(cleared.json["purged"], purged, "{args:?}");
+        assert_eq!(tree(&home.0), before, "{args:?}: no identity was left");
+    }
+}
+
+/// A result line that cannot be written is exit 7 with the one stderr
+/// line, which does not claim that nothing happened.
+#[test]
+fn an_unwritable_stdout_is_a_local_failure_with_its_stderr_line() {
+    let home = TempHome::new();
+    // The write end of a pipe nobody reads: every write is EPIPE. (A
+    // closed or read-only descriptor would not do: std reports success
+    // for EBADF on stdout.)
+    let mut reader = Process::new("true").stdin(Stdio::piped()).spawn().unwrap();
+    let broken = reader.stdin.take().unwrap();
+    reader.wait().unwrap();
+    let mut process = binary(&home.0);
+    process.args(["ctl", "uninstall"]).stdout(broken);
+    let out = output_within(process.spawn().unwrap(), Duration::from_secs(30));
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(
+        String::from_utf8(out.stderr).unwrap(),
+        "syrtis-agent ctl: the result could not be written; the command may have taken effect\n"
+    );
 }
 
 /// A unit written from upstream's previous template (36ce382) is still the

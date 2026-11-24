@@ -390,9 +390,20 @@
 # says `ctl uninstall` on a home with no state and no install object
 # creates nothing, and adds three non-claims (`listen` exit status,
 # non-loopback `--host`, the `install` source check).
+#
+# CTL-1 review follow-up (2026-11-24) changed spec/cli-v1.md on purpose.
+# `ctl uninstall` now exits 7 naming `state` when `--purge` did not remove
+# the identity and pairing state and `sourceScope` when the state went and
+# source-scope.json did not; its read-only "nothing to uninstall" answer
+# needs a state directory that is missing or holds only what a finished
+# purge leaves, so a cache an earlier uninstall could not clear is no
+# longer reported `absent` (and the state the store writes on that path,
+# when there was none, is always removed again); an unwritable stdout gets
+# its stderr line. One acceptance row was added. No frozen contract, wire, schema or control
+# command changed.
 510d1b9231917e9cb60b96c3f270151f79bed770b969e651884dcfe866d9854a  spec/cache-store-v1.md
 c5ede4c3b6aacd1fd63ffb64958d41df8614d410d6164b3ec3a88d33d0c53ce5  spec/install-v1.md
-28ed5f30f58624574393d09bfe18d7eebc1e3ee1ec03173bec76bed6a165adb1  spec/cli-v1.md
+8e33a6781b03e7ccac1e7cf22959617bf16b72a32fae2a31acc8155a986bd2b2  spec/cli-v1.md
 af07a9a2e8c93f33814c8b35f48c28b8c9f0d5b159e8a26b08de658e04035b9f  spec/control-v1.md
 c6cfaf6793ab2d9319c461ac538c8d9e95428fdf2eebe54f630e6337673b3580  spec/pairing-v1.md
 e519125a763a240223d6b88153a3fb111896e520b053afd8b5533a21ce8c76ba  spec/runtime-v1.md

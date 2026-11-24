@@ -12,20 +12,21 @@
 //! path, a token or a Pair URL), and the exit status says why. The Pair
 //! URL exists only in the stdout line of `offer create`.
 
-use std::{ffi::OsString, io::Write, net::IpAddr};
+use std::{ffi::OsString, io::Write, net::IpAddr, os::unix::fs::MetadataExt, path::PathBuf};
 
 use serde_json::{Value, json};
 
 use super::imp::{Menu, Reach, code_name};
 use crate::{
-    agent::{Agent, AgentError},
+    agent::{Agent, AgentError, AgentUninstallReport},
     control::{
         APPROVE, LISTEN_CONFIGURE, OFFER_CANCEL, OFFER_CREATE, OK, PENDING_LIST, REVOKE, Response,
-        SCOPE_APPROVE, SHARING_SET, SHUTDOWN, STATUS,
+        SCOPE_APPROVE, SHARING_SET, SHUTDOWN, SOCKET_NAME, STATUS,
     },
     install::{self, Outcome},
     listener::bind_address,
     secure_fs::{SecureRoot, StorageError},
+    source::{PRICING_DIR, SOURCE_CACHE_DIR},
     state_store::{STATE_FILE, STATE_FILE_MAX_BYTES},
 };
 
@@ -262,7 +263,14 @@ pub(super) fn run(menu: &Menu, args: &[OsString], out: &mut dyn Write, err: &mut
     match outcome {
         Ok(value) => match writeln!(out, "{PREFIX}{value}").and_then(|()| out.flush()) {
             Ok(()) => 0,
-            Err(_) => EXIT_LOCAL,
+            Err(_) => {
+                // The command ran; only its result line was lost.
+                let _ = writeln!(
+                    err,
+                    "syrtis-agent ctl: the result could not be written; the command may have taken effect"
+                );
+                EXIT_LOCAL
+            }
         },
         Err(Fail { code, line }) => {
             let _ = writeln!(err, "syrtis-agent ctl: {}", one_line(&line));
@@ -447,13 +455,32 @@ fn uninstall_cmd(menu: &Menu, purge: bool) -> Result<Value, Fail> {
         }
         return Ok(value);
     }
-    let report = match Agent::uninstall_stopped(&menu.home, menu.suffix, purge) {
+    // Without a `state.json` the store writes a fresh one (an identity and
+    // a control token) just to be opened. That one is always purged again,
+    // asked or not: it is not the owner's state, and nothing may be left
+    // behind by an uninstall. An unreadable state counts as present.
+    let fresh_state = matches!(
+        SecureRoot::open_read_only(&menu.home, menu.suffix),
+        Ok(Some(root)) if matches!(root.read_file(STATE_FILE, STATE_FILE_MAX_BYTES), Ok(None))
+    );
+    let report = match Agent::uninstall_stopped(&menu.home, menu.suffix, purge || fresh_state) {
         Ok(report) => report,
         Err(AgentError::Storage(StorageError::Busy)) => return Err(running()),
         Err(error) => {
             return Err(fail(EXIT_LOCAL, format!("not uninstalled ({error:?})")));
         }
     };
+    let mut value = uninstall_result(&report, purge || fresh_state)?;
+    // `purged` answers what was asked: the fresh state does not count.
+    value["purged"] = json!(purge && report.install.purged);
+    Ok(value)
+}
+
+/// The result of a finished uninstall. Exit 7 names everything that is
+/// still there: an object left for a manual repair, the identity and
+/// pairing state when `--purge` did not remove it (`state`), and
+/// `source-scope.json` when the state went and it did not (`sourceScope`).
+fn uninstall_result(report: &AgentUninstallReport, purge: bool) -> Result<Value, Fail> {
     let name = |outcome: Outcome| match outcome {
         Outcome::Removed => "removed",
         Outcome::Absent => "absent",
@@ -466,11 +493,17 @@ fn uninstall_cmd(menu: &Menu, purge: bool) -> Result<Value, Fail> {
         ("receiverCache", report.install.receiver_cache),
         ("sourceCache", report.source_cache),
     ];
-    let left: Vec<&str> = objects
+    let mut left: Vec<&str> = objects
         .iter()
         .filter(|(_, outcome)| *outcome == Outcome::ManualRepair)
         .map(|(object, _)| *object)
         .collect();
+    if purge && !report.install.purged {
+        left.push("state");
+    }
+    if report.install.purged && !report.scope_removed {
+        left.push("sourceScope");
+    }
     if !left.is_empty() {
         return Err(fail(
             EXIT_LOCAL,
@@ -487,17 +520,41 @@ fn uninstall_cmd(menu: &Menu, purge: bool) -> Result<Value, Fail> {
     Ok(value)
 }
 
-/// Read-only: no readable `state.json` and neither install object means
-/// there is nothing to uninstall, and opening the store would create an
-/// identity and a control token. Any doubt (an unsafe root, an unreadable
-/// state, an object present) returns `false` and the full uninstall runs.
+/// Read-only: neither install object, and a state directory that is
+/// missing or holds only what a finished purge leaves (`owner.lock`, which
+/// is never removed, a stale `control.sock`, `pricing`, which no uninstall
+/// touches, and an emptied `source-cache`), means there is nothing to
+/// uninstall, and opening the store would create an identity and a control
+/// token. Any doubt (an unsafe root, a directory that cannot be listed,
+/// any other entry such as a state file or a cache a failed uninstall
+/// left, an object present) returns `false` and the full uninstall runs.
 fn nothing_installed(menu: &Menu) -> bool {
-    let no_state = match SecureRoot::open_read_only(&menu.home, menu.suffix) {
+    let listed = |dir: PathBuf| -> Option<Vec<OsString>> {
+        std::fs::read_dir(dir)
+            .ok()?
+            .map(|entry| entry.map(|entry| entry.file_name()).ok())
+            .collect()
+    };
+    let root = menu.root_path();
+    let left_by_a_purge = |name: &OsString| {
+        name == "owner.lock"
+            || name == SOCKET_NAME
+            || name == PRICING_DIR
+            || (name == SOURCE_CACHE_DIR && {
+                // The directory `clear_private_subdir` would accept, and
+                // empty: a link or another mode is for the full uninstall.
+                let cache = root.join(SOURCE_CACHE_DIR);
+                std::fs::symlink_metadata(&cache)
+                    .is_ok_and(|meta| meta.is_dir() && meta.mode() & 0o7777 == 0o700)
+                    && listed(cache).is_some_and(|inside| inside.is_empty())
+            })
+    };
+    let empty_root = match SecureRoot::open_read_only(&menu.home, menu.suffix) {
         Ok(None) => true,
-        Ok(Some(root)) => matches!(root.read_file(STATE_FILE, STATE_FILE_MAX_BYTES), Ok(None)),
+        Ok(Some(_)) => listed(root.clone()).is_some_and(|names| names.iter().all(left_by_a_purge)),
         Err(_) => false,
     };
-    no_state && !install::objects_present(&menu.home)
+    empty_root && !install::objects_present(&menu.home)
 }
 
 fn running() -> Fail {
@@ -762,6 +819,47 @@ mod tests {
         let (result, sent) = attempt(&[("../etc", "0A1B-2C3D")], OK);
         assert_eq!(result.unwrap_err().code, EXIT_LOCAL);
         assert_eq!(sent.len(), 1);
+    }
+
+    fn report(purged: bool, scope_removed: bool, source_cache: Outcome) -> AgentUninstallReport {
+        AgentUninstallReport {
+            install: install::UninstallReport {
+                autostart: Outcome::Removed,
+                binary: Outcome::Removed,
+                producer_cache: Outcome::Removed,
+                receiver_cache: Outcome::Removed,
+                purged,
+            },
+            source_cache,
+            scope_removed,
+        }
+    }
+
+    /// Exit 0 only when nothing asked for is left: a purge that kept the
+    /// state, a purge that kept `source-scope.json` and a cache left for a
+    /// manual repair are each exit 7 naming what stayed.
+    #[test]
+    fn an_uninstall_that_left_something_is_a_failure_naming_it() {
+        let left = |report: AgentUninstallReport, purge| {
+            let fail = uninstall_result(&report, purge).unwrap_err();
+            assert_eq!(fail.code, EXIT_LOCAL);
+            fail.line
+        };
+        assert!(left(report(false, false, Outcome::Removed), true).ends_with(": state"));
+        assert!(left(report(true, false, Outcome::Removed), true).ends_with(": sourceScope"));
+        assert!(
+            left(report(false, false, Outcome::ManualRepair), true)
+                .ends_with(": sourceCache,state")
+        );
+        assert!(
+            left(report(false, false, Outcome::ManualRepair), false).ends_with(": sourceCache")
+        );
+
+        let kept = uninstall_result(&report(false, false, Outcome::Removed), false).unwrap();
+        assert_eq!(kept["purged"], false);
+        let purged = uninstall_result(&report(true, true, Outcome::Removed), true).unwrap();
+        assert_eq!(purged["purged"], true);
+        assert_eq!(purged["sourceCache"], "removed");
     }
 
     #[test]
