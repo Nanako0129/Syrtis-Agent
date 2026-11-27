@@ -1,0 +1,117 @@
+name: Release
+
+# Only a `v*` tag runs this. It builds the Linux binary the Syrtis app
+# deploys to remote machines and attaches it, with its SHA-256, to the
+# tag's GitHub release. Three gates stand in front of the release: the
+# tagged commit must be on the default branch, the same checks as ci.yml
+# must pass, and the `release` environment (required reviewers, set in the
+# repository settings) must approve the publish job.
+on:
+  push:
+    tags:
+      - "v*"
+
+# No job gets a token scope by default; each job below asks for its own.
+permissions: {}
+
+jobs:
+  # A tag can be pushed on any commit; only one the default branch already
+  # contains may be released.
+  on-default-branch:
+    name: Tagged commit is on the default branch
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the tagged commit to be an ancestor of the default branch
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          test -n "$DEFAULT_BRANCH"
+          git merge-base --is-ancestor HEAD "origin/$DEFAULT_BRANCH"
+
+  # The same job set as ci.yml (fmt, clippy, test, digest check), reused so
+  # the two cannot drift.
+  checks:
+    name: CI checks
+    needs: on-default-branch
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build x86_64-unknown-linux-gnu
+    needs: checks
+    # ubuntu-22.04 keeps the glibc requirement at 2.35.
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      # Pinned to the commit of dtolnay/rust-toolchain's `1.85.0` branch; that
+      # revision fixes the toolchain to 1.85.0 and has no `toolchain` input.
+      - uses: dtolnay/rust-toolchain@9d8ce8d04e0f46cc2c817f1369e4bd480df4ccc6 # 1.85.0
+      - run: cargo build --release --locked
+      - name: Stage the asset and its checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          mkdir dist
+          cp target/release/syrtis-agent dist/syrtis-agent-x86_64-unknown-linux-gnu
+          cd dist
+          sha256sum syrtis-agent-x86_64-unknown-linux-gnu > syrtis-agent-x86_64-unknown-linux-gnu.sha256
+      # The release binary must refuse the debug home (same check as ci.yml).
+      - name: Release build refuses the debug home
+        shell: bash
+        run: |
+          set +e
+          message=$(SYRTIS_AGENT_DEBUG_HOME=/nonexistent ./dist/syrtis-agent-x86_64-unknown-linux-gnu run --release-gate-check 2>&1)
+          status=$?
+          set -e
+          test "$status" -eq 3
+          test "$message" = "syrtis-agent: SYRTIS_AGENT_DEBUG_HOME is set, but this build does not accept it. Nothing was opened."
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: syrtis-agent-x86_64-unknown-linux-gnu
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-22.04
+    # Waits for the reviewers the maintainer sets on this environment.
+    environment: release
+    # The only job that can write to the repository.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: syrtis-agent-x86_64-unknown-linux-gnu
+          path: dist
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum --check syrtis-agent-x86_64-unknown-linux-gnu.sha256
+          gh release create "$TAG" \
+            syrtis-agent-x86_64-unknown-linux-gnu \
+            syrtis-agent-x86_64-unknown-linux-gnu.sha256 \
+            --verify-tag \
+            --title "$TAG" \
+            --notes "Linux x86_64 (glibc 2.35 or newer). Verify with the attached .sha256."
